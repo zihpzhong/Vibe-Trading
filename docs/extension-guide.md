@@ -1,7 +1,7 @@
 # Vibe-Trading 扩展与优化指南
 
 > 更新时间：2026-05-08  
-> 适用分支：`my/main`
+> 适用分支：`dev`
 
 ---
 
@@ -16,8 +16,8 @@
 ## 分支结构
 
 ```
-main        ← 纯净跟踪上游（只执行 git pull，不做任何修改）
-my/main     ← 个人工作分支（所有扩展和优化在此分支）
+main    ← 纯净跟踪上游（只执行 git pull，不做任何修改）
+dev     ← 个人工作分支（所有扩展和优化在此分支）
 ```
 
 ---
@@ -143,7 +143,7 @@ git checkout main
 git pull origin main
 
 # Step 2：切回自定义分支，rebase 到最新 main
-git checkout my/main
+git checkout dev
 git rebase main
 
 # Step 3：如有冲突（极少发生），解决后继续
@@ -197,4 +197,4 @@ chore[ext]: updates extension dependencies
 1. **不要直接修改上游文件**（`agent/src/` 内的原有文件），否则 rebase 时会产生冲突
 2. 需要修改上游行为时，优先考虑：技能覆盖 → 工具扩展 → 包装/代理模式
 3. `ext_bridge.py` 是唯一例外，它在上游目录内但由我们创建，rebase 冲突风险极低
-4. 提交前确认当前在 `my/main` 分支：`git branch --show-current`
+4. 提交前确认当前在 `dev` 分支：`git branch --show-current`
