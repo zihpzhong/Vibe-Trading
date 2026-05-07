@@ -135,23 +135,58 @@ cp extensions/config/.env.local.example extensions/config/.env.local
 
 ---
 
-## 同步上游最新代码（日常操作）
+## 日常 Git 操作
+
+### 远程仓库说明
+
+| 远程名 | 地址 | 用途 |
+|--------|------|------|
+| `origin` | `https://github.com/zihpzhong/Vibe-Trading.git` | 个人 fork（推送目标） |
+| `upstream` | `https://github.com/HKUDS/Vibe-Trading.git` | 上游原仓库（只拉取）|
+
+---
+
+### 日常开发流程
 
 ```bash
-# Step 1：在 main 分支拉取上游最新
-git checkout main
-git pull origin main
+# 1. 确认在 dev 分支
+git checkout dev
 
-# Step 2：切回自定义分支，rebase 到最新 main
+# 2. 开发、修改文件...
+
+# 3. 提交
+git add <文件>
+git commit -m "feat[ext]: adds ..."
+
+# 4. 推送到自己的 fork
+git push origin dev
+```
+
+---
+
+### 同步上游最新代码
+
+```bash
+# Step 1：拉取上游最新到 main
+git checkout main
+git pull upstream main
+
+# Step 2：同步到自己 fork 的 main
+git push origin main
+
+# Step 3：切回 dev，rebase 到最新 main
 git checkout dev
 git rebase main
 
-# Step 3：如有冲突（极少发生），解决后继续
+# Step 4：如有冲突（极少发生），解决后继续
 # git add <冲突文件>
 # git rebase --continue
 
-# 完成！自定义代码已包含最新上游内容
+# Step 5：强制推送 dev（rebase 后需要）
+git push origin dev --force-with-lease
 ```
+
+---
 
 ### 冲突概率分析
 
@@ -161,6 +196,38 @@ git rebase main
 | `~/.vibe-trading/` | **0%** | 在项目目录外 |
 | `ext_bridge.py` | **<1%** | 上游不会创建此同名文件 |
 | `.gitignore` | **偶发** | 双方都可能追加条目，保留双方内容即可 |
+
+---
+
+### 查看状态
+
+```bash
+# 查看当前分支和远程
+git branch -a
+git remote -v
+
+# 查看 dev 比 main 多了哪些提交
+git log main..dev --oneline
+
+# 查看上游有哪些新提交（未合并）
+git fetch upstream
+git log main..upstream/main --oneline
+```
+
+---
+
+### 撤销操作
+
+```bash
+# 撤销最后一次提交（保留文件改动）
+git reset --soft HEAD~1
+
+# 丢弃工作区改动
+git checkout -- <文件>
+
+# rebase 出错时中止
+git rebase --abort
+```
 
 ---
 
