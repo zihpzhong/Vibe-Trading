@@ -100,12 +100,16 @@ class LiveTradingTool(BaseTool):
                 "type": "number",
                 "description": "Expected order quantity in base asset (for orderbook impact check). 0 = skip.",
             },
+            "account_balance": {
+                "type": "number",
+                "description": "Account USDT balance (for position cap check). 0 = skip.",
+            },
         "mock": {
                 "type": "boolean",
                 "description": "Use mock exchange (default: true). Set to false for real trading.",
             },
         },
-        "required": ["action", "symbol", "direction"],
+        "required": ["action"],
     }
     is_readonly = False
 
@@ -126,8 +130,16 @@ class LiveTradingTool(BaseTool):
         return True
 
     def execute(self, **kwargs: Any) -> str:
-        action = kwargs["action"]
+        action = kwargs.get("action", "")
         symbol = kwargs.get("symbol", "")
+
+        # Per-action parameter validation
+        if not action:
+            return json.dumps({"status": "error", "message": "Missing required field: action"})
+        if action in ("run_gate", "calculate_stop") and not kwargs.get("direction"):
+            return json.dumps({"status": "error", "message": "Missing required field: direction"})
+        if action == "close_position" and not symbol:
+            return json.dumps({"status": "error", "message": "Missing required field: symbol"})
 
         if action == "run_gate":
             direction = SignalDirection(kwargs["direction"])
@@ -175,10 +187,12 @@ class LiveTradingTool(BaseTool):
         config = LiveTradingConfig.conservative() if mode == "conservative" else LiveTradingConfig()
 
         order_qty = kwargs.get("order_qty", 0.0)
+        account_balance = kwargs.get("account_balance", 0.0)
         engine = ExecGateEngine(config)
         result = engine.run_gate(
             signal, ticker=ticker, funding_rate=funding_rate,
             orderbook=orderbook, order_qty=order_qty,
+            account_balance=account_balance,
         )
 
         return json.dumps({
