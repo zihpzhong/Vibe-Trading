@@ -709,6 +709,7 @@ def main() -> int:
                                     stop_loss=stop_price,
                                     take_profit=tp_price,
                                     leverage=leverage,
+                                    entry_score=score,
                                 )
                                 cycle_orders += 1
                                 total_orders += 1
@@ -796,20 +797,50 @@ def main() -> int:
                 perf = positions.get_performance_metrics()
                 trade_count = perf.get("trade_count", 0)
                 if trade_count >= 3 and "error" not in perf:
-                    console.print(Panel.fit(
+                    # 按评分分档统计胜率
+                    score_tiers = positions.get_win_rate_by_score_tier()
+                    tier_lines = ""
+                    for tier_name, tier_data in score_tiers.items():
+                        if tier_data["count"] > 0:
+                            tier_lines += (
+                                f"  {tier_name}: {tier_data['count']}笔 "
+                                f"胜率={tier_data['win_rate']:.0%} "
+                                f"总PnL={tier_data['total_pnl']:+.2f}\n"
+                            )
+                    panel_text = (
                         f"[bold]绩效报告 (Cycle #{cycle_count})[/bold]\n"
                         f"  交易数: {trade_count}"
                         f"  胜率: {perf.get('win_rate', 0):.1%}"
                         f"  获利因子: {perf.get('profit_factor', 0):.2f}"
                         f"  夏普: {perf.get('sharpe', 0):.2f}"
                         f"  最大回撤: {perf.get('max_drawdown', 0):.2%}"
-                        f"  总收益: {perf.get('total_return', 0):+.2%}",
-                        border_style="cyan",
-                    ))
+                        f"  总收益: {perf.get('total_return', 0):+.2%}\n"
+                    )
+                    if tier_lines.strip():
+                        panel_text += f"\n[dim]按评分分档:[/dim]\n{tier_lines}"
+                    console.print(Panel.fit(panel_text, border_style="cyan"))
                 elif trade_count > 0:
                     console.print(f"[dim]绩效: 仅 {trade_count} 笔交易, 等待更多数据[/dim]")
             except Exception as exc:
                 log.debug("Performance report failed: %s", exc)
+
+        # ---- 极端指标值监控 ----
+        if cycle_count % 3 == 0:
+            try:
+                extreme_warnings = []
+                for r in report.rankings:
+                    rsi = r.get("rsi_1h", 50)
+                    if rsi < 20:
+                        extreme_warnings.append(f"{r.get('symbol','')} RSI_1h={rsi:.1f}（超卖）")
+                    elif rsi > 80:
+                        extreme_warnings.append(f"{r.get('symbol','')} RSI_1h={rsi:.1f}（超买）")
+                if extreme_warnings:
+                    for w in extreme_warnings[:5]:
+                        console.print(f"[yellow]⚠ 极端指标: {w}[/yellow]")
+                    if len(extreme_warnings) > 5:
+                        console.print(f"[dim]  另有 {len(extreme_warnings)-5} 个...[/dim]")
+            except Exception:
+                pass
 
         # ---- 等待到下一个周期 ----
         elapsed = time.time() - cycle_start
