@@ -350,3 +350,57 @@ class TestAccountBalance:
         assert tracker.get_exposure() == pytest.approx(0.10)  # 1000/10000
         tracker.account_balance = 5000.0
         assert tracker.get_exposure() == pytest.approx(0.20)  # 1000/5000
+
+
+# ---------------------------------------------------------------------------
+# Entry score tracking
+# ---------------------------------------------------------------------------
+
+class TestEntryScore:
+    """Entry score propagation and tier-based win rate."""
+
+    def test_open_position_stores_entry_score(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 1.0, 90.0, entry_score=8)
+        pos = tracker.get_position("X")
+        assert pos is not None
+        assert pos.entry_score == 8
+
+    def test_entry_score_propagates_to_close_record(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 1.0, 90.0, entry_score=7)
+        tracker.close_position("X", exit_price=110.0, reason="TP")
+        closed = tracker.get_recent_closed(10)
+        assert len(closed) == 1
+        assert closed[0].entry_score == 7
+
+    def test_win_rate_by_score_tier(self, tracker: PositionTracker) -> None:
+        # High score winner
+        tracker.open_position("A", "LONG", 100.0, 1.0, 90.0, entry_score=9)
+        tracker.close_position("A", exit_price=110.0, reason="TP")
+        # Medium score loser
+        tracker.open_position("B", "SHORT", 200.0, 1.0, 210.0, entry_score=5)
+        tracker.close_position("B", exit_price=210.0, reason="SL")
+        # Low score winner
+        tracker.open_position("C", "LONG", 50.0, 1.0, 45.0, entry_score=3)
+        tracker.close_position("C", exit_price=55.0, reason="TP")
+
+        tiers = tracker.get_win_rate_by_score_tier()
+        assert tiers["high (7-10)"]["count"] == 1
+        assert tiers["high (7-10)"]["wins"] == 1
+        assert tiers["high (7-10)"]["win_rate"] == 1.0
+        assert tiers["medium (5-6)"]["count"] == 1
+        assert tiers["medium (5-6)"]["wins"] == 0
+        assert tiers["low (0-4)"]["count"] == 1
+        assert tiers["low (0-4)"]["wins"] == 1
+
+    def test_entry_score_survives_serialization(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 1.0, 90.0, entry_score=8)
+        tracker.close_position("X", exit_price=110.0, reason="TP")
+        # Re-create tracker to trigger deserialization
+        import tempfile
+        import shutil
+        persist_dir = tracker._persist_path.parent
+        t2 = PositionTracker(account_balance=10000.0, persist_dir=str(persist_dir))
+        closed = t2.get_recent_closed(10)
+        assert len(closed) >= 1
+        assert closed[-1].entry_score == 8
+        t2.clear()
