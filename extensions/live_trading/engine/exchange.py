@@ -80,6 +80,10 @@ class ExchangeBase(ABC):
         """
         ...
 
+    def get_min_qty(self, symbol: str) -> float:
+        """Return minimum tradeable quantity for symbol (0.0 = unknown)."""
+        return 0.0
+
 
 class MockExchange(ExchangeBase):
     """Mock exchange that returns simulated data.

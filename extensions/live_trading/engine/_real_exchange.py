@@ -148,8 +148,9 @@ class RealExchange(ExchangeBase):
 
         # Pre-fetch LOT_SIZE stepSizes from exchangeInfo for quantity rounding
         self._step_sizes: dict[str, float] = {}
-        # Also store min notional for reference
+        # Also store min notional and min qty for reference
         self._min_notionals: dict[str, float] = {}
+        self._min_qtys: dict[str, float] = {}
         # Valid trading symbols (futures or spot depending on market_type)
         self._valid_symbols: set[str] = set()
         self._load_exchange_info()
@@ -298,12 +299,12 @@ class RealExchange(ExchangeBase):
         """Fetch current perpetual funding rate via direct HTTP."""
         with self._lock:
             resp = _retry(f"funding({symbol})", lambda: self._session.get(
-                f"{self._api_url()}/fapi/v1/premiumIndex",
+                f"{self._fapi_url()}/fapi/v1/premiumIndex",
                 params={"symbol": symbol},
                 timeout=10,
             ))
             if resp.status_code == 404:
-                logger.warning("Funding rate unavailable for %s (not a futures pair?), returning 0.0", symbol)
+                logger.warning("Funding rate 404 for %s (no perpetual futures contract), returning 0.0", symbol)
                 return 0.0
             resp.raise_for_status()
             raw = resp.json()
@@ -386,10 +387,14 @@ class RealExchange(ExchangeBase):
             side: Internal direction — "long"/"short"/"buy"/"sell" or "LONG"/"SHORT".
         """
         qty = self._round_qty(symbol, amount)
+        if qty <= 0:
+            raise RuntimeError(
+                f"market({symbol},{side},{amount}) rounds to {qty} — quantity below minimum tradeable"
+            )
         with self._lock:
             raw = _retry(f"market({symbol},{side},{qty})", self._trade_request, "/api/v3/order", {
                 "symbol": symbol, "side": self._binance_side(side), "type": "MARKET",
-                "quantity": str(qty),
+                "quantity": str(qty), "newOrderRespType": "RESULT",
             })
             return {
                 "order_id": raw.get("orderId"),
@@ -399,6 +404,8 @@ class RealExchange(ExchangeBase):
                 "amount": amount,
                 "filled": float(raw.get("executedQty", 0)),
                 "status": raw.get("status"),
+                "avg_price": float(raw.get("avgPrice", 0) or 0),
+                "cummulative_quote": float(raw.get("cummulativeQuoteQty", 0) or 0),
             }
 
     def create_limit_order(self, symbol: str, side: str, amount: float, price: float) -> dict:
@@ -643,6 +650,7 @@ class RealExchange(ExchangeBase):
                     if f.get("filterType") == "LOT_SIZE":
                         step = float(f.get("stepSize", 1))
                         self._step_sizes[sym] = step
+                        self._min_qtys[sym] = float(f.get("minQty", 0))
                         break
         except Exception as exc:
             logger.warning("Failed to load exchangeInfo for LOT_SIZE: %s", exc)
@@ -736,6 +744,10 @@ class RealExchange(ExchangeBase):
             # Code -4046 means already set to this value — not an error
             if "-4046" not in str(exc):
                 logger.warning("Failed to set leverage for %s: %s", symbol, exc)
+
+    def get_min_qty(self, symbol: str) -> float:
+        """Minimum tradeable quantity for a symbol (from LOT_SIZE minQty)."""
+        return self._min_qtys.get(symbol, 0.0)
 
     def is_valid_symbol(self, symbol: str) -> bool:
         """Check if a symbol is tradeable on the current exchange.

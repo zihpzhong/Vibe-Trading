@@ -219,11 +219,13 @@ class TestATRStop:
     """US-003: ATR 动态止损计算."""
 
     @staticmethod
-    def _make_kline(n: int = 50) -> pd.DataFrame:
+    def _make_kline(n: int = 50, vol_pct: float = 8.0) -> pd.DataFrame:
+        """Create kline data with given volatility (peak-to-trough %)."""
         prices = [100.0 + i * 0.5 for i in range(n)]
+        half = vol_pct / 200  # 8% vol → high=1.04×, low=0.96×
         return pd.DataFrame({
-            "high": [p * 1.02 for p in prices],
-            "low": [p * 0.98 for p in prices],
+            "high": [p * (1 + half) for p in prices],
+            "low": [p * (1 - half) for p in prices],
             "close": prices,
         })
 
@@ -270,8 +272,31 @@ class TestATRStop:
         """数据不足时使用固定百分比止损."""
         kline = pd.DataFrame({"high": [100.0], "low": [98.0], "close": [99.0]})
         stop, atr = calculate_atr_stop(kline, SignalDirection.LONG, 100.0)
-        assert stop == 95.0  # 5% fallback
+        assert stop == 92.0  # 8% fallback (from ATRStopConfig.min_stop_distance_pct)
         assert atr == 0.0
+
+    def test_min_stop_distance_pct_enforced(self) -> None:
+        """ATR 计算出的距离小于最小距离时，使用最小距离."""
+        kline = pd.DataFrame({
+            "high": [101.0] * 20,
+            "low": [99.0] * 20,
+            "close": [100.0] * 20,
+        })
+        # Very low volatility → ATR-based stop < 8% → should enforce min distance
+        stop, atr = calculate_atr_stop(kline, SignalDirection.LONG, 100.0)
+        assert stop == pytest.approx(92.0, rel=1e-3)  # 8% of 100
+        assert atr > 0
+
+    def test_min_stop_short_direction(self) -> None:
+        """SHORT 方向最小止损距离."""
+        kline = pd.DataFrame({
+            "high": [101.0] * 20,
+            "low": [99.0] * 20,
+            "close": [100.0] * 20,
+        })
+        stop, atr = calculate_atr_stop(kline, SignalDirection.SHORT, 100.0)
+        assert stop == pytest.approx(108.0, rel=1e-3)  # 8% of 100, above entry
+        assert atr > 0
 
 
 # ---------------------------------------------------------------------------

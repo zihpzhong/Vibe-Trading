@@ -399,7 +399,7 @@ class TestTPSLMonitorIntegration:
     ) -> None:
         tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0)
         exchange.get_tickers = MagicMock(return_value=[
-            {"symbol": "LONGUSDT", "last": 105.0},
+            {"symbol": "LONGUSDT", "last": 104.0},  # 4% profit → activates trailing, below +5% TP
         ])
         monitor = TPSLMonitor(
             exchange, tracker, poll_interval=0.05,
@@ -536,11 +536,13 @@ class TestATRStopIntegration:
     """E2E: ATR stop calculation with kline data."""
 
     @staticmethod
-    def _make_kline(n: int = 50) -> pd.DataFrame:
+    def _make_kline(n: int = 50, vol_pct: float = 8.0) -> pd.DataFrame:
+        """Create kline data with given volatility (peak-to-trough %)."""
         prices = [100.0 + i * 0.5 for i in range(n)]
+        half = vol_pct / 200
         return pd.DataFrame({
-            "high": [p * 1.02 for p in prices],
-            "low": [p * 0.98 for p in prices],
+            "high": [p * (1 + half) for p in prices],
+            "low": [p * (1 - half) for p in prices],
             "close": prices,
         })
 
@@ -551,7 +553,7 @@ class TestATRStopIntegration:
         assert stop < 150.0
         assert atr > 0
         # ATR should be reasonable for this data
-        assert 0.5 < atr < 5.0
+        assert 0.5 < atr < 15.0
 
     def test_conservative_mode_uses_tighter_stop(self) -> None:
         """conservative=True -> stop closer to entry price."""
