@@ -436,6 +436,7 @@ class PositionTracker:
             "high (7-10)": {"count": 0, "wins": 0, "total_pnl": 0.0},
             "medium (5-6)": {"count": 0, "wins": 0, "total_pnl": 0.0},
             "low (0-4)": {"count": 0, "wins": 0, "total_pnl": 0.0},
+            "N/A (旧数据)": {"count": 0, "wins": 0, "total_pnl": 0.0},
         }
         with self._lock:
             for c in self._closed:
@@ -443,8 +444,10 @@ class PositionTracker:
                     tier = "high (7-10)"
                 elif c.entry_score >= 5:
                     tier = "medium (5-6)"
-                else:
+                elif c.entry_score > 0:
                     tier = "low (0-4)"
+                else:
+                    tier = "N/A (旧数据)"
                 tiers[tier]["count"] += 1
                 if c.pnl_usdt > 0:
                     tiers[tier]["wins"] += 1
@@ -456,7 +459,7 @@ class PositionTracker:
                 "count": data["count"],
                 "wins": data["wins"],
                 "win_rate": round(data["wins"] / data["count"], 2) if data["count"] > 0 else 0.0,
-                "total_pnl": round(data["total_pnl"], 2),
+                "total_pnl": round(data["total_pnl"], 4),
             }
         return result
 
