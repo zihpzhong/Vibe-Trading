@@ -630,7 +630,12 @@ class TestOrderbookImpact:
     def test_impact_with_orderbook_data(self) -> None:
         engine = ExecGateEngine()
         signal = LiveSignal(symbol="X", direction=SignalDirection.LONG, score=5, entry_price=100.0)
-        orderbook = {"asks": [[101.0, 1.0]], "bids": [[99.0, 1.0]]}
-        result = engine.run_gate(signal, ticker={"volume24h": 5_000_000}, funding_rate=0.0005, orderbook=orderbook)
+        # Tight spread: impact of 0.1 qty at 100.1 vs mid 100.0 = 0.1% ≤ 0.5% → PASS
+        orderbook = {"asks": [["100.1", "5.0"]], "bids": [["99.9", "5.0"]]}
+        result = engine.run_gate(
+            signal, ticker={"volume24h": 5_000_000}, funding_rate=0.0005,
+            orderbook=orderbook, order_qty=0.1,
+        )
         ob_check = [c for c in result.checks if c.name == "orderbook_impact"]
-        assert len(ob_check) >= 1
+        assert len(ob_check) == 1
+        assert ob_check[0].passed

@@ -557,7 +557,8 @@ class RealExchange(ExchangeBase):
                         result: dict[str, float] = {}
                         for entry in (resp.json() if isinstance(resp.json(), list) else []):
                             asset = entry.get("asset", "")
-                            balance = float(entry.get("balance", 0))
+                            # 使用 availableBalance（可用余额）而非 balance（总钱包=可用+持仓保证金）
+                            balance = float(entry.get("availableBalance", 0))
                             if balance > 0:
                                 result[asset] = balance
                         return result
