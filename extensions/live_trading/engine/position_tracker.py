@@ -32,6 +32,7 @@ class Position:
     take_profit: Optional[float] = None
     opened_at: str = ""  # ISO 8601
     dca_count: int = 0  # 已 DCA 加仓次数
+    leverage: int = 1
 
     def __post_init__(self) -> None:
         if not self.opened_at:
@@ -47,6 +48,7 @@ class Position:
             "take_profit": self.take_profit,
             "opened_at": self.opened_at,
             "dca_count": self.dca_count,
+            "leverage": self.leverage,
         }
 
     @classmethod
@@ -60,6 +62,7 @@ class Position:
             take_profit=float(d["take_profit"]) if d.get("take_profit") else None,
             opened_at=d.get("opened_at", ""),
             dca_count=int(d.get("dca_count", 0)),
+            leverage=int(d.get("leverage", 1)),
         )
 
 
@@ -78,6 +81,7 @@ class CloseRecord:
     opened_at: str = ""
     closed_at: str = ""
     dca_count: int = 0
+    leverage: int = 1
 
     def __post_init__(self) -> None:
         if not self.closed_at:
@@ -96,6 +100,7 @@ class CloseRecord:
             "opened_at": self.opened_at,
             "closed_at": self.closed_at,
             "dca_count": self.dca_count,
+            "leverage": self.leverage,
         }
 
     @classmethod
@@ -112,6 +117,35 @@ class CloseRecord:
             opened_at=d.get("opened_at", ""),
             closed_at=d.get("closed_at", ""),
             dca_count=int(d.get("dca_count", 0)),
+            leverage=int(d.get("leverage", 1)),
+        )
+
+    def to_trade_record(self):
+        """Convert to backtest TradeRecord for performance metrics."""
+        from agent.backtest.models import TradeRecord
+        import pandas as pd
+
+        direction_int = 1 if self.direction == "LONG" else -1
+        entry_time = pd.Timestamp(self.opened_at) if self.opened_at else pd.Timestamp.now()
+        exit_time = pd.Timestamp(self.closed_at) if self.closed_at else pd.Timestamp.now()
+        # Estimate holding bars (1h bar granularity)
+        delta = exit_time - entry_time
+        holding_bars = max(1, int(delta.total_seconds() / 3600))
+
+        return TradeRecord(
+            symbol=self.symbol,
+            direction=direction_int,
+            entry_price=self.entry_price,
+            exit_price=self.exit_price,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            size=self.quantity,
+            leverage=float(self.leverage),
+            pnl=self.pnl_usdt,
+            pnl_pct=self.pnl_pct,
+            exit_reason=self.reason,
+            holding_bars=holding_bars,
+            commission=0.0,
         )
 
 
@@ -145,6 +179,8 @@ class PositionTracker:
         self._cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → timestamp
         self._trailing_stops: dict[str, float] = {}
         self._peak_prices: dict[str, float] = {}
+        self._equity_history: list[dict[str, Any]] = []  # 权益曲线快照
+        self._initial_balance: float = account_balance
         self._load()
 
     # ------------------------------------------------------------------
@@ -159,6 +195,7 @@ class PositionTracker:
         quantity: float,
         stop_loss: float,
         take_profit: Optional[float] = None,
+        leverage: int = 1,
     ) -> Position:
         """Record a new position. Overwrites existing position for the same symbol."""
         with self._lock:
@@ -169,13 +206,15 @@ class PositionTracker:
                 quantity=quantity,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                leverage=leverage,
             )
             self._positions[symbol] = pos
             # Record cooldown to prevent immediate re-entry
             key = f"{symbol}:{direction}"
             self._cooldowns[key] = time.time()
+            self._record_equity_snapshot_unlocked()
             self._persist()
-            logger.info("Position opened: %s %s @ %.4f qty=%.4f", symbol, direction, entry_price, quantity)
+            logger.info("Position opened: %s %s @ %.4f qty=%.4f lev=%dx", symbol, direction, entry_price, quantity, leverage)
             return pos
 
     def close_position(self, symbol: str, exit_price: Optional[float] = None, reason: str = "MANUAL") -> Optional[Position]:
@@ -214,6 +253,7 @@ class PositionTracker:
                     reason=reason,
                     opened_at=pos.opened_at,
                     dca_count=pos.dca_count,
+                    leverage=pos.leverage,
                 )
                 self._closed.append(record)
                 # Keep only last 50 records
@@ -221,6 +261,7 @@ class PositionTracker:
                     self._closed = self._closed[-50:]
 
                 self._persist()
+                self._record_equity_snapshot_unlocked()
                 logger.info(
                     "Position closed: %s %s %s PnL=%.2fUSDT (%.2f%%)",
                     symbol, pos.direction, reason, pnl_usdt, pnl_pct,
@@ -296,6 +337,83 @@ class PositionTracker:
         if self._account_balance <= 0:
             return 1.0
         return total_value / self._account_balance
+
+    # ------------------------------------------------------------------
+    # Equity curve tracking
+    # ------------------------------------------------------------------
+
+    def _record_equity_snapshot_unlocked(self) -> None:
+        """Record an equity snapshot. Caller must hold _lock."""
+        # Total equity = account balance + cumulative realized PnL
+        total_realized_pnl = sum(c.pnl_usdt for c in self._closed)
+        equity = self._account_balance + total_realized_pnl
+        self._equity_history.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "balance": self._account_balance,
+            "equity": round(equity, 4),
+            "active_positions": len(self._positions),
+            "total_realized_pnl": round(total_realized_pnl, 4),
+        })
+
+    def record_equity_snapshot(self) -> None:
+        """Thread-safe equity snapshot recording."""
+        with self._lock:
+            self._record_equity_snapshot_unlocked()
+
+    def get_equity_series(self):
+        """Return equity curve as pd.Series (index=timestamp, values=equity).
+
+        Returns None if no data.
+        """
+        with self._lock:
+            if not self._equity_history:
+                return None
+            import pandas as pd
+            timestamps = [pd.Timestamp(e["timestamp"]) for e in self._equity_history]
+            values = [e["equity"] for e in self._equity_history]
+            return pd.Series(values, index=timestamps)
+
+    def get_performance_metrics(self):
+        """Compute full performance metrics from equity curve and closed trades.
+
+        Returns dict from calc_metrics, or empty metrics if < 3 trades.
+        """
+        closed = self.get_recent_closed(50)
+        if len(closed) < 3:
+            return {
+                "trade_count": len(closed),
+                "win_rate": 0.0,
+                "profit_factor": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "total_return": 0.0,
+                "message": "数据太少，至少需要 3 笔交易",
+            }
+
+        trades = [c.to_trade_record() for c in closed]
+        equity = self.get_equity_series()
+        if equity is None or len(equity) < 5:
+            return {
+                "trade_count": len(trades),
+                "win_rate": 0.0,
+                "profit_factor": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "total_return": 0.0,
+                "message": "权益曲线数据不足",
+            }
+
+        try:
+            from agent.backtest.metrics import calc_metrics
+            return calc_metrics(
+                equity_curve=equity,
+                trades=trades,
+                initial_cash=self._initial_balance,
+                bars_per_year=365 * 24,  # 1h bars for crypto
+            )
+        except Exception as exc:
+            logger.warning("Performance metrics failed: %s", exc)
+            return {"trade_count": len(trades), "error": str(exc)}
 
     # ------------------------------------------------------------------
     # Guards
@@ -383,6 +501,8 @@ class PositionTracker:
             "trailing_stops": getattr(self, "_trailing_stops", {}),
             "peak_prices": getattr(self, "_peak_prices", {}),
             "account_balance": self._account_balance,
+            "initial_balance": self._initial_balance,
+            "equity_history": getattr(self, "_equity_history", []),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -411,9 +531,13 @@ class PositionTracker:
             self._peak_prices = raw.get("peak_prices", {})
             if "account_balance" in raw:
                 self._account_balance = float(raw["account_balance"])
+            if "initial_balance" in raw:
+                self._initial_balance = float(raw["initial_balance"])
+            if "equity_history" in raw:
+                self._equity_history = list(raw["equity_history"])
             logger.info(
-                "Loaded %d positions, %d closed records from %s",
-                len(self._positions), len(self._closed), self._persist_path,
+                "Loaded %d positions, %d closed records, %d equity snapshots from %s",
+                len(self._positions), len(self._closed), len(self._equity_history), self._persist_path,
             )
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.warning("Failed to load positions from %s: %s", self._persist_path, exc)
@@ -424,5 +548,6 @@ class PositionTracker:
             self._positions.clear()
             self._closed.clear()
             self._cooldowns.clear()
+            self._equity_history.clear()
             if self._persist_path.exists():
                 self._persist_path.unlink()
