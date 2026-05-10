@@ -34,6 +34,7 @@ RUN pip install --no-cache-dir -r agent/requirements.txt
 # Copy project
 COPY pyproject.toml LICENSE README.md ./
 COPY agent/ agent/
+COPY extensions/ extensions/
 
 # Copy built frontend
 COPY --from=frontend-build /app/frontend/dist frontend/dist

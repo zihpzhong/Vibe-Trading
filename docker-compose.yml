@@ -7,10 +7,26 @@ services:
       - agent/.env
     environment:
       - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1
+      - NO_PROXY=localhost,127.0.0.1
     volumes:
       - vibe-runs:/app/agent/runs
       - vibe-sessions:/app/agent/sessions
     restart: unless-stopped
+
+  live-trading:
+    build: .
+    user: root
+    env_file:
+      - agent/.env
+    environment:
+      - NO_PROXY=localhost,127.0.0.1
+      - HOME=/home/vibe
+    volumes:
+      - live-trading-data:/home/vibe/.vibe-trading
+    command: ["python", "extensions/run_live_trading.py", "--balance", "50", "--interval", "15", "--position-size", "0.2"]
+    restart: unless-stopped
+    healthcheck:
+      disable: true
 
   frontend:
     image: node:20
@@ -31,3 +47,4 @@ services:
 volumes:
   vibe-runs:
   vibe-sessions:
+  live-trading-data:
