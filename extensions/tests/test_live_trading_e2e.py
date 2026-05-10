@@ -384,7 +384,7 @@ class TestTPSLMonitorIntegration:
             call_count[0] += 1
             raise RuntimeError("API down")
 
-        exchange.create_stop_loss_order = failing_sl
+        exchange.create_market_order = failing_sl
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "LONGUSDT", "last": 89.0},
         ])
