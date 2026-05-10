@@ -490,10 +490,15 @@ class PositionTracker:
             current_exp = self._get_exposure_unlocked()
             post_exp = current_exp + (additional_notional / self._account_balance) if additional_notional > 0 else current_exp
             if post_exp >= self._max_exposure_pct:
-                return False, (
-                    f"开仓后总敞口 {post_exp:.1%} 超限 (上限 {self._max_exposure_pct:.0%}, "
-                    f"当前 {current_exp:.1%}, 新增 ${additional_notional:.2f})"
-                )
+                if additional_notional > 0:
+                    return False, (
+                        f"开仓后总敞口 {post_exp:.1%} 超限 (上限 {self._max_exposure_pct:.0%}, "
+                        f"当前 {current_exp:.1%}, 新增 ${additional_notional:.2f})"
+                    )
+                else:
+                    return False, (
+                        f"总敞口 {current_exp:.1%} 超限 (上限 {self._max_exposure_pct:.0%})"
+                    )
             return True, ""
 
     def is_in_cooldown(self, symbol: str, direction: str) -> bool:
