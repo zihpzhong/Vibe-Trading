@@ -148,23 +148,24 @@ def main() -> int:
     )
 
     # ---- 检查实际账户余额（仅 futures） ----
+    actual_usdt_balance = None
     try:
         actual_balance = exchange.get_account_balance()
         if actual_balance:
-            usdt_bal = actual_balance.get("USDT", 0)
-            if usdt_bal < args.balance:
+            actual_usdt_balance = actual_balance.get("USDT", 0)
+            if actual_usdt_balance < args.balance:
                 log.warning(
                     "Futures wallet USDT balance: %.2f (--balance=%.2f may be inaccurate)",
-                    usdt_bal, args.balance,
+                    actual_usdt_balance, args.balance,
                 )
-                if usdt_bal < 10:
+                if actual_usdt_balance < 10:
                     log.error(
                         "Insufficient futures wallet balance (%.2f USDT). "
                         "Please transfer USDT from Spot wallet to Futures wallet on Binance.",
-                        usdt_bal,
+                        actual_usdt_balance,
                     )
             else:
-                log.info("Futures wallet USDT balance: %.2f", usdt_bal)
+                log.info("Futures wallet USDT balance: %.2f", actual_usdt_balance)
     except Exception:
         log.info("Could not query account balance (non-fatal)")
 
@@ -176,8 +177,10 @@ def main() -> int:
             log.warning("set_position_mode failed (可能 Binance 网络暂时不可用), 继续启动...")
 
     # ---- 持仓管理 ----
+    # 使用实际余额（优先）或 CLI 默认值
+    effective_balance = actual_usdt_balance if actual_usdt_balance is not None else args.balance
     positions = PositionTracker(
-        account_balance=args.balance,
+        account_balance=effective_balance,
         max_positions=5,
         max_exposure_pct=5.0,  # 总敞口上限 500%（含杠杆名义价值, 5 仓 × 100%/仓）
     )
@@ -474,8 +477,8 @@ def main() -> int:
                         bal = exchange.get_account_balance()
                         if bal and "USDT" in bal:
                             positions.account_balance = float(bal["USDT"])
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.warning("余额同步失败: %s", exc)
 
                     # 2a. 检查是否可以开新仓
                     ok, reason = positions.can_open_new(symbol)
@@ -600,7 +603,20 @@ def main() -> int:
                     except Exception:
                         pass  # 非 futures 交易对无资金费率，跳过
 
-                    # 2e. 构建 LiveSignal 并执行 Gate
+                    # 2e. 计算预期下单量（Gate 需要此值做盘口冲击检查）
+                    max_lev = args.max_leverage
+                    if score >= 7:
+                        leverage = max_lev
+                    elif score >= 5:
+                        leverage = max(1, max_lev // 2)
+                    else:
+                        leverage = 1
+                    position_margin = positions.account_balance * args.position_size
+                    order_notional = position_margin * leverage
+                    order_notional = min(order_notional, positions.account_balance)
+                    order_qty = order_notional / entry_price if entry_price > 0 else 0.0
+
+                    # 2f. 构建 LiveSignal 并执行 Gate
                     live_signal = LiveSignal(
                         symbol=symbol,
                         direction=direction,
@@ -610,7 +626,10 @@ def main() -> int:
                         target_prices=[tp_price],
                     )
 
-                    gate_result = gate_engine.run_gate(live_signal, ticker, funding_rate, orderbook)
+                    gate_result = gate_engine.run_gate(
+                        live_signal, ticker, funding_rate, orderbook,
+                        order_qty=order_qty,
+                    )
 
                     # Phase 2 NEUTRAL 降级: 即使 Gate PASS 也降为 WATCH_ONLY
                     if watch_only_flag and gate_result.status.value == "PASS":
@@ -638,21 +657,8 @@ def main() -> int:
 
                     # 2g. Gate PASS → 开仓
                     if gate_result.status.value == "PASS":
-                        # 动态杠杆: score≥7 用 max_leverage, score 5-6 用半值 (借鉴 freqtrade)
-                        max_lev = args.max_leverage
-                        if score >= 7:
-                            leverage = max_lev
-                        elif score >= 5:
-                            leverage = max(1, max_lev // 2)
-                        else:
-                            leverage = 1
-
-                        # 按 position_size 分配每笔保证金, 杠杆放大名义价值
-                        # 避免均分剩余仓位导致的集中度过高
-                        position_margin = positions.account_balance * args.position_size
-                        notional = position_margin * leverage
-                        # 硬上限: 单笔名义价值不超过账户余额
-                        notional = min(notional, positions.account_balance)
+                        # 复用 Gate 前置计算的下单量（见 2e 节）
+                        notional = order_notional
                         if notional < 20:
                             console.print(
                                 f"           [yellow]SKIP — 名义价值 ${notional:.1f} < $20 Binance 最小限额[/yellow]"

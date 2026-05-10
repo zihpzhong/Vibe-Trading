@@ -96,6 +96,10 @@ class LiveTradingTool(BaseTool):
                 "enum": ["default", "conservative"],
                 "description": "Risk mode for ATR multiplier",
             },
+            "order_qty": {
+                "type": "number",
+                "description": "Expected order quantity in base asset (for orderbook impact check). 0 = skip.",
+            },
         "mock": {
                 "type": "boolean",
                 "description": "Use mock exchange (default: true). Set to false for real trading.",
@@ -170,8 +174,12 @@ class LiveTradingTool(BaseTool):
         mode = kwargs.get("mode", "default")
         config = LiveTradingConfig.conservative() if mode == "conservative" else LiveTradingConfig()
 
+        order_qty = kwargs.get("order_qty", 0.0)
         engine = ExecGateEngine(config)
-        result = engine.run_gate(signal, ticker=ticker, funding_rate=funding_rate, orderbook=orderbook)
+        result = engine.run_gate(
+            signal, ticker=ticker, funding_rate=funding_rate,
+            orderbook=orderbook, order_qty=order_qty,
+        )
 
         return json.dumps({
             "status": result.status.value,
