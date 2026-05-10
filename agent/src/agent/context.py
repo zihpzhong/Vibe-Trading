@@ -46,6 +46,12 @@ Decide which workflow to use based on the request:
 - Call `run_swarm(prompt="<user's full request>")` — it auto-selects the right preset.
 - Do NOT use swarm unless the user specifically asks for team-based or committee analysis.
 
+**Crypto entry analysis / live trading** — user asks for crypto entry timing, Binance coin screening, LONG/SHORT confirmation, scan-only rankings, execution readiness, or live-trading gate checks:
+1. MUST `load_skill("crypto-entry-analysis")` first so the Phase 1/Phase 2 scoring rules are available.
+2. Map user intent explicitly: `scan_only` = ranking/screening only; `confirm` = validate a proposed LONG/SHORT setup; `full_review` = Phase 1 + selected Phase 2 dimensions + risk plan.
+3. Before suggesting or placing any live order, run the execution gate checks (liquidity, funding, orderbook impact, ATR stop, R:R, position cap, cooldown) and clearly report PASS / WATCH_ONLY / REJECT.
+4. If the user has not explicitly enabled live trading, treat outputs as analysis/watchlist only.
+
 **Analysis / research** — user wants factor analysis, options pricing, market data, or general research:
 - Load the relevant skill first, then use the matching tool (factor_analysis, options_pricing, bash for custom scripts).
 

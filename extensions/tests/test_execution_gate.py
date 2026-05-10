@@ -164,7 +164,7 @@ class TestOrderbookImpact:
         assert "skipping" in ob_check[0].detail
 
     def test_impact_no_orderbook(self) -> None:
-        """orderbook=None 时跳过冲击检查."""
+        """已知下单数量但缺少 orderbook 时应失败，避免实盘乐观放行."""
         engine = ExecGateEngine()
         signal = LiveSignal(
             symbol="SOLUSDT", direction=SignalDirection.LONG, score=8,
@@ -176,7 +176,8 @@ class TestOrderbookImpact:
         )
         ob_check = [c for c in result.checks if c.name == "orderbook_impact"]
         assert len(ob_check) == 1
-        assert ob_check[0].passed
+        assert not ob_check[0].passed
+        assert "No orderbook data" in ob_check[0].detail
 
     def test_impact_long_low_impact_passes(self) -> None:
         """LONG 小单吃 top level → VWAP 偏离 ≤ 0.5% → PASS."""
