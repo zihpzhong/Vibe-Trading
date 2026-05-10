@@ -25,6 +25,7 @@ class ATRStopConfig:
     multiplier_default: float = 2.0  # 默认 2.0 × ATR(14)
     multiplier_conservative: float = 1.5  # 保守 1.5 × ATR(14)
     period: int = 14
+    min_stop_distance_pct: float = 8.0  # 最小止损距离 (%) — 确保给 DCA 留出空间
 
 
 @dataclass
