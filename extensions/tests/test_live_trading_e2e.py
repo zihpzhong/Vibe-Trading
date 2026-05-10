@@ -330,13 +330,17 @@ class TestPositionLifecycle:
 
     def test_can_open_new_rejects_duplicate(self, tracker: PositionTracker) -> None:
         tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
-        assert tracker.can_open_new("BTCUSDT") is False
+        ok, reason = tracker.can_open_new("BTCUSDT")
+        assert ok is False
+        assert "已有" in reason
 
     def test_can_open_new_rejects_at_max_positions(self, tracker: PositionTracker) -> None:
         tracker.open_position("A", "LONG", 100.0, 1.0, 90.0)
         tracker.open_position("B", "LONG", 200.0, 1.0, 180.0)
         tracker.open_position("C", "LONG", 300.0, 1.0, 270.0)
-        assert tracker.can_open_new("D") is False
+        ok, reason = tracker.can_open_new("D")
+        assert ok is False
+        assert "上限" in reason
 
     def test_exposure_with_multiple_positions(self, tracker: PositionTracker) -> None:
         tracker.open_position("A", "LONG", 100.0, 10.0, 90.0)   # value = 1000
