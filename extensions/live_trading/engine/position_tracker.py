@@ -33,6 +33,7 @@ class Position:
     opened_at: str = ""  # ISO 8601
     dca_count: int = 0  # 已 DCA 加仓次数
     leverage: int = 1
+    entry_score: int = 0  # 开仓时评分, 用于分档胜率统计
 
     def __post_init__(self) -> None:
         if not self.opened_at:
@@ -49,6 +50,7 @@ class Position:
             "opened_at": self.opened_at,
             "dca_count": self.dca_count,
             "leverage": self.leverage,
+            "entry_score": self.entry_score,
         }
 
     @classmethod
@@ -63,6 +65,7 @@ class Position:
             opened_at=d.get("opened_at", ""),
             dca_count=int(d.get("dca_count", 0)),
             leverage=int(d.get("leverage", 1)),
+            entry_score=int(d.get("entry_score", 0)),
         )
 
 
@@ -82,6 +85,7 @@ class CloseRecord:
     closed_at: str = ""
     dca_count: int = 0
     leverage: int = 1
+    entry_score: int = 0
 
     def __post_init__(self) -> None:
         if not self.closed_at:
@@ -101,6 +105,7 @@ class CloseRecord:
             "closed_at": self.closed_at,
             "dca_count": self.dca_count,
             "leverage": self.leverage,
+            "entry_score": self.entry_score,
         }
 
     @classmethod
@@ -118,6 +123,7 @@ class CloseRecord:
             closed_at=d.get("closed_at", ""),
             dca_count=int(d.get("dca_count", 0)),
             leverage=int(d.get("leverage", 1)),
+            entry_score=int(d.get("entry_score", 0)),
         )
 
     def to_trade_record(self):
@@ -196,6 +202,7 @@ class PositionTracker:
         stop_loss: float,
         take_profit: Optional[float] = None,
         leverage: int = 1,
+        entry_score: int = 0,
     ) -> Position:
         """Record a new position. Overwrites existing position for the same symbol."""
         with self._lock:
@@ -207,6 +214,7 @@ class PositionTracker:
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 leverage=leverage,
+                entry_score=entry_score,
             )
             self._positions[symbol] = pos
             # Record cooldown to prevent immediate re-entry
@@ -254,6 +262,7 @@ class PositionTracker:
                     opened_at=pos.opened_at,
                     dca_count=pos.dca_count,
                     leverage=pos.leverage,
+                    entry_score=pos.entry_score,
                 )
                 self._closed.append(record)
                 # Keep only last 50 records
@@ -414,6 +423,42 @@ class PositionTracker:
         except Exception as exc:
             logger.warning("Performance metrics failed: %s", exc)
             return {"trade_count": len(trades), "error": str(exc)}
+
+    def get_win_rate_by_score_tier(self) -> dict[str, dict[str, float]]:
+        """Win rate grouped by entry score tier.
+
+        Returns:
+            {"high": {"count": N, "wins": N, "win_rate": 0.0, "total_pnl": 0.0},
+             "medium": {...},
+             "low": {...}}
+        """
+        tiers = {
+            "high (7-10)": {"count": 0, "wins": 0, "total_pnl": 0.0},
+            "medium (5-6)": {"count": 0, "wins": 0, "total_pnl": 0.0},
+            "low (0-4)": {"count": 0, "wins": 0, "total_pnl": 0.0},
+        }
+        with self._lock:
+            for c in self._closed:
+                if c.entry_score >= 7:
+                    tier = "high (7-10)"
+                elif c.entry_score >= 5:
+                    tier = "medium (5-6)"
+                else:
+                    tier = "low (0-4)"
+                tiers[tier]["count"] += 1
+                if c.pnl_usdt > 0:
+                    tiers[tier]["wins"] += 1
+                tiers[tier]["total_pnl"] += c.pnl_usdt
+
+        result = {}
+        for tier_name, data in tiers.items():
+            result[tier_name] = {
+                "count": data["count"],
+                "wins": data["wins"],
+                "win_rate": round(data["wins"] / data["count"], 2) if data["count"] > 0 else 0.0,
+                "total_pnl": round(data["total_pnl"], 2),
+            }
+        return result
 
     # ------------------------------------------------------------------
     # Guards
