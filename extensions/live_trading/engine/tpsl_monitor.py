@@ -210,7 +210,12 @@ class TPSLMonitor(Thread):
             self._on_error(last_err)
 
     def _execute_sl(self, pos: Position, price: float, effective_sl: float) -> None:
-        """Execute stop-loss: STOP_MARKET order with 3x retry."""
+        """Execute stop-loss: market order to close position with 3x retry.
+
+        Uses market order (not STOP_LOSS) because the SL condition has already
+        been triggered — we need immediate execution, not a conditional algo order.
+        Binance spot API does not support STOP_LOSS on /api/v3/order.
+        """
         side = "sell" if pos.direction == "LONG" else "buy"
         detail = f"SL triggered: {pos.symbol} {pos.direction} @ {price:.4f} (SL={effective_sl:.4f})"
         logger.info(detail)
@@ -218,7 +223,7 @@ class TPSLMonitor(Thread):
         last_err: Optional[Exception] = None
         for attempt in range(MAX_RETRIES):
             try:
-                self._exchange.create_stop_loss_order(pos.symbol, side, pos.quantity, effective_sl)
+                self._exchange.create_market_order(pos.symbol, side, pos.quantity)
                 self._positions.close_position(pos.symbol)
                 self._trailing_stops.pop(pos.symbol, None)
                 self._peak_prices.pop(pos.symbol, None)

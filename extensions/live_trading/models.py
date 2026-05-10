@@ -138,6 +138,7 @@ class ScheduleReport:
     phase2_requests: list[Phase2Request] = field(default_factory=list)
     watchlist: list[dict[str, object]] = field(default_factory=list)
     btc_status: str = "CONDUCTION_OK"
+    btc_1h_trend: str = "NEUTRAL"
     active_positions: int = 0
     trading_enabled: bool = False
     scan_time_ms: float = 0.0

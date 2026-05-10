@@ -173,11 +173,11 @@ class ExecGateEngine:
             risk = (stop - entry) / entry
             reward = (entry - target) / entry
         else:
-            result.add_check("risk_reward", True, "Invalid stop placement, skipping")
+            result.add_check("risk_reward", False, "Invalid stop placement, skipping")
             return
 
         if risk <= 0:
-            result.add_check("risk_reward", True, "No calculable risk, skipping")
+            result.add_check("risk_reward", False, "No calculable risk, skipping")
             return
 
         rr = reward / risk
