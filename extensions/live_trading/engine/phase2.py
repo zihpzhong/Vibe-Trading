@@ -54,7 +54,15 @@ DIM_LABELS: dict[str, str] = {
     "dim8": "相关性",
 }
 
-SYSTEM_PROMPT = """You are a professional crypto trading analyst. Analyze each required dimension using the provided skill framework, then output a consensus verdict.
+class Phase2Analyzer:
+    """Phase 2 deep analysis: load skills per dimension → LLM → verdict."""
+
+    def __init__(self) -> None:
+        self._llm: Any = None
+
+    def _system_prompt(self, tier: str) -> str:
+        """Build tier-aware system prompt with appropriate consensus strictness."""
+        base = """You are a professional crypto trading analyst. Analyze each required dimension using the provided skill framework, then output a consensus verdict.
 
 Return valid JSON only:
 {
@@ -71,18 +79,18 @@ Return valid JSON only:
 
 Rules:
 - PASS = dimension strongly supports the signal direction
-- NEUTRAL = inconclusive or mixed signals
+- NEUTRAL = inconclusive, mixed signals, or dimension data unavailable
 - FAIL = dimension opposes the signal or shows danger
-- consensus = PASS only when ALL required dims are PASS
-- consensus = FAIL if ANY required dim is FAIL
+"""
+        if tier == "fast_track":
+            base += """- consensus = PASS when at least one dimension is PASS and none are FAIL
+- consensus = FAIL if any required dim is FAIL
+- consensus = NEUTRAL if ALL dimensions are NEUTRAL"""
+        else:
+            base += """- consensus = PASS when >= 50% of required dims are PASS and none are FAIL
+- consensus = FAIL if any required dim is FAIL
 - consensus = NEUTRAL otherwise"""
-
-
-class Phase2Analyzer:
-    """Phase 2 deep analysis: load skills per dimension → LLM → verdict."""
-
-    def __init__(self) -> None:
-        self._llm: Any = None
+        return base
 
     def _get_llm(self):
         if self._llm is None:
@@ -129,7 +137,7 @@ class Phase2Analyzer:
             llm = self._get_llm()
             response = llm.chat(
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self._system_prompt(req.tier)},
                     {"role": "user", "content": prompt},
                 ],
                 timeout=30,
@@ -140,7 +148,7 @@ class Phase2Analyzer:
             return None
 
     def _build_prompt(self, req: Phase2Request, ticker: dict, skills: dict[str, str]) -> str:
-        dim_list = "\n".join(f"  - {d} ({DIM_LABELS.get(d, d)})" for d in req.dims)
+        dim_list = "\n".join(f"  - {d} ({DIM_LABELS.get(d, d)})" for d in skills.keys())
 
         skills_block = ""
         for dim, content in skills.items():

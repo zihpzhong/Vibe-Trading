@@ -31,6 +31,7 @@ class Position:
     stop_loss: float
     take_profit: Optional[float] = None
     opened_at: str = ""  # ISO 8601
+    dca_count: int = 0  # 已 DCA 加仓次数
 
     def __post_init__(self) -> None:
         if not self.opened_at:
@@ -45,6 +46,7 @@ class Position:
             "stop_loss": self.stop_loss,
             "take_profit": self.take_profit,
             "opened_at": self.opened_at,
+            "dca_count": self.dca_count,
         }
 
     @classmethod
@@ -57,6 +59,59 @@ class Position:
             stop_loss=float(d.get("stop_loss", 0)),
             take_profit=float(d["take_profit"]) if d.get("take_profit") else None,
             opened_at=d.get("opened_at", ""),
+            dca_count=int(d.get("dca_count", 0)),
+        )
+
+
+@dataclass
+class CloseRecord:
+    """A closed position record."""
+
+    symbol: str
+    direction: str
+    entry_price: float
+    exit_price: float
+    quantity: float
+    pnl_usdt: float
+    pnl_pct: float
+    reason: str  # "TP" | "SL" | "MANUAL"
+    opened_at: str = ""
+    closed_at: str = ""
+    dca_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.closed_at:
+            self.closed_at = datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "direction": self.direction,
+            "entry_price": self.entry_price,
+            "exit_price": self.exit_price,
+            "quantity": self.quantity,
+            "pnl_usdt": self.pnl_usdt,
+            "pnl_pct": self.pnl_pct,
+            "reason": self.reason,
+            "opened_at": self.opened_at,
+            "closed_at": self.closed_at,
+            "dca_count": self.dca_count,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> CloseRecord:
+        return cls(
+            symbol=d["symbol"],
+            direction=d["direction"],
+            entry_price=float(d["entry_price"]),
+            exit_price=float(d["exit_price"]),
+            quantity=float(d["quantity"]),
+            pnl_usdt=float(d["pnl_usdt"]),
+            pnl_pct=float(d["pnl_pct"]),
+            reason=d["reason"],
+            opened_at=d.get("opened_at", ""),
+            closed_at=d.get("closed_at", ""),
+            dca_count=int(d.get("dca_count", 0)),
         )
 
 
@@ -75,7 +130,7 @@ class PositionTracker:
         self,
         account_balance: float = 10_000.0,
         max_exposure_pct: float = 0.25,
-        max_positions: int = 3,
+        max_positions: int = 5,
         cooldown_minutes: int = 30,
         persist_dir: Optional[str | Path] = None,
     ) -> None:
@@ -86,7 +141,10 @@ class PositionTracker:
         self._persist_path = (Path(persist_dir) if persist_dir else _DEFAULT_PERSIST_DIR) / "positions.json"
         self._lock = RLock()
         self._positions: dict[str, Position] = {}
+        self._closed: list[CloseRecord] = []  # 已平仓历史（最多保留最近 50 条）
         self._cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → timestamp
+        self._trailing_stops: dict[str, float] = {}
+        self._peak_prices: dict[str, float] = {}
         self._load()
 
     # ------------------------------------------------------------------
@@ -120,13 +178,98 @@ class PositionTracker:
             logger.info("Position opened: %s %s @ %.4f qty=%.4f", symbol, direction, entry_price, quantity)
             return pos
 
-    def close_position(self, symbol: str) -> Optional[Position]:
-        """Close and remove a position. Returns the closed position or None."""
+    def close_position(self, symbol: str, exit_price: Optional[float] = None, reason: str = "MANUAL") -> Optional[Position]:
+        """Close and remove a position. Records it in closed history with PnL.
+
+        Args:
+            symbol: Position symbol to close.
+            exit_price: Price at which the position was closed (for PnL calculation).
+            reason: Close reason — "TP", "SL", or "MANUAL".
+
+        Returns:
+            The closed Position or None.
+        """
         with self._lock:
             pos = self._positions.pop(symbol, None)
             if pos:
+                if exit_price is not None and exit_price > 0:
+                    if pos.direction == "LONG":
+                        pnl_usdt = (exit_price - pos.entry_price) * pos.quantity
+                        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+                    else:
+                        pnl_usdt = (pos.entry_price - exit_price) * pos.quantity
+                        pnl_pct = (pos.entry_price - exit_price) / pos.entry_price * 100
+                else:
+                    pnl_usdt = 0.0
+                    pnl_pct = 0.0
+
+                record = CloseRecord(
+                    symbol=pos.symbol,
+                    direction=pos.direction,
+                    entry_price=pos.entry_price,
+                    exit_price=exit_price or pos.entry_price,
+                    quantity=pos.quantity,
+                    pnl_usdt=round(pnl_usdt, 4),
+                    pnl_pct=round(pnl_pct, 2),
+                    reason=reason,
+                    opened_at=pos.opened_at,
+                    dca_count=pos.dca_count,
+                )
+                self._closed.append(record)
+                # Keep only last 50 records
+                if len(self._closed) > 50:
+                    self._closed = self._closed[-50:]
+
                 self._persist()
-                logger.info("Position closed: %s %s @ %.4f", symbol, pos.direction, pos.entry_price)
+                logger.info(
+                    "Position closed: %s %s %s PnL=%.2fUSDT (%.2f%%)",
+                    symbol, pos.direction, reason, pnl_usdt, pnl_pct,
+                )
+            return pos
+
+    def get_recent_closed(self, n: int = 10) -> list[CloseRecord]:
+        """Return the most recent N closed position records."""
+        with self._lock:
+            return list(self._closed[-n:])
+
+    def adjust_position(self, symbol: str, add_quantity: float, new_price: float) -> Optional[Position]:
+        """DCA: add quantity to existing position, recalc average entry price.
+
+        Returns updated position or None if symbol not found.
+        """
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if not pos:
+                return None
+            total_qty = pos.quantity + add_quantity
+            pos.entry_price = (pos.entry_price * pos.quantity + new_price * add_quantity) / total_qty
+            pos.quantity = total_qty
+            pos.dca_count += 1
+            self._persist()
+            logger.info(
+                "Position adjusted: %s +%.4f @ %.4f, new avg=%.4f qty=%.4f (dca#%d)",
+                symbol, add_quantity, new_price, pos.entry_price, total_qty, pos.dca_count,
+            )
+            return pos
+
+    def reduce_position(self, symbol: str, reduce_qty: float, current_price: float) -> Optional[Position]:
+        """Partially close a position (e.g. partial fill).
+
+        If reduce_qty >= total quantity, fully closes the position.
+        Otherwise reduces quantity in-place.
+        """
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if not pos:
+                return None
+            if reduce_qty >= pos.quantity:
+                return self.close_position(symbol, exit_price=current_price, reason="PARTIAL")
+            pos.quantity -= reduce_qty
+            self._persist()
+            logger.info(
+                "Position reduced: %s -%.4f @ %.4f, remaining qty=%.4f",
+                symbol, reduce_qty, current_price, pos.quantity,
+            )
             return pos
 
     # ------------------------------------------------------------------
@@ -202,6 +345,25 @@ class PositionTracker:
     # Persistence
     # ------------------------------------------------------------------
 
+
+    def get_trailing_state(self) -> dict[str, dict[str, float]]:
+        """Return current trailing stop state for external persistence.
+
+        Returns:
+            {"trailing_stops": {...}, "peak_prices": {...}}
+        """
+        with self._lock:
+            return {
+                "trailing_stops": dict(self._trailing_stops),
+                "peak_prices": dict(self._peak_prices),
+            }
+
+    def set_trailing_state(self, trailing_stops: dict[str, float], peak_prices: dict[str, float]) -> None:
+        """Restore trailing stop state from persisted data."""
+        with self._lock:
+            self._trailing_stops = trailing_stops or {}
+            self._peak_prices = peak_prices or {}
+            self._persist()
     def _persist(self) -> None:
         """Write positions and cooldowns to JSON file.
 
@@ -212,7 +374,10 @@ class PositionTracker:
         self._persist_path.parent.mkdir(parents=True, exist_ok=True)
         data: dict[str, Any] = {
             "positions": [p.to_dict() for p in self._positions.values()],
+            "closed": [c.to_dict() for c in self._closed],
             "cooldowns": {k: v for k, v in self._cooldowns.items()},
+            "trailing_stops": getattr(self, "_trailing_stops", {}),
+            "peak_prices": getattr(self, "_peak_prices", {}),
             "account_balance": self._account_balance,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -232,11 +397,19 @@ class PositionTracker:
             for p in raw.get("positions", []):
                 pos = Position.from_dict(p)
                 self._positions[pos.symbol] = pos
+            for c in raw.get("closed", []):
+                try:
+                    self._closed.append(CloseRecord.from_dict(c))
+                except (KeyError, ValueError) as exc:
+                    logger.warning("Skipping invalid close record: %s", exc)
             self._cooldowns = {k: float(v) for k, v in raw.get("cooldowns", {}).items()}
+            self._trailing_stops = raw.get("trailing_stops", {})
+            self._peak_prices = raw.get("peak_prices", {})
             if "account_balance" in raw:
                 self._account_balance = float(raw["account_balance"])
             logger.info(
-                "Loaded %d positions from %s", len(self._positions), self._persist_path,
+                "Loaded %d positions, %d closed records from %s",
+                len(self._positions), len(self._closed), self._persist_path,
             )
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.warning("Failed to load positions from %s: %s", self._persist_path, exc)
@@ -245,6 +418,7 @@ class PositionTracker:
         """Remove all positions and clear persistence (useful for testing)."""
         with self._lock:
             self._positions.clear()
+            self._closed.clear()
             self._cooldowns.clear()
             if self._persist_path.exists():
                 self._persist_path.unlink()

@@ -71,23 +71,24 @@ class TestTakeProfit:
         assert tracker.active_count == 0
 
     def test_tp_not_triggered_below_threshold(self, exchange: MockExchange, tracker: PositionTracker) -> None:
+        """Dynamic TP at +5% (held <30min) should not trigger at +4%."""
         tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0, 120.0)
         exchange.get_tickers = MagicMock(return_value=[
-            {"symbol": "LONGUSDT", "last": 119.0},
+            {"symbol": "LONGUSDT", "last": 104.0},  # +4% < +5% dynamic TP
         ])
         monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
         monitor._poll()
         assert tracker.active_count == 1  # still open
 
-    def test_tp_no_take_profit_set(self, exchange: MockExchange, tracker: PositionTracker) -> None:
-        """Position without take_profit doesn't trigger TP."""
-        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0)  # no TP
+    def test_tp_triggered_by_dynamic_threshold(self, exchange: MockExchange, tracker: PositionTracker) -> None:
+        """Dynamic TP (+5% for <30min) triggers even without fixed TP."""
+        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0)  # no fixed TP
         exchange.get_tickers = MagicMock(return_value=[
-            {"symbol": "LONGUSDT", "last": 999.0},  # way above
+            {"symbol": "LONGUSDT", "last": 106.0},  # +6% > +5% dynamic TP
         ])
         monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
         monitor._poll()
-        assert tracker.active_count == 1  # still open, no TP to hit
+        assert tracker.active_count == 0  # triggered by dynamic TP
 
 
 # ---------------------------------------------------------------------------
@@ -185,19 +186,19 @@ class TestTrailingStop:
             exchange, tracker, poll_interval=0.05,
             trailing_activation_pct=3.0, trail_distance_pct=1.5,
         )
-        # First poll: price at 105 (5% profit) → trailing activates, SL = 105*0.985 = 103.425
-        exchange.get_tickers = MagicMock(return_value=[{"symbol": "LONGUSDT", "last": 105.0}])
+        # First poll: price at 104 (4% profit) → trailing activates, SL = 104*0.985 = 102.44
+        exchange.get_tickers = MagicMock(return_value=[{"symbol": "LONGUSDT", "last": 104.0}])
         monitor._poll()
         sl_after_first = monitor._trailing_stops["LONGUSDT"]
 
-        # Second poll: price drops to 104 (4% profit, still above SL=103.425)
-        exchange.get_tickers = MagicMock(return_value=[{"symbol": "LONGUSDT", "last": 104.0}])
+        # Second poll: price drops to 103 (still above SL=102.44, no TP trigger at +3%)
+        exchange.get_tickers = MagicMock(return_value=[{"symbol": "LONGUSDT", "last": 103.0}])
         monitor._poll()
         sl_after_second = monitor._trailing_stops["LONGUSDT"]
 
-        # SL should NOT have retreated — peak at 105, SL stays at 105*0.985
+        # SL should NOT have retreated — peak at 104, SL stays at 104*0.985
         assert sl_after_second == sl_after_first
-        # Position still open (104 > SL, no trigger)
+        # Position still open (103 > SL, no trigger)
         assert tracker.active_count == 1
 
     def test_trailing_short_only_moves_down(self, exchange: MockExchange, tracker: PositionTracker) -> None:

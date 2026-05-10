@@ -1,0 +1,28 @@
+{
+  "title": "交易系统优化：止损距离放宽 + Phase 2 宽松化",
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "ATR 最小止损距离扩至 8%，给 DCA 留出空间",
+      "acceptanceCriteria": [
+        "ATRStopConfig 新增 min_stop_distance_pct 字段，默认值 8.0",
+        "calculate_atr_stop 确保止损距离不低于 min_stop_distance_pct",
+        "数据不足时的固定百分比止损从 5% 改为 8%",
+        "extensions/tests/ 中所有已有测试通过"
+      ],
+      "passes": true
+    },
+    {
+      "id": "US-002",
+      "title": "Phase 2 enhanced 层共识规则放宽",
+      "acceptanceCriteria": [
+        "enhanced 层（score 5-6）consensus 改为: ≥50% dims 为 PASS 且无 FAIL 即为 PASS",
+        "enhanced 层 FAIL 规则不变: 任一 dim FAIL 则 consensus=FAIL",
+        "enhanced 层 NEUTRAL 规则: 不满足 PASS 条件即为 NEUTRAL",
+        "fast_track 层规则不变",
+        "extensions/tests/ 中所有已有测试通过"
+      ],
+      "passes": true
+    }
+  ]
+}
