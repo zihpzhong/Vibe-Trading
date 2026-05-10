@@ -647,9 +647,9 @@ def main() -> int:
                         notional = position_margin * leverage
                         # 硬上限: 单笔名义价值不超过账户余额
                         notional = min(notional, positions.account_balance)
-                        if notional < 5:
+                        if notional < 20:
                             console.print(
-                                f"           [yellow]SKIP — 名义价值 ${notional:.1f} < $5 最小限额[/yellow]"
+                                f"           [yellow]SKIP — 名义价值 ${notional:.1f} < $20 Binance 最小限额[/yellow]"
                             )
                             continue
                         if args.dry_run:

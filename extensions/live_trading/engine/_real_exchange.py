@@ -380,22 +380,27 @@ class RealExchange(ExchangeBase):
                    "long": "BUY", "short": "SELL", "buy": "BUY", "sell": "SELL"}
         return mapping.get(side, side.upper())
 
-    def create_market_order(self, symbol: str, side: str, amount: float) -> dict:
+    def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
         """Place a market order via direct HTTP.
 
         Args:
             side: Internal direction — "long"/"short"/"buy"/"sell" or "LONG"/"SHORT".
+            reduce_only: If True, adds reduceOnly=true (allows closing positions
+                         below Binance 20 USDT minimum notional).
         """
         qty = self._round_qty(symbol, amount)
         if qty <= 0:
             raise RuntimeError(
                 f"market({symbol},{side},{amount}) rounds to {qty} — quantity below minimum tradeable"
             )
+        params: dict[str, str] = {
+            "symbol": symbol, "side": self._binance_side(side), "type": "MARKET",
+            "quantity": str(qty), "newOrderRespType": "RESULT",
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
         with self._lock:
-            raw = _retry(f"market({symbol},{side},{qty})", self._trade_request, "/api/v3/order", {
-                "symbol": symbol, "side": self._binance_side(side), "type": "MARKET",
-                "quantity": str(qty), "newOrderRespType": "RESULT",
-            })
+            raw = _retry(f"market({symbol},{side},{qty})", self._trade_request, "/api/v3/order", params)
             return {
                 "order_id": raw.get("orderId"),
                 "symbol": raw.get("symbol"),
