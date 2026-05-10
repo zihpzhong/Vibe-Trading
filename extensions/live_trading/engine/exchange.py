@@ -63,8 +63,12 @@ class ExchangeBase(ABC):
         ...
 
     @abstractmethod
-    def create_market_order(self, symbol: str, side: str, amount: float) -> dict:
+    def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
         """Create a market order.
+
+        Args:
+            reduce_only: If True, order will only reduce position (Binance futures).
+                          Allows closing positions below minimum notional (20 USDT).
 
         Returns:
             dict with keys: order_id, symbol, side, type, amount, filled, status
@@ -170,7 +174,7 @@ class MockExchange(ExchangeBase):
     # Mock trading methods (for TPSLMonitor / Scheduler testing)
     # ------------------------------------------------------------------
 
-    def create_market_order(self, symbol: str, side: str, amount: float) -> dict:
+    def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
         return {
             "order_id": f"mock_market_{random.randint(1000, 9999)}",
             "symbol": symbol, "side": side, "type": "market",
