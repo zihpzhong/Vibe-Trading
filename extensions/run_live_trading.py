@@ -178,7 +178,7 @@ def main() -> int:
     positions = PositionTracker(
         account_balance=args.balance,
         max_positions=5,
-        max_exposure_pct=0.75,  # 总敞口上限 75%（含杠杆名义价值）
+        max_exposure_pct=5.0,  # 总敞口上限 500%（含杠杆名义价值, 5 仓 × 100%/仓）
     )
 
     # ---- Phase 2 分析引擎 ----
@@ -466,8 +466,9 @@ def main() -> int:
                         pass
 
                     # 2a. 检查是否可以开新仓
-                    if not positions.can_open_new(symbol):
-                        console.print(f"  {symbol} [yellow]SKIP[/yellow] 仓位已达上限或已有持仓")
+                    ok, reason = positions.can_open_new(symbol)
+                    if not ok:
+                        console.print(f"  {symbol} [yellow]SKIP[/yellow] {reason}")
                         continue
                     if positions.is_in_cooldown(symbol, req.direction):
                         console.print(f"  {symbol} [yellow]SKIP[/yellow] 冷却中")
