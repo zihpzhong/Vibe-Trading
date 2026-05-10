@@ -69,12 +69,12 @@ vibe-trading = "cli:main"
 vibe-trading-mcp = "mcp_server:main"
 
 [tool.setuptools]
-package-dir = {"" = "agent"}
+package-dir = {"" = "agent", "extensions" = "extensions"}
 py-modules = ["cli", "api_server", "mcp_server"]
 
 [tool.setuptools.packages.find]
-where = ["agent"]
-include = ["src*", "backtest*"]
+where = ["agent", "extensions"]
+include = ["src*", "backtest*", "live_trading*", "tools*"]
 
 [tool.setuptools.package-data]
 "src" = [
@@ -98,8 +98,8 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["agent/tests"]
-pythonpath = ["agent"]
+testpaths = ["agent/tests", "extensions/tests"]
+pythonpath = ["agent", "."]
 markers = [
     "unit: Unit tests (fast, no network)",
     "integration: Integration tests (may need network)",
