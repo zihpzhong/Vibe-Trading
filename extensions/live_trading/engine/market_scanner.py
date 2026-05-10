@@ -318,6 +318,7 @@ class MarketScanner:
                 "score": score,
                 "long_score": long_score,
                 "short_score": short_score,
+                "entry_price": indicators["price"],
                 "rsi_1h": indicators["rsi_1h"],
                 "rsi_15m": indicators["rsi_15m"],
                 "change_24h": indicators["change_24h"],

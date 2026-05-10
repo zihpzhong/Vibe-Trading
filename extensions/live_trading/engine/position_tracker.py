@@ -467,8 +467,12 @@ class PositionTracker:
     # Guards
     # ------------------------------------------------------------------
 
-    def can_open_new(self, symbol: str) -> tuple[bool, str]:
+    def can_open_new(self, symbol: str, additional_notional: float = 0.0) -> tuple[bool, str]:
         """Check if a new position can be opened.
+
+        Args:
+            symbol: Trading symbol to check.
+            additional_notional: Expected notional of the new position (0 = skip).
 
         Returns:
             (True, "") if allowed, or (False, "reason string") if rejected.
@@ -476,16 +480,20 @@ class PositionTracker:
         Rejects if:
         - Symbol already has an active position
         - Maximum number of positions reached
-        - Exposure limit exceeded
+        - Total exposure (current + new) exceeds limit
         """
         with self._lock:
             if symbol in self._positions:
                 return False, f"已有 {symbol} 持仓"
             if len(self._positions) >= self._max_positions:
                 return False, f"仓位已达上限 ({self._max_positions})"
-            exp = self._get_exposure_unlocked()
-            if exp >= self._max_exposure_pct:
-                return False, f"总敞口超限 ({exp:.1%} >= {self._max_exposure_pct:.0%})"
+            current_exp = self._get_exposure_unlocked()
+            post_exp = current_exp + (additional_notional / self._account_balance) if additional_notional > 0 else current_exp
+            if post_exp >= self._max_exposure_pct:
+                return False, (
+                    f"开仓后总敞口 {post_exp:.1%} 超限 (上限 {self._max_exposure_pct:.0%}, "
+                    f"当前 {current_exp:.1%}, 新增 ${additional_notional:.2f})"
+                )
             return True, ""
 
     def is_in_cooldown(self, symbol: str, direction: str) -> bool:
@@ -510,6 +518,11 @@ class PositionTracker:
     def account_balance(self, value: float) -> None:
         with self._lock:
             self._account_balance = value
+
+    @property
+    def max_exposure_pct(self) -> float:
+        """Maximum total exposure fraction (e.g. 0.25 = 25%)."""
+        return self._max_exposure_pct
 
     # ------------------------------------------------------------------
     # Persistence
