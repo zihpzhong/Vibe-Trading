@@ -236,7 +236,7 @@ class TPSLMonitor(Thread):
         last_err: Optional[Exception] = None
         for attempt in range(MAX_RETRIES):
             try:
-                order = self._exchange.create_market_order(pos.symbol, side, pos.quantity)
+                order = self._exchange.create_market_order(pos.symbol, side, pos.quantity, reduce_only=True)
                 filled = order.get("filled", 0) or 0
                 if filled < pos.quantity:
                     remaining = pos.quantity - filled
@@ -297,7 +297,7 @@ class TPSLMonitor(Thread):
         last_err: Optional[Exception] = None
         for attempt in range(MAX_RETRIES):
             try:
-                order = self._exchange.create_market_order(pos.symbol, side, pos.quantity)
+                order = self._exchange.create_market_order(pos.symbol, side, pos.quantity, reduce_only=True)
                 filled = order.get("filled", 0) or 0
                 if filled < pos.quantity:
                     remaining = pos.quantity - filled
