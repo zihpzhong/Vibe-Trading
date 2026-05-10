@@ -133,6 +133,129 @@ class TestExecGateEngine:
             assert check.detail
 
 
+class TestOrderbookImpact:
+    """盘口冲击 VWAP 吃单模拟测试."""
+
+    @staticmethod
+    def _make_orderbook(base_price: float = 145.0, levels: int = 10, size: float = 1.0) -> dict:
+        """Create a synthetic orderbook for testing.
+
+        Bids step down 0.1% per level, asks step up 0.1% per level.
+        """
+        bids = [[f"{base_price * (1 - 0.001 * (i + 1)):.2f}", str(size)] for i in range(levels)]
+        asks = [[f"{base_price * (1 + 0.001 * (i + 1)):.2f}", str(size)] for i in range(levels)]
+        return {"bids": bids, "asks": asks}
+
+    def test_impact_skip_zero_qty(self) -> None:
+        """order_qty=0 时跳过冲击检查."""
+        engine = ExecGateEngine()
+        signal = LiveSignal(
+            symbol="SOLUSDT", direction=SignalDirection.LONG, score=8,
+            entry_price=145.0, stop_loss=141.0, target_prices=[152.0],
+        )
+        orderbook = self._make_orderbook()
+        result = engine.run_gate(
+            signal, ticker={"volume24h": 2_100_000},
+            funding_rate=0.0005, orderbook=orderbook, order_qty=0,
+        )
+        ob_check = [c for c in result.checks if c.name == "orderbook_impact"]
+        assert len(ob_check) == 1
+        assert ob_check[0].passed
+        assert "skipping" in ob_check[0].detail
+
+    def test_impact_no_orderbook(self) -> None:
+        """orderbook=None 时跳过冲击检查."""
+        engine = ExecGateEngine()
+        signal = LiveSignal(
+            symbol="SOLUSDT", direction=SignalDirection.LONG, score=8,
+            entry_price=145.0, stop_loss=141.0, target_prices=[152.0],
+        )
+        result = engine.run_gate(
+            signal, ticker={"volume24h": 2_100_000},
+            funding_rate=0.0005, orderbook=None, order_qty=0.5,
+        )
+        ob_check = [c for c in result.checks if c.name == "orderbook_impact"]
+        assert len(ob_check) == 1
+        assert ob_check[0].passed
+
+    def test_impact_long_low_impact_passes(self) -> None:
+        """LONG 小单吃 top level → VWAP 偏离 ≤ 0.5% → PASS."""
+        engine = ExecGateEngine()
+        signal = LiveSignal(
+            symbol="SOLUSDT", direction=SignalDirection.LONG, score=8,
+            entry_price=145.0, stop_loss=141.0, target_prices=[152.0],
+        )
+        # Each ask level has size 5.0, first ask at ~145.145
+        # Eating 0.5 qty stays within top level → VWAP ≈ 145.145
+        # Mid = (144.855 + 145.145) / 2 = 145.0
+        # Impact = (145.145 - 145.0) / 145.0 * 100 ≈ 0.1% ≤ 0.5%
+        orderbook = self._make_orderbook(base_price=145.0, size=5.0)
+        result = engine.run_gate(
+            signal, ticker={"volume24h": 2_100_000},
+            funding_rate=0.0005, orderbook=orderbook, order_qty=0.5,
+        )
+        ob_check = [c for c in result.checks if c.name == "orderbook_impact"]
+        assert len(ob_check) == 1
+        assert ob_check[0].passed, f"Expected PASS, got: {ob_check[0].detail}"
+
+    def test_impact_long_high_impact_fails(self) -> None:
+        """LONG 大单吃多档 → VWAP 偏离 > 0.5% → FAIL."""
+        engine = ExecGateEngine()
+        signal = LiveSignal(
+            symbol="SOLUSDT", direction=SignalDirection.LONG, score=8,
+            entry_price=145.0, stop_loss=141.0, target_prices=[152.0],
+        )
+        # Each level size=1.0, 10 levels stepping up 0.1% each
+        # Total depth = 10.0, qty = 10.0 eats entire book
+        # VWAP ≈ 145.80 vs mid ≈ 145.00 → impact ≈ 0.55% > 0.5%
+        orderbook = self._make_orderbook(base_price=145.0, size=1.0)
+        result = engine.run_gate(
+            signal, ticker={"volume24h": 2_100_000},
+            funding_rate=0.0005, orderbook=orderbook, order_qty=10.0,
+        )
+        ob_check = [c for c in result.checks if c.name == "orderbook_impact"]
+        assert len(ob_check) == 1
+        assert not ob_check[0].passed, f"Expected FAIL, got: {ob_check[0].detail}"
+
+    def test_impact_insufficient_depth(self) -> None:
+        """目标数量超出可用深度 → FAIL."""
+        engine = ExecGateEngine()
+        signal = LiveSignal(
+            symbol="SOLUSDT", direction=SignalDirection.LONG, score=8,
+            entry_price=145.0, stop_loss=141.0, target_prices=[152.0],
+        )
+        # Each level size=1.0, 10 levels → total depth = 10.0
+        # Qty = 20.0 exceeds total available
+        orderbook = self._make_orderbook(base_price=145.0, size=1.0)
+        result = engine.run_gate(
+            signal, ticker={"volume24h": 2_100_000},
+            funding_rate=0.0005, orderbook=orderbook, order_qty=20.0,
+        )
+        ob_check = [c for c in result.checks if c.name == "orderbook_impact"]
+        assert len(ob_check) == 1
+        assert not ob_check[0].passed
+        assert "Cannot fill" in ob_check[0].detail
+
+    def test_impact_short_passes(self) -> None:
+        """SHORT 方向吃 bid 盘口 → 低偏离 → PASS."""
+        engine = ExecGateEngine()
+        signal = LiveSignal(
+            symbol="SOLUSDT", direction=SignalDirection.SHORT, score=8,
+            entry_price=145.0, stop_loss=149.0, target_prices=[138.0],
+        )
+        # Each bid level has size 5.0, first bid at ~144.855
+        # Eating 0.3 qty → VWAP ≈ 144.855
+        # Impact ≈ (145.0 - 144.855) / 145.0 * 100 ≈ 0.1% ≤ 0.5%
+        orderbook = self._make_orderbook(base_price=145.0, size=5.0)
+        result = engine.run_gate(
+            signal, ticker={"volume24h": 2_100_000},
+            funding_rate=-0.0002, orderbook=orderbook, order_qty=0.3,
+        )
+        ob_check = [c for c in result.checks if c.name == "orderbook_impact"]
+        assert len(ob_check) == 1
+        assert ob_check[0].passed, f"Expected PASS, got: {ob_check[0].detail}"
+
+
 # ---------------------------------------------------------------------------
 # BTC 联动前置检查
 # ---------------------------------------------------------------------------

@@ -291,7 +291,8 @@ class MarketScanner:
         for i, t in enumerate(batch):
             sym = t["symbol"]
             # Skip stablecoins — they should never generate trading signals
-            base_currency = sym.removesuffix("USDT").removesuffix("USD")
+            # Only USDT pairs reach this point; strip USDT suffix to find the base currency
+            base_currency = sym.removesuffix("USDT")
             if base_currency in _STABLECOINS:
                 logger.info("  Filter(稳定币): %s skipped", sym)
                 continue

@@ -167,13 +167,12 @@ class TPSLMonitor(Thread):
         else:
             tp_pct = 0.001
 
-        # If fixed TP is set, use the tighter (lower) threshold
+        # If fixed TP is set, use it directly (time decay is fallback for no-TP positions)
         if pos.take_profit is not None:
             if pos.direction == "LONG":
-                fixed_pct = (pos.take_profit - pos.entry_price) / pos.entry_price
+                tp_pct = (pos.take_profit - pos.entry_price) / pos.entry_price
             else:
-                fixed_pct = (pos.entry_price - pos.take_profit) / pos.entry_price
-            tp_pct = min(tp_pct, fixed_pct)
+                tp_pct = (pos.entry_price - pos.take_profit) / pos.entry_price
 
         if pos.direction == "LONG":
             return price >= pos.entry_price * (1 + tp_pct)

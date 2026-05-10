@@ -36,6 +36,7 @@ class ExecGateEngine:
         ticker: Optional[dict] = None,
         funding_rate: float = 0.0,
         orderbook: Optional[dict] = None,
+        order_qty: float = 0.0,
     ) -> ExecutionGateResult:
         """Run all gate checks against a signal.
 
@@ -44,6 +45,8 @@ class ExecGateEngine:
             ticker: Ticker dict with keys: last, volume24h, etc.
             funding_rate: Current perpetual funding rate.
             orderbook: Order book dict with bids/asks.
+            order_qty: Expected order quantity in base asset. Used for
+                orderbook impact simulation. 0 = skip impact check.
 
         Returns:
             ExecutionGateResult with aggregated verdict.
@@ -56,7 +59,7 @@ class ExecGateEngine:
 
         self._check_liquidity(result, ticker)
         self._check_funding_rate(result, funding_rate)
-        self._check_orderbook_impact(result, orderbook, signal)
+        self._check_orderbook_impact(result, orderbook, signal, order_qty)
         self._check_risk_reward(result, signal)
         self._check_position_cap(result)
 
@@ -115,18 +118,21 @@ class ExecGateEngine:
 
     def _check_orderbook_impact(
         self, result: ExecutionGateResult, orderbook: Optional[dict],
-        signal: LiveSignal,
+        signal: LiveSignal, order_qty: float = 0.0,
     ) -> None:
-        """Estimate orderbook impact based on a notional trade size."""
-        if orderbook is None:
-            result.add_check("orderbook_impact", True, "No orderbook data, skipping")
+        """Estimate orderbook impact by simulating eating through depth levels.
+
+        LONG eats from asks, SHORT eats from bids. Computes VWAP of filled
+        quantity and measures deviation from mid price. If target qty can't
+        be filled within available depth, the check fails.
+
+        Pass order_qty=0 (default) to skip the check (no order size known).
+        """
+        if orderbook is None or order_qty <= 0:
+            result.add_check("orderbook_impact", True, "No order qty or orderbook, skipping")
             return
 
         max_impact = self.config.execution_gate.max_orderbook_impact_pct
-        notional = signal.entry_price or 0
-        if notional <= 0:
-            result.add_check("orderbook_impact", True, "No entry price, skipping")
-            return
 
         if signal.direction == SignalDirection.LONG:
             levels = orderbook.get("asks", [])
@@ -137,23 +143,51 @@ class ExecGateEngine:
             result.add_check("orderbook_impact", True, "No orderbook depth, skipping")
             return
 
-        # Single-level impact: price impact of trading 1 unit at the top level
-        top_price, top_size = float(levels[0][0]), float(levels[0][1])
-        trade_size = notional * 0.01  # assume 1% of notional
-        if top_size > 0 and trade_size / top_size > 0.5:
-            impact_pct = abs(top_price - notional) / notional * 100
-            if impact_pct <= max_impact:
-                result.add_check(
-                    "orderbook_impact", True,
-                    f"Impact ~{impact_pct:.2f}% ≤ {max_impact}%",
-                )
-            else:
-                result.add_check(
-                    "orderbook_impact", False,
-                    f"Impact ~{impact_pct:.2f}% > {max_impact}% (too high)",
-                )
+        # Simulate eating through orderbook levels
+        remaining = order_qty
+        total_cost = 0.0
+        filled = 0.0
+        for price_str, qty_str in levels:
+            price = float(price_str) if isinstance(price_str, str) else price_str
+            qty = float(qty_str) if isinstance(qty_str, str) else qty_str
+            take = min(qty, remaining)
+            filled += take
+            total_cost += take * price
+            remaining -= take
+            if remaining <= 0:
+                break
+
+        if remaining > 1e-8:
+            result.add_check(
+                "orderbook_impact", False,
+                f"Cannot fill {order_qty:.6f} {signal.symbol}, only {filled:.6f} available in orderbook",
+            )
+            return
+
+        # Mid price from best bid/ask
+        best_bid = float(orderbook["bids"][0][0]) if orderbook.get("bids") else signal.entry_price or 0
+        best_ask = float(orderbook["asks"][0][0]) if orderbook.get("asks") else signal.entry_price or 0
+
+        if best_bid <= 0 or best_ask <= 0:
+            result.add_check("orderbook_impact", True, "Invalid bid/ask for mid price, skipping")
+            return
+
+        mid = (best_bid + best_ask) / 2
+        vwap = total_cost / filled
+        impact_pct = abs(vwap - mid) / mid * 100
+
+        if impact_pct <= max_impact:
+            result.add_check(
+                "orderbook_impact", True,
+                f"VWAP impact ~{impact_pct:.2f}% ≤ {max_impact}% "
+                f"(mid={mid:.4f}, vwap={vwap:.4f}, filled={filled:.6f})",
+            )
         else:
-            result.add_check("orderbook_impact", True, "Top level depth sufficient")
+            result.add_check(
+                "orderbook_impact", False,
+                f"VWAP impact ~{impact_pct:.2f}% > {max_impact}% "
+                f"(mid={mid:.4f}, vwap={vwap:.4f}, filled={filled:.6f})",
+            )
 
     def _check_risk_reward(self, result: ExecutionGateResult, signal: LiveSignal) -> None:
         """Check R:R ratio meets minimum."""
