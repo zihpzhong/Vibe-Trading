@@ -131,8 +131,7 @@ class TestStopLoss:
             call_count[0] += 1
             raise RuntimeError("API down")
 
-        exchange.create_stop_loss_order = failing_sl
-        exchange.create_market_order = MagicMock()
+        exchange.create_market_order = failing_sl
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "LONGUSDT", "last": 89.0},
         ])
@@ -145,8 +144,8 @@ class TestStopLoss:
     def test_sl_closes_position_on_success(self, exchange: MockExchange, tracker: PositionTracker) -> None:
         """SL closes position via STOP_MARKET."""
         tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0)
-        exchange.create_stop_loss_order = MagicMock(return_value={
-            "order_id": "sl123", "status": "closed",
+        exchange.create_market_order = MagicMock(return_value={
+            "order_id": "mkt123", "status": "closed",
         })
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "LONGUSDT", "last": 89.0},
@@ -154,7 +153,7 @@ class TestStopLoss:
         monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
         monitor._poll()
         assert tracker.active_count == 0
-        exchange.create_stop_loss_order.assert_called_once()
+        exchange.create_market_order.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

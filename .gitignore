@@ -81,3 +81,4 @@ wiki/alpha-library/content/
 
 # Custom extensions - local config (never commit real secrets)
 extensions/config/.env.local
+claudedocs/

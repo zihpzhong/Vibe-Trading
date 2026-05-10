@@ -11,7 +11,7 @@ from typing import Optional
 
 from extensions.live_trading.models import Phase2Request, ScheduleReport
 
-from .btc_conduction import check_btc_conduction
+from .btc_conduction import check_btc_1h_trend, check_btc_conduction
 from .exchange import ExchangeBase
 from .market_scanner import MarketScanner
 from .position_tracker import PositionTracker
@@ -66,12 +66,21 @@ class TradingScheduler:
             logger.warning("BTC conduction check failed, falling back to CONDUCTION_OK", exc_info=True)
             btc_status = "CONDUCTION_OK"
 
+        # Step 1b: BTC 1h short-term trend check
+        btc_1h_trend = "NEUTRAL"
+        try:
+            btc_1h_kline = self._exchange.get_kline("BTCUSDT", "1h", 50)
+            btc_1h_trend = check_btc_1h_trend(btc_1h_kline)
+        except Exception:
+            pass
+
         if btc_status in ("LOCK_LONG", "LOCK_SHORT"):
             return ScheduleReport(
                 rankings=[],
                 phase2_requests=[],
                 watchlist=[],
                 btc_status=btc_status,
+                btc_1h_trend=btc_1h_trend,
                 active_positions=self._positions.active_count,
                 trading_enabled=self._trading_enabled,
             )
@@ -95,6 +104,7 @@ class TradingScheduler:
             phase2_requests=phase2_requests,
             watchlist=scan_result.watchlist,
             btc_status=btc_status,
+            btc_1h_trend=btc_1h_trend,
             active_positions=self._positions.active_count,
             trading_enabled=self._trading_enabled,
             scan_time_ms=scan_result.scan_time_ms,
