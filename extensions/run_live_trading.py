@@ -629,6 +629,7 @@ def main() -> int:
                     gate_result = gate_engine.run_gate(
                         live_signal, ticker, funding_rate, orderbook,
                         order_qty=order_qty,
+                        account_balance=positions.account_balance,
                     )
 
                     # Phase 2 NEUTRAL 降级: 即使 Gate PASS 也降为 WATCH_ONLY
@@ -671,6 +672,12 @@ def main() -> int:
                                 f"@ {entry_price:.2f}[/yellow]"
                             )
                         else:
+                            # 风控检查: 开仓后总敞口是否超限
+                            ok, reason = positions.can_open_new(symbol, additional_notional=notional)
+                            if not ok:
+                                log.info("Gate PASS but %s rejected by position cap: %s", symbol, reason)
+                                console.print(f"           [yellow]SKIP — {reason}[/yellow]")
+                                continue
                             quantity = round(notional / entry_price, 6)
                             if quantity <= 0:
                                 log.warning("Quantity too small for %s, skipping", symbol)
@@ -773,8 +780,11 @@ def main() -> int:
                             # DCA 暴露率检查: 确保加仓后总暴露不超限
                             current_exposure = positions.get_exposure()
                             dca_mult = [1.25, 1.5, 1.75][min(p.dca_count, 2)]
-                            post_dca_exposure = current_exposure + (args.position_size * dca_mult)
-                            max_exposure = 0.25  # 与 PositionTracker 默认值一致
+                            max_exposure = positions.max_exposure_pct  # 动态从 PositionTracker 读取
+                            # DCA 使用减半杠杆
+                            dca_leverage = max(1, args.max_leverage // 2)
+                            dca_notional = (positions.account_balance * args.position_size) * dca_mult * dca_leverage
+                            post_dca_exposure = current_exposure + (dca_notional / positions.account_balance)
                             if post_dca_exposure > max_exposure:
                                 log.warning(
                                     "DCA SKIP %s: 加仓后暴露率 %.1f%% 超过上限 %.0f%% (当前 %.1f%%)",
@@ -784,8 +794,6 @@ def main() -> int:
                                     f"  [yellow]DCA SKIP {p.symbol}: 暴露率 {post_dca_exposure*100:.1f}% > {max_exposure*100:.0f}%[/yellow]"
                                 )
                                 continue
-                            mult = dca_mult  # 复用上面已计算的 dca_mult
-                            dca_notional = (positions.account_balance * args.position_size) * mult
                             if dca_notional > positions.account_balance * 0.5:
                                 continue
                             dca_qty = round(dca_notional / cur, 6)

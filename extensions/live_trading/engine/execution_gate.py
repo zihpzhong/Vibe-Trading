@@ -37,6 +37,7 @@ class ExecGateEngine:
         funding_rate: float = 0.0,
         orderbook: Optional[dict] = None,
         order_qty: float = 0.0,
+        account_balance: float = 0.0,
     ) -> ExecutionGateResult:
         """Run all gate checks against a signal.
 
@@ -47,6 +48,8 @@ class ExecGateEngine:
             orderbook: Order book dict with bids/asks.
             order_qty: Expected order quantity in base asset. Used for
                 orderbook impact simulation. 0 = skip impact check.
+            account_balance: Account USDT balance for position cap check.
+                0 = skip position cap check.
 
         Returns:
             ExecutionGateResult with aggregated verdict.
@@ -61,7 +64,7 @@ class ExecGateEngine:
         self._check_funding_rate(result, funding_rate)
         self._check_orderbook_impact(result, orderbook, signal, order_qty)
         self._check_risk_reward(result, signal)
-        self._check_position_cap(result)
+        self._check_position_cap(result, signal, order_qty, account_balance)
 
         failed = result.failed_checks
         if any(c.name == "funding_rate" for c in failed):
@@ -222,13 +225,38 @@ class ExecGateEngine:
         else:
             result.add_check("risk_reward", False, f"R:R {rr:.1f} < {min_rr}:1 (too low)")
 
-    def _check_position_cap(self, result: ExecutionGateResult) -> None:
-        """Record the configured position cap as a memo check.
+    def _check_position_cap(
+        self, result: ExecutionGateResult,
+        signal: LiveSignal,
+        order_qty: float = 0.0,
+        account_balance: float = 0.0,
+    ) -> None:
+        """Check if the single position size exceeds the configured cap.
 
-        Actual portfolio allocation verification is the caller's responsibility.
+        Uses order_qty and entry_price to estimate notional, then compares
+        against max_position_pct of account_balance. Skips if insufficient
+        data is available (caller's responsibility to enforce).
         """
         max_pct = self.config.execution_gate.max_position_pct
-        result.add_check(
-            "position_cap", True,
-            f"Position cap: {max_pct}% of portfolio",
-        )
+        if account_balance <= 0 or order_qty <= 0 or not signal.entry_price:
+            result.add_check(
+                "position_cap", True,
+                f"Position cap: {max_pct}% (skipped, no balance/qty)",
+            )
+            return
+
+        entry_price = signal.entry_price
+        notional = order_qty * entry_price
+        position_pct = notional / account_balance * 100
+
+        if position_pct <= max_pct:
+            result.add_check(
+                "position_cap", True,
+                f"Position ${notional:.2f} ({position_pct:.1f}%) ≤ cap {max_pct}%",
+            )
+        else:
+            result.add_check(
+                "position_cap", False,
+                f"Position ${notional:.2f} ({position_pct:.1f}%) > cap {max_pct}% "
+                f"(balance=${account_balance:.2f})",
+            )
