@@ -104,6 +104,10 @@ class LiveTradingTool(BaseTool):
                 "type": "number",
                 "description": "Account USDT balance (for position cap check). 0 = skip.",
             },
+            "order_margin": {
+                "type": "number",
+                "description": "Margin allocated to the position in USDT (for position cap check). 0 = fallback to notional.",
+            },
         "mock": {
                 "type": "boolean",
                 "description": "Use mock exchange (default: true). Set to false for real trading.",
@@ -133,9 +137,22 @@ class LiveTradingTool(BaseTool):
         action = kwargs.get("action", "")
         symbol = kwargs.get("symbol", "")
 
+        # Allow the schema-level mock flag to select exchange mode before the
+        # lazy exchange instance is created. Refuse unsafe mid-session swaps.
+        if "mock" in kwargs:
+            requested_mock = bool(kwargs["mock"])
+            if self._exchange is not None and requested_mock != self._mock:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Cannot change mock mode after exchange initialization",
+                })
+            self._mock = requested_mock
+
         # Per-action parameter validation
         if not action:
             return json.dumps({"status": "error", "message": "Missing required field: action"})
+        if action in ("run_gate", "calculate_stop") and not symbol:
+            return json.dumps({"status": "error", "message": "Missing required field: symbol"})
         if action in ("run_gate", "calculate_stop") and not kwargs.get("direction"):
             return json.dumps({"status": "error", "message": "Missing required field: direction"})
         if action == "close_position" and not symbol:
@@ -188,11 +205,12 @@ class LiveTradingTool(BaseTool):
 
         order_qty = kwargs.get("order_qty", 0.0)
         account_balance = kwargs.get("account_balance", 0.0)
+        order_margin = kwargs.get("order_margin", 0.0)
         engine = ExecGateEngine(config)
         result = engine.run_gate(
             signal, ticker=ticker, funding_rate=funding_rate,
             orderbook=orderbook, order_qty=order_qty,
-            account_balance=account_balance,
+            account_balance=account_balance, order_margin=order_margin,
         )
 
         return json.dumps({
