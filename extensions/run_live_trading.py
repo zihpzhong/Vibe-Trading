@@ -331,7 +331,7 @@ def main() -> int:
     console.print()
     console.print(Panel.fit(
         f"[bold]Vibe Trading 全流程实盘[/bold]\n"
-        f"  余额: {args.balance} USDT"
+        f"  余额: {positions.account_balance:.2f} USDT"
         f"  模式: {mode_label[args.mode]}"
         f"  间隔: {args.interval}min"
         f"  仓位: {args.position_size:.0%}"
