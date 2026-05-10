@@ -161,8 +161,10 @@ class TestCanOpenNew:
         tracker.open_position("A", "LONG", 100.0, 1.0, 90.0)
         tracker.open_position("B", "LONG", 200.0, 1.0, 180.0)
         tracker.open_position("C", "LONG", 300.0, 1.0, 270.0)
-        assert tracker.active_count == 3
-        assert tracker.can_open_new("D") is False
+        tracker.open_position("D", "LONG", 400.0, 1.0, 360.0)
+        tracker.open_position("E", "LONG", 500.0, 1.0, 450.0)
+        assert tracker.active_count == 5
+        assert tracker.can_open_new("F") is False
 
     def test_rejects_when_exposure_exceeded(self, tracker: PositionTracker) -> None:
         # 3000 value / 10000 balance = 0.30 > 0.25 max

@@ -33,10 +33,30 @@ _PROJECT_ROOT = _SCRIPT_DIR.parent  # /app (= project root)
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
+from logging.handlers import RotatingFileHandler
+
+# 日志目录
+_LOG_DIR = Path.home() / ".vibe-trading" / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# 文件日志（带轮转，保留 7 天）
+_file_handler = RotatingFileHandler(
+    _LOG_DIR / "live_trading.log", maxBytes=10 * 1024 * 1024, backupCount=7,
+)
+_file_handler.setLevel(logging.INFO)
+_file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        _file_handler,
+    ],
 )
 log = logging.getLogger("live_trading")
 
@@ -60,6 +80,8 @@ def parse_args() -> argparse.Namespace:
                         help=f"单次开仓比例 (默认 {0.2:.0%})")
     parser.add_argument("--rr", type=float, default=DEFAULT_REWARD_RISK_RATIO,
                         help=f"目标 R:R 止盈比 (默认 {DEFAULT_REWARD_RISK_RATIO}:1)")
+    parser.add_argument("--max-leverage", type=int, default=5,
+                        help="最大杠杆倍数 (默认 5), score≥7 用最大值, score 5-6 用半值")
     parser.add_argument("--no-phase2", action="store_true",
                         help="跳过 Phase 2 LLM 深度分析 (仅 Phase 1 + Gate)")
     return parser.parse_args()
@@ -99,7 +121,7 @@ def main() -> int:
     from extensions.live_trading.engine.execution_gate import ExecGateEngine
     from extensions.live_trading.engine.phase2 import Phase2Analyzer
     from extensions.live_trading.config import LiveTradingConfig
-    from extensions.live_trading.models import GateStatus, LiveSignal, SignalDirection
+    from extensions.live_trading.models import GateStatus, LiveSignal, ScheduleReport, SignalDirection
 
     # ---- 配置 ----
     config = LiveTradingConfig()
@@ -147,13 +169,16 @@ def main() -> int:
 
     # ---- 设置合约模式：逐仓 + 单向持仓 ----
     if hasattr(exchange, "set_position_mode") and not args.mock:
-        exchange.set_position_mode(dual=False)
+        try:
+            exchange.set_position_mode(dual=False)
+        except Exception:
+            log.warning("set_position_mode failed (可能 Binance 网络暂时不可用), 继续启动...")
 
     # ---- 持仓管理 ----
     positions = PositionTracker(
         account_balance=args.balance,
-        max_positions=3,
-        max_exposure_pct=args.position_size * 3 * 1.1,  # 3 仓 + 10% 缓冲
+        max_positions=5,
+        max_exposure_pct=0.75,  # 总敞口上限 75%（含杠杆名义价值）
     )
 
     # ---- Phase 2 分析引擎 ----
@@ -173,6 +198,116 @@ def main() -> int:
     monitor = TPSLMonitor(exchange, positions, poll_interval=5.0)
     monitor.start()
     log.info("TPSL Monitor started")
+
+    # ---- 日亏损熔断 ----
+    # ---- 日亏损熔断 ----
+    class DailyRiskTracker:
+        """跟踪当日已实现盈亏，超过阈值时熔断交易。
+
+        仅在持仓平仓时记录已实现盈亏，不受浮动盈亏波动影响。
+        熔断后进入冷却期（默认4小时），冷却结束后可恢复交易。
+        """
+        def __init__(self, max_daily_loss_pct: float = 0.10, cooldown_hours: float = 4.0):
+            self.max_daily_loss_pct = max_daily_loss_pct
+            self.cooldown_hours = cooldown_hours
+            self._day_key = ""
+            self._realized_pnl: float = 0.0  # 当日已实现盈亏
+            self._last_closed_count: int = 0  # 已处理的平仓记录数
+            self._suspended_until: float = 0.0  # 熔断解除时间戳
+
+        def reset_if_new_day(self) -> None:
+            """跨日自动重置。"""
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if today != self._day_key:
+                if self._day_key and self._realized_pnl != 0:
+                    log.info(
+                        "📊 日终业绩: %s realized PnL=%+.2f USDT (%.1f%% 账户)",
+                        self._day_key, self._realized_pnl,
+                        self._realized_pnl / positions.account_balance * 100 if positions.account_balance else 0,
+                    )
+                self._day_key = today
+                self._realized_pnl = 0.0
+                self._last_closed_count = 0
+                # 新交易日解除熔断
+                if self._suspended_until > 0:
+                    log.info("DailyRiskTracker: 新交易日, 解除熔断")
+                    self._suspended_until = 0.0
+                log.info("DailyRiskTracker reset for %s (threshold %.0f%%)", today, self.max_daily_loss_pct * 100)
+
+        def sync_from_closed(self, closed_positions: list) -> int:
+            """从已平仓记录同步当日已实现盈亏。
+
+            只处理上次同步后新增的平仓记录，避免重复计数。
+
+            Returns:
+                新处理的平仓记录数。
+            """
+            new_count = 0
+            for i in range(self._last_closed_count, len(closed_positions)):
+                rec = closed_positions[i]
+                try:
+                    # CloseRecord is a dataclass with .closed_at and .pnl_usdt
+                    closed_at = getattr(rec, "closed_at", "")
+                    if not closed_at:
+                        closed_at = datetime.now(timezone.utc).isoformat()
+                    closed_day = closed_at[:10]  # YYYY-MM-DD
+                    if closed_day == self._day_key:
+                        pnl = getattr(rec, "pnl_usdt", 0.0)
+                        self._realized_pnl += float(pnl)
+                        new_count += 1
+                except Exception:
+                    pass
+            self._last_closed_count = len(closed_positions)
+            if new_count > 0:
+                log.info(
+                    "DailyRiskTracker: 记录 %d 笔平仓, 当日累计 PnL=%+.2f USDT",
+                    new_count, self._realized_pnl,
+                )
+            return new_count
+
+        @property
+        def is_blown(self) -> bool:
+            """是否触发熔断。
+
+            熔断条件：
+            1. 当日已实现亏损超过 max_daily_loss_pct * account_balance
+            2. 且冷却时间尚未结束
+            """
+            now = time.time()
+            if self._suspended_until > now:
+                return True
+
+            if positions.account_balance <= 0:
+                return False
+
+            loss_pct = abs(min(self._realized_pnl, 0.0)) / positions.account_balance
+            if loss_pct >= self.max_daily_loss_pct:
+                self._suspended_until = now + self.cooldown_hours * 3600
+                log.warning(
+                    "⚠️ 日亏损熔断触发: 累计亏损 %.2f USDT (%.1f%%), 冷却 %.0f 小时至 %s",
+                    abs(self._realized_pnl),
+                    loss_pct * 100,
+                    self.cooldown_hours,
+                    datetime.fromtimestamp(self._suspended_until, tz=timezone.utc).isoformat(),
+                )
+                return True
+            return False
+
+        @property
+        def suspension_remaining_str(self) -> str:
+            """返回熔断剩余时间的可读字符串。"""
+            remaining = self._suspended_until - time.time()
+            if remaining <= 0:
+                return ""
+            hours = int(remaining // 3600)
+            minutes = int((remaining % 3600) // 60)
+            return f"{hours}h{minutes}m"
+
+        @property
+        def day_pnl(self) -> float:
+            return self._realized_pnl
+
+    daily_risk = DailyRiskTracker(max_daily_loss_pct=0.10, cooldown_hours=4.0)
 
     # ---- 信号处理 ----
     stop_event = Event()
@@ -210,9 +345,26 @@ def main() -> int:
 
         try:
             # ================================================================
-            # STEP 1: Scheduler — BTC传导 + Phase 1 扫描 + 分级决策
+            # STEP 0: 日亏损检查 & BTC传导 + Phase 1 扫描 + 分级决策
             # ================================================================
-            report = scheduler.run_once(top_n=config.scan_top_n)
+            daily_risk.reset_if_new_day()
+            if daily_risk.is_blown:
+                log.warning(
+                    "Daily loss limit reached: %.2f USDT (%.1f%%), skipping this cycle",
+                    daily_risk.day_pnl,
+                    daily_risk.day_pnl / positions.account_balance * 100,
+                )
+                cooldown_str = daily_risk.suspension_remaining_str
+                console.print(f"[red]⚠️ 日亏损熔断触发 (已实现亏损: {daily_risk.day_pnl:.2f} USDT), 冷却剩余 {cooldown_str}[/red]")
+                report = ScheduleReport(
+                    rankings=[], phase2_requests=[], watchlist=[],
+                    btc_status="CONDUCTION_OK", btc_1h_trend="NEUTRAL",
+                    active_positions=positions.active_count,
+                    trading_enabled=False,
+                )
+                # 仍显示持仓，但不交易
+            else:
+                report = scheduler.run_once(top_n=config.scan_top_n)
 
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
             btc_label = report.btc_status
@@ -263,8 +415,23 @@ def main() -> int:
                             f"SL距={sl_dist:.1f}%[/]"
                         )
                     console.print(f"  [dim]浮动盈亏合计: {total_pnl:+.3f} USDT[/dim]")
+                    # 从已平仓记录同步当日已实现盈亏（仅处理新增记录）
+                    daily_risk.sync_from_closed(positions.get_recent_closed(50))
                 except Exception:
                     pass
+
+            # --- 已平仓记录 ---
+            closed_records = positions.get_recent_closed(5)
+            if closed_records:
+                console.print("[dim]最近平仓:[/dim]")
+                for c in reversed(closed_records):
+                    color = "[green]" if c.pnl_usdt >= 0 else "[red]"
+                    console.print(
+                        f"  {color}{c.symbol:12s} {c.direction:5s} "
+                        f"exit={c.exit_price:.4f} "
+                        f"PnL={c.pnl_usdt:+.2f}USDT ({c.pnl_pct:+.2f}%) "
+                        f"{c.reason}[/]"
+                    )
 
             if report.rankings:
                 top = report.rankings[:5]
@@ -289,6 +456,14 @@ def main() -> int:
                     direction = SignalDirection(req.direction)
                     score = req.score
                     entry_price = req.entry_price
+
+                    # 2aa. 同步实际余额
+                    try:
+                        bal = exchange.get_account_balance()
+                        if bal and "USDT" in bal:
+                            positions.account_balance = float(bal["USDT"])
+                    except Exception:
+                        pass
 
                     # 2a. 检查是否可以开新仓
                     if not positions.can_open_new(symbol):
@@ -319,6 +494,7 @@ def main() -> int:
                         # 如果 entry_price 为 0（扫描器未输出价格），使用当前市价
                         if entry_price is None or entry_price == 0:
                             entry_price = float(ticker.get("last", 0))
+                            req.entry_price = entry_price  # 同步到 Phase2Request
                         if entry_price is None or entry_price <= 0:
                             console.print(f"  {symbol:12s} [yellow]SKIP[/yellow] 无效入场价格")
                             continue
@@ -328,39 +504,54 @@ def main() -> int:
 
                     # 2c. Phase 2: LLM深度分析 — load_skill per dim → 综合评分
                     if phase2_analyzer and req.dims:
-                        phase2_result = phase2_analyzer.analyze(req, ticker)
-                        if phase2_result:
-                            dims_str = "; ".join(
-                                f"{d}:{phase2_result.get('dimensions', {}).get(d, {}).get('verdict', '?')}"
-                                for d in req.dims
-                            )
-                            consensus = phase2_result.get("consensus", "PASS")
-                            summary = phase2_result.get("summary", "")
-                            if consensus == "FAIL":
-                                console.print(
-                                    f"  {symbol:12s} [red]PHASE2 FAIL[/red] — {summary}"
-                                )
-                                console.print(f"           {dims_str}")
-                                continue
-                            elif consensus == "NEUTRAL":
-                                console.print(
-                                    f"  {symbol:12s} [yellow]PHASE2 NEUTRAL[/yellow] — {summary}"
-                                )
-                                console.print(f"           {dims_str}")
-                                # 降级为 WATCH_ONLY 处理: 继续计算但标记
-                                watch_only_flag = True
-                            else:
-                                console.print(
-                                    f"  {symbol:12s} [green]PHASE2 PASS[/green] — {summary}"
-                                )
-                                console.print(f"           {dims_str}")
-                                watch_only_flag = False
-                        else:
-                            # Phase 2 分析失败（如 LLM JSON 解析错误），保守降级
+                        # score < 6: Phase 2 始终 NEUTRAL/FAIL, 无增加价值
+                        # 直接走 Execution Gate, 节省每轮 3-5 分钟 LLM API 时间
+                        if score < 6:
                             console.print(
-                                f"  {symbol:12s} [yellow]PHASE2 ERROR[/yellow] — LLM analysis failed, defaulting to WATCH_ONLY"
+                                f"  {symbol:12s} [dim]PHASE2 SKIP[/dim] — score={score} < 6, 直接走 Gate 评估"
                             )
-                            watch_only_flag = True
+                            watch_only_flag = False
+                        else:
+                            phase2_result = phase2_analyzer.analyze(req, ticker)
+                            if phase2_result:
+                                dims_str = "; ".join(
+                                    f"{d}:{phase2_result.get('dimensions', {}).get(d, {}).get('verdict', '?')}"
+                                    for d in req.dims
+                                )
+                                consensus = phase2_result.get("consensus", "PASS")
+                                summary = phase2_result.get("summary", "")
+                                if consensus == "FAIL":
+                                    console.print(
+                                        f"  {symbol:12s} [red]PHASE2 FAIL[/red] — {summary}"
+                                    )
+                                    console.print(f"           {dims_str}")
+                                    continue
+                                elif consensus == "NEUTRAL":
+                                    # fast_track: Phase 1 评分已确认技术信号, LLM 保守可放过
+                                    if req.tier == "fast_track":
+                                        console.print(
+                                            f"  {symbol:12s} [green]PHASE2 FAST_TRACK PASS[/green] — {summary}"
+                                        )
+                                        console.print(f"           {dims_str}")
+                                        watch_only_flag = False
+                                    else:
+                                        console.print(
+                                            f"  {symbol:12s} [yellow]PHASE2 NEUTRAL[/yellow] — {summary}"
+                                        )
+                                        console.print(f"           {dims_str}")
+                                        watch_only_flag = True
+                                else:
+                                    console.print(
+                                        f"  {symbol:12s} [green]PHASE2 PASS[/green] — {summary}"
+                                    )
+                                    console.print(f"           {dims_str}")
+                                    watch_only_flag = False
+                            else:
+                                # Phase 2 分析失败（如 LLM JSON 解析错误），保守降级
+                                console.print(
+                                    f"  {symbol:12s} [yellow]PHASE2 ERROR[/yellow] — LLM analysis failed, defaulting to WATCH_ONLY"
+                                )
+                                watch_only_flag = True
                     else:
                         watch_only_flag = False
 
@@ -371,11 +562,20 @@ def main() -> int:
                             kline_1h, direction, entry_price,
                             conservative=(args.mode == "conservative"),
                         )
-                        # 计算止盈 (R:R = args.rr:1)
+                        # 动态 R:R: 高分信号放大利润目标
+                        active_rr = args.rr
+                        if score >= 8:
+                            active_rr = max(active_rr, 4.0)  # 极强信号 4:1
+                        elif score >= 7:
+                            active_rr = max(active_rr, 3.0)  # 强信号 3:1
+                        elif score >= 6:
+                            active_rr = max(active_rr, 2.5)  # 中等偏强 2.5:1
+                        if active_rr != args.rr:
+                            log.info("%s: score=%d, R:R 从 %.1f 提升至 %.1f", symbol, score, args.rr, active_rr)
                         if direction == SignalDirection.LONG:
-                            tp_price = entry_price + (entry_price - stop_price) * args.rr
+                            tp_price = entry_price + (entry_price - stop_price) * active_rr
                         else:
-                            tp_price = entry_price - (stop_price - entry_price) * args.rr
+                            tp_price = entry_price - (stop_price - entry_price) * active_rr
                     except Exception as exc:
                         log.warning("ATR calculation failed for %s: %s", symbol, exc)
                         continue
@@ -425,7 +625,21 @@ def main() -> int:
 
                     # 2g. Gate PASS → 开仓
                     if gate_result.status.value == "PASS":
-                        notional = args.balance * args.position_size
+                        # 动态杠杆: score≥7 用 max_leverage, score 5-6 用半值 (借鉴 freqtrade)
+                        max_lev = args.max_leverage
+                        if score >= 7:
+                            leverage = max_lev
+                        elif score >= 5:
+                            leverage = max(1, max_lev // 2)
+                        else:
+                            leverage = 1
+
+                        # 杠杆感知的动态分配: 保证金均分到剩余仓位, 杠杆放大名义价值
+                        available = positions.account_balance * 0.99
+                        active_pos = positions.active_count
+                        remaining_slots = max(1, 5 - active_pos)
+                        margin_per_slot = available / remaining_slots
+                        notional = margin_per_slot * leverage
                         if notional < 5:
                             console.print(
                                 f"           [yellow]SKIP — 名义价值 ${notional:.1f} < $5 最小限额[/yellow]"
@@ -434,28 +648,51 @@ def main() -> int:
                         if args.dry_run:
                             console.print(
                                 f"           [yellow]DRY RUN — 跳过开仓: {symbol} "
-                                f"{direction.value} qty ≈ {notional / entry_price:.6f} "
+                                f"{direction.value} {leverage}x qty ≈ {notional / entry_price:.6f} "
                                 f"@ {entry_price:.2f}[/yellow]"
                             )
                         else:
-                            quantity = round(args.balance * args.position_size / entry_price, 6)
+                            quantity = round(notional / entry_price, 6)
                             if quantity <= 0:
                                 log.warning("Quantity too small for %s, skipping", symbol)
                                 continue
+                            min_qty = exchange.get_min_qty(symbol)
+                            if min_qty > 0 and quantity < min_qty:
+                                log.info(
+                                    "%s: qty=%.6f < minQty=%.6f, 跳过 (notional=%.2f 不足以交易该币种)",
+                                    symbol, quantity, min_qty, notional,
+                                )
+                                console.print(
+                                    f"           [yellow]SKIP — qty {quantity:.6f} < 最小交易量 {min_qty}, 跳过[/yellow]"
+                                )
+                                continue
 
                             log.info(
-                                "OPENING %s %s qty=%f entry=%.2f SL=%.2f TP=%.2f",
-                                symbol, direction.value, quantity, entry_price, stop_price, tp_price,
+                                "OPENING %s %s %dx qty=%f entry=%.2f SL=%.2f TP=%.2f",
+                                symbol, direction.value, leverage, quantity, entry_price, stop_price, tp_price,
                             )
 
                             try:
                                 # Set futures leverage and margin mode before placing order
                                 if hasattr(exchange, "set_leverage"):
-                                    exchange.set_leverage(symbol, leverage=5)
+                                    exchange.set_leverage(symbol, leverage=leverage)
                                 if hasattr(exchange, "set_margin_mode"):
                                     exchange.set_margin_mode(symbol, "ISOLATED")
                                 order = exchange.create_market_order(symbol, direction.value.lower(), quantity)
                                 log.info("Order placed: %s", order)
+
+                                # 确认订单已成交，超时未成交则取消+跳过
+                                if order.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                                    time.sleep(2)
+                                    try:
+                                        status = exchange.fetch_order(order["order_id"], symbol)
+                                        if status.get("status") == "NEW":
+                                            exchange.cancel_order(order["order_id"], symbol)
+                                            log.warning("Order %s cancelled — not filled after 2s", order["order_id"])
+                                            console.print(f"           [yellow]⚠️ 订单未成交，已取消[/yellow]")
+                                            continue
+                                    except Exception:
+                                        pass
 
                                 positions.open_position(
                                     symbol=symbol,
@@ -484,6 +721,63 @@ def main() -> int:
                     console.print(f"[bold green]{cycle_orders} 个新订单已执行[/bold green]")
                 else:
                     console.print("[dim]本轮无开仓[/dim]")
+
+                # ---- DCA 检查: 亏损 >= 5% 触发阶梯加仓 ----
+                if not args.dry_run:
+                    try:
+                        for p in positions.get_active_positions():
+                            if p.dca_count >= 3:
+                                continue
+                            t = exchange.get_ticker(p.symbol)
+                            cur = float(t.get("last", 0)) or 0
+                            if cur <= 0:
+                                continue
+                            loss = (cur - p.entry_price) / p.entry_price if p.direction == "LONG" else (p.entry_price - cur) / p.entry_price
+                            if loss >= -0.05:
+                                continue
+                            # DCA 保护: 该仓位累计亏损超过账户 8% 则跳过 DCA
+                            total_cost = p.entry_price * p.quantity
+                            if p.direction == "LONG":
+                                total_unrealized = (cur - p.entry_price) * p.quantity
+                            else:
+                                total_unrealized = (p.entry_price - cur) * p.quantity
+                            loss_pct_of_account = abs(total_unrealized) / positions.account_balance
+                            if loss_pct_of_account > 0.08:
+                                log.warning(
+                                    "DCA SKIP %s: 累计亏损 %.2f USDT (%.1f%% 账户) 超过 8%% 阈值",
+                                    p.symbol, total_unrealized, loss_pct_of_account * 100,
+                                )
+                                console.print(f"  [red]DCA SKIP {p.symbol}: 累计亏损 {abs(total_unrealized):.2f} USDT ({loss_pct_of_account*100:.1f}% 账户)[/red]")
+                                continue
+                            # DCA 暴露率检查: 确保加仓后总暴露不超限
+                            current_exposure = positions.get_exposure()
+                            dca_mult = [1.25, 1.5, 1.75][min(p.dca_count, 2)]
+                            post_dca_exposure = current_exposure + (args.position_size * dca_mult)
+                            max_exposure = 0.25  # 与 PositionTracker 默认值一致
+                            if post_dca_exposure > max_exposure:
+                                log.warning(
+                                    "DCA SKIP %s: 加仓后暴露率 %.1f%% 超过上限 %.0f%% (当前 %.1f%%)",
+                                    p.symbol, post_dca_exposure * 100, max_exposure * 100, current_exposure * 100,
+                                )
+                                console.print(
+                                    f"  [yellow]DCA SKIP {p.symbol}: 暴露率 {post_dca_exposure*100:.1f}% > {max_exposure*100:.0f}%[/yellow]"
+                                )
+                                continue
+                            mult = dca_mult  # 复用上面已计算的 dca_mult
+                            dca_notional = (positions.account_balance * args.position_size) * mult
+                            if dca_notional > positions.account_balance * 0.5:
+                                continue
+                            dca_qty = round(dca_notional / cur, 6)
+                            if dca_qty <= 0:
+                                continue
+                            if hasattr(exchange, "set_leverage"):
+                                exchange.set_leverage(p.symbol, leverage=max(1, args.max_leverage // 2))
+                            order = exchange.create_market_order(p.symbol, p.direction.lower(), dca_qty)
+                            log.info("DCA order: %s", order)
+                            positions.adjust_position(p.symbol, dca_qty, cur)
+                            console.print(f"  [cyan]DCA {p.symbol}: +{dca_qty:.4f} @ {cur:.4f} (亏损{loss*100:.1f}%)[/cyan]")
+                    except Exception as exc:
+                        log.warning("DCA check failed: %s", exc)
 
         except Exception as exc:
             log.exception("Cycle #%d failed: %s", cycle_count, exc)

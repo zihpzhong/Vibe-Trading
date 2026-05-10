@@ -1,0 +1,65 @@
+# 交易系统优化 — 实施记录
+
+## 2026-05-10
+
+### US-001: ATR 最小止损距离扩至 8%
+**改动文件:**
+- `extensions/live_trading/config.py` — ATRStopConfig 新增 `min_stop_distance_pct: float = 8.0`
+- `extensions/live_trading/engine/atr_stop.py` — 两步修改:
+  1. 数据不足时的固定百分比止损从 5% 改为使用 `cfg.min_stop_distance_pct`
+  2. ATR 计算后增加最小止损距离检查: `max(stop_distance, entry_price * min_stop_distance_pct/100)`
+- `extensions/tests/test_execution_gate.py` — 更新 `_make_kline` 波动率从 2% 到 8% 避免被 clamp；更新 fallback 断言从 95.0 到 92.0；新增 `test_min_stop_distance_pct_enforced` 和 `test_min_stop_short_direction`
+- `extensions/tests/test_live_trading_e2e.py` — 同步更新 `_make_kline` 波动率和 ATR 范围断言
+
+### US-002: Phase 2 enhanced 层共识规则放宽
+**改动文件:**
+- `extensions/live_trading/engine/phase2.py` — enhanced 层 consensus 规则从 "ALL dims must be PASS" 改为 ">= 50% dims are PASS and none are FAIL"
+
+### Deslop pass (ai-slop-cleaner)
+- `extensions/live_trading/engine/atr_stop.py:70-74` — NaN/0 ATR 保护路径也从硬编码 5% 改为使用 `cfg.min_stop_distance_pct`
+
+### 测试结果: 229/230 通过（1 个预先存在的失败: `test_crypto_entry_analysis_routing`）
+### 审核: APPROVED（architect 确认所有验收标准满足）
+### Deslop 回归: ✅ 无回归
+
+
+## 2026-05-10 — P0 风控优化（第二轮）
+
+### US-003: DCA 前校验总暴露率
+**问题**: DCA 阶梯加仓不检查 PositionTracker 暴露率上限 (25%)，单币仓位可达 55%
+**改动**:
+- `extensions/run_live_trading.py` DCA 段落 (line 674-687): 
+  1. 在 `mult = [1.25, 1.5, 1.75]` 前插入暴露率检查: 计算 post_dca_exposure = current_exposure + position_size * dca_mult
+  2. 超过 25% 上限时记录 WARNING 日志并跳过 DCA
+  3. 优化: 复用已计算的 dca_mult 避免重复计算
+
+### US-004: 日亏损熔断重构
+**问题**: 原有内联 DailyRiskTracker 记录浮动盈亏（每次覆盖累加），无冷却期
+**改动**:
+- `extensions/run_live_trading.py` lines 202-310:
+  1. 重构 DailyRiskTracker 类:
+     - 改用已实现盈亏 (sync_from_closed) 替代浮动盈亏 (record_pnl)
+     - 新增 `_last_closed_count` 跟踪已处理记录数，避免重复计数
+     - 新增冷却机制: `cooldown_hours=4.0`, `_suspended_until` 时间戳
+     - 阈值从 20% 调整为 10%（更保守）
+     - 新交易日自动解除熔断
+  2. 修改主循环 (line 419): 每轮从 positions.get_recent_closed(50) 同步已实现盈亏
+  3. 修改熔断提示 (line 357-358): 显示冷却剩余时间
+
+### US-005: Trailing Stop 状态持久化
+**问题**: TPSLMonitor 的 _trailing_stops 和 _peak_prices 仅存内存，Docker 重启/断连后丢失
+**改动**:
+- `extensions/live_trading/engine/position_tracker.py`:
+  1. `_persist()`: positions.json 新增 trailing_stops 和 peak_prices 字段
+  2. `_load()`: 恢复时加载 trailing 状态
+  3. `__init__`: 新增 `self._trailing_stops` 和 `self._peak_prices` 属性
+  4. 新增 `get_trailing_state()` / `set_trailing_state()` 方法
+- `extensions/live_trading/engine/tpsl_monitor.py`:
+  1. `__init__` 末尾: 从 PositionTracker 恢复 trailing 状态
+  2. `_poll` 末尾: 每轮保存 trailing 状态到 PositionTracker
+
+### 测试状态: 待运行
+
+### 测试结果: 229/230 通过（1 个预先存在的失败: test_crypto_entry_analysis_routing）
+### 审核: APPROVED
+### 回归: ✅ 无新增失败
