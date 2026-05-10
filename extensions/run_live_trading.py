@@ -343,6 +343,12 @@ def main() -> int:
         cycle_count += 1
         cycle_orders = 0
 
+        # ---- 记录权益快照 ----
+        try:
+            positions.record_equity_snapshot()
+        except Exception:
+            pass
+
         try:
             # ================================================================
             # STEP 0: 日亏损检查 & BTC传导 + Phase 1 扫描 + 分级决策
@@ -702,6 +708,7 @@ def main() -> int:
                                     quantity=quantity,
                                     stop_loss=stop_price,
                                     take_profit=tp_price,
+                                    leverage=leverage,
                                 )
                                 cycle_orders += 1
                                 total_orders += 1
@@ -782,6 +789,27 @@ def main() -> int:
 
         except Exception as exc:
             log.exception("Cycle #%d failed: %s", cycle_count, exc)
+
+        # ---- 绩效报告（每 10 轮） ----
+        if cycle_count % 10 == 0:
+            try:
+                perf = positions.get_performance_metrics()
+                trade_count = perf.get("trade_count", 0)
+                if trade_count >= 3 and "error" not in perf:
+                    console.print(Panel.fit(
+                        f"[bold]绩效报告 (Cycle #{cycle_count})[/bold]\n"
+                        f"  交易数: {trade_count}"
+                        f"  胜率: {perf.get('win_rate', 0):.1%}"
+                        f"  获利因子: {perf.get('profit_factor', 0):.2f}"
+                        f"  夏普: {perf.get('sharpe', 0):.2f}"
+                        f"  最大回撤: {perf.get('max_drawdown', 0):.2%}"
+                        f"  总收益: {perf.get('total_return', 0):+.2%}",
+                        border_style="cyan",
+                    ))
+                elif trade_count > 0:
+                    console.print(f"[dim]绩效: 仅 {trade_count} 笔交易, 等待更多数据[/dim]")
+            except Exception as exc:
+                log.debug("Performance report failed: %s", exc)
 
         # ---- 等待到下一个周期 ----
         elapsed = time.time() - cycle_start
