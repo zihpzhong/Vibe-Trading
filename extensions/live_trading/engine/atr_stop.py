@@ -57,23 +57,30 @@ def calculate_atr_stop(
     cfg = config or ATRStopConfig()
 
     if len(kline) < cfg.period:
-        # Not enough data: use a fixed 5% stop as fallback
+        # Not enough data: use a fixed percentage stop as fallback
+        fallback_pct = cfg.min_stop_distance_pct / 100
         if direction == SignalDirection.LONG:
-            return entry_price * 0.95, 0.0
+            return entry_price * (1 - fallback_pct), 0.0
         else:
-            return entry_price * 1.05, 0.0
+            return entry_price * (1 + fallback_pct), 0.0
 
     atr_series = calculate_atr(kline["high"], kline["low"], kline["close"], cfg.period)
     atr_value = atr_series.iloc[-1]
 
     if pd.isna(atr_value) or atr_value == 0:
+        fallback_pct = cfg.min_stop_distance_pct / 100
         if direction == SignalDirection.LONG:
-            return entry_price * 0.95, 0.0
+            return entry_price * (1 - fallback_pct), 0.0
         else:
-            return entry_price * 1.05, 0.0
+            return entry_price * (1 + fallback_pct), 0.0
 
     multiplier = cfg.multiplier_conservative if conservative else cfg.multiplier_default
     stop_distance = atr_value * multiplier
+
+    # Enforce minimum stop distance to keep DCA viable
+    min_distance = entry_price * (cfg.min_stop_distance_pct / 100)
+    if stop_distance < min_distance:
+        stop_distance = min_distance
 
     if direction == SignalDirection.LONG:
         stop_price = entry_price - stop_distance

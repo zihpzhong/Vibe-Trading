@@ -10,6 +10,7 @@ agent/.env
 .claude/*
 !.claude/hooks.json
 CLAUDE.md
+.DS_Store
 .vscode/
 learn-claude-code-main/
 agent/sessions/

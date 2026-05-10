@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from threading import Event, Thread
 from typing import Callable, Optional
 
@@ -60,6 +61,17 @@ class TPSLMonitor(Thread):
         self._trailing_stops: dict[str, float] = {}
         # Track peak prices for trailing stop calculation
         self._peak_prices: dict[str, float] = {}
+
+        # 从持久化状态恢复 trailing stop
+        if hasattr(self._positions, "get_trailing_state"):
+            try:
+                state = self._positions.get_trailing_state()
+                if state["trailing_stops"]:
+                    self._trailing_stops = state["trailing_stops"]
+                    self._peak_prices = state["peak_prices"]
+                    logger.info("Restored trailing stops for %d symbols", len(self._trailing_stops))
+            except Exception as exc:
+                logger.warning("Failed to restore trailing state: %s", exc)
 
     # ------------------------------------------------------------------
     # Thread lifecycle
@@ -125,13 +137,47 @@ class TPSLMonitor(Thread):
     # Threshold checking
     # ------------------------------------------------------------------
 
+
+        # 持久化 trailing stop 状态
+        if hasattr(self._positions, "set_trailing_state"):
+            try:
+                self._positions.set_trailing_state(self._trailing_stops, self._peak_prices)
+            except Exception as exc:
+                logger.debug("Failed to persist trailing state: %s", exc)
     def _check_take_profit(self, pos: Position, price: float) -> bool:
-        """Check if TP level is reached."""
-        if pos.take_profit is None:
-            return False
+        """Check if TP level is reached — time-decaying minimal_roi style.
+
+        The longer the position is held, the lower the TP threshold:
+          < 30 min : +5%
+          30-60 min : +3%
+          60-120 min: +1%
+          > 120 min : +0.1% (保本附近)
+
+        If a fixed take_profit is set, uses the tighter of the two.
+        """
+        elapsed = time.time() - datetime.fromisoformat(pos.opened_at).timestamp()
+        elapsed_min = elapsed / 60
+
+        if elapsed_min < 30:
+            tp_pct = 0.05
+        elif elapsed_min < 60:
+            tp_pct = 0.03
+        elif elapsed_min < 120:
+            tp_pct = 0.01
+        else:
+            tp_pct = 0.001
+
+        # If fixed TP is set, use the tighter (lower) threshold
+        if pos.take_profit is not None:
+            if pos.direction == "LONG":
+                fixed_pct = (pos.take_profit - pos.entry_price) / pos.entry_price
+            else:
+                fixed_pct = (pos.entry_price - pos.take_profit) / pos.entry_price
+            tp_pct = min(tp_pct, fixed_pct)
+
         if pos.direction == "LONG":
-            return price >= pos.take_profit
-        return price <= pos.take_profit
+            return price >= pos.entry_price * (1 + tp_pct)
+        return price <= pos.entry_price * (1 - tp_pct)
 
     def _check_stop_loss(self, pos: Position, price: float, effective_sl: float) -> bool:
         """Check if SL level is breached."""
@@ -190,14 +236,42 @@ class TPSLMonitor(Thread):
         last_err: Optional[Exception] = None
         for attempt in range(MAX_RETRIES):
             try:
-                self._exchange.create_market_order(pos.symbol, side, pos.quantity)
-                self._positions.close_position(pos.symbol)
+                order = self._exchange.create_market_order(pos.symbol, side, pos.quantity)
+                filled = order.get("filled", 0) or 0
+                if filled < pos.quantity:
+                    remaining = pos.quantity - filled
+                    logger.warning(
+                        "TP partial fill for %s: filled=%.4f of %.4f, remaining=%.4f",
+                        pos.symbol, filled, pos.quantity, remaining,
+                    )
+                    self._positions.reduce_position(pos.symbol, filled or pos.quantity, price)
+                    # If remaining is below exchange minQty, close in tracker (dust)
+                    min_qty = self._exchange.get_min_qty(pos.symbol)
+                    if min_qty > 0 and remaining < min_qty:
+                        self._positions.close_position(pos.symbol, exit_price=price, reason="TP")
+                        logger.info(
+                            "TP dust cleanup: %s remaining=%.6f below minQty=%.6f, closed in tracker",
+                            pos.symbol, remaining, min_qty,
+                        )
+                else:
+                    self._positions.close_position(pos.symbol, exit_price=price, reason="TP")
                 self._trailing_stops.pop(pos.symbol, None)
                 self._peak_prices.pop(pos.symbol, None)
                 if self._on_take_profit:
                     self._on_take_profit(pos)
                 return
             except Exception as exc:
+                err_msg = str(exc)
+                # If quantity rounds to zero (below minimum tradeable), close as dust and give up
+                if "below minimum tradeable" in err_msg or "Quantity less than or equal to zero" in err_msg:
+                    logger.warning(
+                        "TP dust: %s remaining qty=%.6f untradeable, closing in tracker",
+                        pos.symbol, pos.quantity,
+                    )
+                    self._positions.close_position(pos.symbol, exit_price=price, reason="TP")
+                    self._trailing_stops.pop(pos.symbol, None)
+                    self._peak_prices.pop(pos.symbol, None)
+                    return
                 last_err = exc
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_BACKOFF[attempt]
@@ -223,14 +297,41 @@ class TPSLMonitor(Thread):
         last_err: Optional[Exception] = None
         for attempt in range(MAX_RETRIES):
             try:
-                self._exchange.create_market_order(pos.symbol, side, pos.quantity)
-                self._positions.close_position(pos.symbol)
+                order = self._exchange.create_market_order(pos.symbol, side, pos.quantity)
+                filled = order.get("filled", 0) or 0
+                if filled < pos.quantity:
+                    remaining = pos.quantity - filled
+                    logger.warning(
+                        "SL partial fill for %s: filled=%.4f of %.4f, remaining=%.4f",
+                        pos.symbol, filled, pos.quantity, remaining,
+                    )
+                    self._positions.reduce_position(pos.symbol, filled or pos.quantity, price)
+                    # If remaining is below exchange minQty, close in tracker (dust)
+                    min_qty = self._exchange.get_min_qty(pos.symbol)
+                    if min_qty > 0 and remaining < min_qty:
+                        self._positions.close_position(pos.symbol, exit_price=price, reason="SL")
+                        logger.info(
+                            "SL dust cleanup: %s remaining=%.6f below minQty=%.6f, closed in tracker",
+                            pos.symbol, remaining, min_qty,
+                        )
+                else:
+                    self._positions.close_position(pos.symbol, exit_price=price, reason="SL")
                 self._trailing_stops.pop(pos.symbol, None)
                 self._peak_prices.pop(pos.symbol, None)
                 if self._on_stop_loss:
                     self._on_stop_loss(pos)
                 return
             except Exception as exc:
+                err_msg = str(exc)
+                if "below minimum tradeable" in err_msg or "Quantity less than or equal to zero" in err_msg:
+                    logger.warning(
+                        "SL dust: %s remaining qty=%.6f untradeable, closing in tracker",
+                        pos.symbol, pos.quantity,
+                    )
+                    self._positions.close_position(pos.symbol, exit_price=price, reason="SL")
+                    self._trailing_stops.pop(pos.symbol, None)
+                    self._peak_prices.pop(pos.symbol, None)
+                    return
                 last_err = exc
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_BACKOFF[attempt]
