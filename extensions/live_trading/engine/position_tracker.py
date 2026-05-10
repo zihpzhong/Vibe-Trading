@@ -120,7 +120,7 @@ class PositionTracker:
 
     Usage:
         tracker = PositionTracker(account_balance=10000.0, max_exposure_pct=0.25)
-        if tracker.can_open_new("BTCUSDT"):
+        if tracker.can_open_new("BTCUSDT")[0]:
             tracker.open_position(signal, quantity=0.01, stop_loss=63000, take_profit=67000)
         exposure = tracker.get_exposure()
         tracker.close_position("BTCUSDT")
@@ -301,8 +301,11 @@ class PositionTracker:
     # Guards
     # ------------------------------------------------------------------
 
-    def can_open_new(self, symbol: str) -> bool:
+    def can_open_new(self, symbol: str) -> tuple[bool, str]:
         """Check if a new position can be opened.
+
+        Returns:
+            (True, "") if allowed, or (False, "reason string") if rejected.
 
         Rejects if:
         - Symbol already has an active position
@@ -311,12 +314,13 @@ class PositionTracker:
         """
         with self._lock:
             if symbol in self._positions:
-                return False
+                return False, f"已有 {symbol} 持仓"
             if len(self._positions) >= self._max_positions:
-                return False
-            if self._get_exposure_unlocked() >= self._max_exposure_pct:
-                return False
-            return True
+                return False, f"仓位已达上限 ({self._max_positions})"
+            exp = self._get_exposure_unlocked()
+            if exp >= self._max_exposure_pct:
+                return False, f"总敞口超限 ({exp:.1%} >= {self._max_exposure_pct:.0%})"
+            return True, ""
 
     def is_in_cooldown(self, symbol: str, direction: str) -> bool:
         """Check if symbol+direction pair is in cooldown period."""
