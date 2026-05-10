@@ -151,11 +151,15 @@ class TestCanOpenNew:
     """Position opening guard."""
 
     def test_allows_first_position(self, tracker: PositionTracker) -> None:
-        assert tracker.can_open_new("BTCUSDT") is True
+        ok, reason = tracker.can_open_new("BTCUSDT")
+        assert ok is True
+        assert reason == ""
 
     def test_rejects_duplicate_symbol(self, tracker: PositionTracker) -> None:
         tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
-        assert tracker.can_open_new("BTCUSDT") is False
+        ok, reason = tracker.can_open_new("BTCUSDT")
+        assert ok is False
+        assert "已有" in reason
 
     def test_rejects_at_max_positions(self, tracker: PositionTracker) -> None:
         tracker.open_position("A", "LONG", 100.0, 1.0, 90.0)
@@ -164,16 +168,22 @@ class TestCanOpenNew:
         tracker.open_position("D", "LONG", 400.0, 1.0, 360.0)
         tracker.open_position("E", "LONG", 500.0, 1.0, 450.0)
         assert tracker.active_count == 5
-        assert tracker.can_open_new("F") is False
+        ok, reason = tracker.can_open_new("F")
+        assert ok is False
+        assert "上限" in reason
 
     def test_rejects_when_exposure_exceeded(self, tracker: PositionTracker) -> None:
         # 3000 value / 10000 balance = 0.30 > 0.25 max
         tracker.open_position("A", "LONG", 3000.0, 1.0, 2900.0)
-        assert tracker.can_open_new("B") is False
+        ok, reason = tracker.can_open_new("B")
+        assert ok is False
+        assert "敞口" in reason
 
     def test_allows_different_symbol_below_limits(self, tracker: PositionTracker) -> None:
         tracker.open_position("A", "LONG", 100.0, 1.0, 90.0)
-        assert tracker.can_open_new("B") is True
+        ok, reason = tracker.can_open_new("B")
+        assert ok is True
+        assert reason == ""
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +299,7 @@ class TestThreadSafety:
             try:
                 for i in range(start, start + 10):
                     sym = f"SYM{i}"
-                    if tracker.can_open_new(sym):
+                    if tracker.can_open_new(sym)[0]:
                         tracker.open_position(sym, "LONG", 100.0, 1.0, 90.0)
                     _ = tracker.get_exposure()
                     _ = tracker.is_in_cooldown(sym, "LONG")
