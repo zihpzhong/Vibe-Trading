@@ -15,12 +15,12 @@ from src.agent.tools import BaseTool
 
 from extensions.live_trading.config import LiveTradingConfig
 from extensions.live_trading.models import LiveSignal, SignalDirection
-from src.live_trading.execution_gate import ExecGateEngine
-from src.live_trading.atr_stop import calculate_atr_stop
-from src.live_trading.exchange import create_exchange
-from src.live_trading.scheduler import TradingScheduler
-from src.live_trading.position_tracker import PositionTracker
-from src.live_trading.tpsl_monitor import TPSLMonitor
+from extensions.live_trading.engine.execution_gate import ExecGateEngine
+from extensions.live_trading.engine.atr_stop import calculate_atr_stop
+from extensions.live_trading.engine.exchange import create_exchange
+from extensions.live_trading.engine.scheduler import TradingScheduler
+from extensions.live_trading.engine.position_tracker import PositionTracker
+from extensions.live_trading.engine.tpsl_monitor import TPSLMonitor
 
 
 class LiveTradingTool(BaseTool):
