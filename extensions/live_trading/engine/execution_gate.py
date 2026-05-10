@@ -38,6 +38,7 @@ class ExecGateEngine:
         orderbook: Optional[dict] = None,
         order_qty: float = 0.0,
         account_balance: float = 0.0,
+        order_margin: float = 0.0,
     ) -> ExecutionGateResult:
         """Run all gate checks against a signal.
 
@@ -50,6 +51,9 @@ class ExecGateEngine:
                 orderbook impact simulation. 0 = skip impact check.
             account_balance: Account USDT balance for position cap check.
                 0 = skip position cap check.
+            order_margin: Margin allocated to this position. If provided,
+                position cap is checked on margin usage; otherwise the
+                check falls back to order notional from order_qty * entry.
 
         Returns:
             ExecutionGateResult with aggregated verdict.
@@ -64,7 +68,7 @@ class ExecGateEngine:
         self._check_funding_rate(result, funding_rate)
         self._check_orderbook_impact(result, orderbook, signal, order_qty)
         self._check_risk_reward(result, signal)
-        self._check_position_cap(result, signal, order_qty, account_balance)
+        self._check_position_cap(result, signal, order_qty, account_balance, order_margin)
 
         failed = result.failed_checks
         if any(c.name == "funding_rate" for c in failed):
@@ -131,8 +135,11 @@ class ExecGateEngine:
 
         Pass order_qty=0 (default) to skip the check (no order size known).
         """
-        if orderbook is None or order_qty <= 0:
-            result.add_check("orderbook_impact", True, "No order qty or orderbook, skipping")
+        if order_qty <= 0:
+            result.add_check("orderbook_impact", True, "No order qty, skipping")
+            return
+        if orderbook is None:
+            result.add_check("orderbook_impact", False, "No orderbook data for sized order")
             return
 
         max_impact = self.config.execution_gate.max_orderbook_impact_pct
@@ -143,7 +150,7 @@ class ExecGateEngine:
             levels = orderbook.get("bids", [])
 
         if not levels:
-            result.add_check("orderbook_impact", True, "No orderbook depth, skipping")
+            result.add_check("orderbook_impact", False, "No orderbook depth for sized order")
             return
 
         # Simulate eating through orderbook levels
@@ -230,33 +237,45 @@ class ExecGateEngine:
         signal: LiveSignal,
         order_qty: float = 0.0,
         account_balance: float = 0.0,
+        order_margin: float = 0.0,
     ) -> None:
-        """Check if the single position size exceeds the configured cap.
+        """Check if the single-position margin usage exceeds cap.
 
-        Uses order_qty and entry_price to estimate notional, then compares
-        against max_position_pct of account_balance. Skips if insufficient
-        data is available (caller's responsibility to enforce).
+        ``max_position_pct`` is treated as allocated account capital / margin,
+        not leveraged notional exposure. If order_margin is not supplied, the
+        method falls back to order notional for backward-compatible callers.
+        Skips only when there is no usable balance or size context.
         """
         max_pct = self.config.execution_gate.max_position_pct
-        if account_balance <= 0 or order_qty <= 0 or not signal.entry_price:
+        if account_balance <= 0:
             result.add_check(
                 "position_cap", True,
-                f"Position cap: {max_pct}% (skipped, no balance/qty)",
+                f"Position cap: {max_pct}% (skipped, no balance)",
             )
             return
 
-        entry_price = signal.entry_price
-        notional = order_qty * entry_price
-        position_pct = notional / account_balance * 100
+        entry_price = signal.entry_price or 0.0
+        notional = order_qty * entry_price if order_qty > 0 and entry_price > 0 else 0.0
+        measured_value = order_margin if order_margin > 0 else notional
+        measured_label = "margin" if order_margin > 0 else "notional"
+
+        if measured_value <= 0:
+            result.add_check(
+                "position_cap", True,
+                f"Position cap: {max_pct}% (skipped, no margin/qty)",
+            )
+            return
+
+        position_pct = measured_value / account_balance * 100
 
         if position_pct <= max_pct:
             result.add_check(
                 "position_cap", True,
-                f"Position ${notional:.2f} ({position_pct:.1f}%) ≤ cap {max_pct}%",
+                f"Position {measured_label} ${measured_value:.2f} ({position_pct:.1f}%) ≤ cap {max_pct}%",
             )
         else:
             result.add_check(
                 "position_cap", False,
-                f"Position ${notional:.2f} ({position_pct:.1f}%) > cap {max_pct}% "
+                f"Position {measured_label} ${measured_value:.2f} ({position_pct:.1f}%) > cap {max_pct}% "
                 f"(balance=${account_balance:.2f})",
             )
