@@ -466,19 +466,19 @@ def main() -> int:
             if report.phase2_requests:
                 console.print(f"[bold]--- 自动交易评估 ({'LIVE' if not args.dry_run else 'DRY RUN'}) ---[/bold]")
 
+                # 2aa. 同步实际余额（每轮一次，不在循环内重复）
+                try:
+                    bal = exchange.get_account_balance()
+                    if bal and "USDT" in bal:
+                        positions.account_balance = float(bal["USDT"])
+                except Exception as exc:
+                    log.warning("余额同步失败: %s", exc)
+
                 for req in report.phase2_requests:
                     symbol = req.symbol
                     direction = SignalDirection(req.direction)
                     score = req.score
                     entry_price = req.entry_price
-
-                    # 2aa. 同步实际余额
-                    try:
-                        bal = exchange.get_account_balance()
-                        if bal and "USDT" in bal:
-                            positions.account_balance = float(bal["USDT"])
-                    except Exception as exc:
-                        log.warning("余额同步失败: %s", exc)
 
                     # 2a. 检查是否可以开新仓
                     ok, reason = positions.can_open_new(symbol)
