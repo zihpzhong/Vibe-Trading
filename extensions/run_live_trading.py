@@ -634,12 +634,12 @@ def main() -> int:
                         else:
                             leverage = 1
 
-                        # 杠杆感知的动态分配: 保证金均分到剩余仓位, 杠杆放大名义价值
-                        available = positions.account_balance * 0.99
-                        active_pos = positions.active_count
-                        remaining_slots = max(1, 5 - active_pos)
-                        margin_per_slot = available / remaining_slots
-                        notional = margin_per_slot * leverage
+                        # 按 position_size 分配每笔保证金, 杠杆放大名义价值
+                        # 避免均分剩余仓位导致的集中度过高
+                        position_margin = positions.account_balance * args.position_size
+                        notional = position_margin * leverage
+                        # 硬上限: 单笔名义价值不超过账户余额
+                        notional = min(notional, positions.account_balance)
                         if notional < 5:
                             console.print(
                                 f"           [yellow]SKIP — 名义价值 ${notional:.1f} < $5 最小限额[/yellow]"
