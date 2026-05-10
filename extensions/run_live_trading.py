@@ -76,8 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance", type=float, default=50.0, help="账户 USDT 余额")
     parser.add_argument("--mode", choices=["default", "conservative", "aggressive"],
                         default="default", help="风控模式")
-    parser.add_argument("--position-size", type=float, default=0.2,
-                        help=f"单次开仓比例 (默认 {0.2:.0%})")
+    parser.add_argument("--position-size", type=float, default=DEFAULT_POSITION_SIZE_PCT,
+                        help=f"单次开仓保证金比例 (默认 {DEFAULT_POSITION_SIZE_PCT:.0%})")
     parser.add_argument("--rr", type=float, default=DEFAULT_REWARD_RISK_RATIO,
                         help=f"目标 R:R 止盈比 (默认 {DEFAULT_REWARD_RISK_RATIO}:1)")
     parser.add_argument("--max-leverage", type=int, default=5,
@@ -611,7 +611,16 @@ def main() -> int:
                         leverage = max(1, max_lev // 2)
                     else:
                         leverage = 1
-                    position_margin = positions.account_balance * args.position_size
+                    effective_position_size = min(
+                        args.position_size,
+                        config.execution_gate.max_position_pct / 100,
+                    )
+                    if effective_position_size < args.position_size:
+                        log.info(
+                            "%s: position-size %.1f%% capped to gate max_position_pct %.1f%%",
+                            symbol, args.position_size * 100, config.execution_gate.max_position_pct,
+                        )
+                    position_margin = positions.account_balance * effective_position_size
                     order_notional = position_margin * leverage
                     order_notional = min(order_notional, positions.account_balance)
                     order_qty = order_notional / entry_price if entry_price > 0 else 0.0
@@ -630,6 +639,7 @@ def main() -> int:
                         live_signal, ticker, funding_rate, orderbook,
                         order_qty=order_qty,
                         account_balance=positions.account_balance,
+                        order_margin=position_margin,
                     )
 
                     # Phase 2 NEUTRAL 降级: 即使 Gate PASS 也降为 WATCH_ONLY
@@ -783,7 +793,11 @@ def main() -> int:
                             max_exposure = positions.max_exposure_pct  # 动态从 PositionTracker 读取
                             # DCA 使用减半杠杆
                             dca_leverage = max(1, args.max_leverage // 2)
-                            dca_notional = (positions.account_balance * args.position_size) * dca_mult * dca_leverage
+                            effective_position_size = min(
+                                args.position_size,
+                                config.execution_gate.max_position_pct / 100,
+                            )
+                            dca_notional = (positions.account_balance * effective_position_size) * dca_mult * dca_leverage
                             post_dca_exposure = current_exposure + (dca_notional / positions.account_balance)
                             if post_dca_exposure > max_exposure:
                                 log.warning(

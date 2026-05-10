@@ -397,7 +397,7 @@ class RealExchange(ExchangeBase):
             "symbol": symbol, "side": self._binance_side(side), "type": "MARKET",
             "quantity": str(qty), "newOrderRespType": "RESULT",
         }
-        if reduce_only:
+        if reduce_only and self._market_type == "future":
             params["reduceOnly"] = "true"
         with self._lock:
             raw = _retry(f"market({symbol},{side},{qty})", self._trade_request, "/api/v3/order", params)
