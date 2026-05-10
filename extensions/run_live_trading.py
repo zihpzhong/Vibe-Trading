@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
                         help=f"单次开仓比例 (默认 {0.2:.0%})")
     parser.add_argument("--rr", type=float, default=DEFAULT_REWARD_RISK_RATIO,
                         help=f"目标 R:R 止盈比 (默认 {DEFAULT_REWARD_RISK_RATIO}:1)")
+    parser.add_argument("--no-phase2", action="store_true",
+                        help="跳过 Phase 2 LLM 深度分析 (仅 Phase 1 + Gate)")
     return parser.parse_args()
 
 
@@ -95,8 +97,9 @@ def main() -> int:
     from extensions.live_trading.engine.tpsl_monitor import TPSLMonitor
     from extensions.live_trading.engine.atr_stop import calculate_atr_stop
     from extensions.live_trading.engine.execution_gate import ExecGateEngine
+    from extensions.live_trading.engine.phase2 import Phase2Analyzer
     from extensions.live_trading.config import LiveTradingConfig
-    from extensions.live_trading.models import LiveSignal, SignalDirection
+    from extensions.live_trading.models import GateStatus, LiveSignal, SignalDirection
 
     # ---- 配置 ----
     config = LiveTradingConfig()
@@ -147,7 +150,18 @@ def main() -> int:
         exchange.set_position_mode(dual=False)
 
     # ---- 持仓管理 ----
-    positions = PositionTracker(account_balance=args.balance)
+    positions = PositionTracker(
+        account_balance=args.balance,
+        max_positions=3,
+        max_exposure_pct=args.position_size * 3 * 1.1,  # 3 仓 + 10% 缓冲
+    )
+
+    # ---- Phase 2 分析引擎 ----
+    phase2_analyzer = Phase2Analyzer() if not args.no_phase2 else None
+    if phase2_analyzer:
+        log.info("Phase 2 deep analysis enabled (LLM-driven skills)")
+    else:
+        log.info("Phase 2 disabled (--no-phase2)")
 
     # ---- Gate 引擎 ----
     gate_engine = ExecGateEngine(config)
@@ -204,6 +218,11 @@ def main() -> int:
             btc_label = report.btc_status
             if btc_label in ("LOCK_LONG", "LOCK_SHORT"):
                 btc_label = f"[red]{btc_label}[/red]"
+            btc_1h = getattr(report, "btc_1h_trend", "NEUTRAL")
+            if btc_1h == "WEAKNESS":
+                btc_label += " [yellow]1h↓[/yellow]"
+            elif btc_1h == "STRENGTH":
+                btc_label += " [green]1h↑[/green]"
 
             # 状态表
             table = build_status_table(
@@ -216,6 +235,36 @@ def main() -> int:
                 orders_count=total_orders,
             )
             console.print(table)
+
+            # --- 持仓盈亏 ---
+            active_pos = positions.get_active_positions()
+            if active_pos:
+                try:
+                    active_symbols = [p.symbol for p in active_pos]
+                    tickers_all = exchange.get_tickers(active_symbols)
+                    prices = {t["symbol"]: float(t.get("last", 0)) for t in tickers_all}
+                    console.print("[bold]持仓盈亏:[/bold]")
+                    total_pnl = 0.0
+                    for p in active_pos:
+                        cur = prices.get(p.symbol, 0) or 0
+                        if p.direction == "LONG":
+                            pnl_pct = (cur - p.entry_price) / p.entry_price * 100 if p.entry_price else 0
+                            pnl_usdt = p.quantity * (cur - p.entry_price)
+                        else:
+                            pnl_pct = (p.entry_price - cur) / p.entry_price * 100 if p.entry_price else 0
+                            pnl_usdt = p.quantity * (p.entry_price - cur)
+                        total_pnl += pnl_usdt
+                        color = "[green]" if pnl_pct >= 0 else "[red]"
+                        sl_dist = abs(cur - p.stop_loss) / cur * 100 if cur and p.stop_loss else 0
+                        console.print(
+                            f"  {color}{p.symbol:12s} {p.direction:5s} "
+                            f"entry={p.entry_price:.6f} cur={cur:.6f} "
+                            f"PnL={pnl_pct:+.2f}% ({pnl_usdt:+.3f}USDT) "
+                            f"SL距={sl_dist:.1f}%[/]"
+                        )
+                    console.print(f"  [dim]浮动盈亏合计: {total_pnl:+.3f} USDT[/dim]")
+                except Exception:
+                    pass
 
             if report.rankings:
                 top = report.rankings[:5]
@@ -249,6 +298,20 @@ def main() -> int:
                         console.print(f"  {symbol} [yellow]SKIP[/yellow] 冷却中")
                         continue
 
+                    # 2ab. BTC 1h trend gate: avoid counter-trend altcoin trades
+                    btc_hint = getattr(report, "btc_1h_trend", "NEUTRAL")
+                    if btc_hint != "NEUTRAL" and symbol != "BTCUSDT":
+                        if btc_hint == "WEAKNESS" and direction == SignalDirection.LONG:
+                            console.print(
+                                f"  {symbol} [yellow]SKIP[/yellow] BTC 1h 弱势, 跳过山寨币多头"
+                            )
+                            continue
+                        if btc_hint == "STRENGTH" and direction == SignalDirection.SHORT:
+                            console.print(
+                                f"  {symbol} [yellow]SKIP[/yellow] BTC 1h 强势, 跳过山寨币空头"
+                            )
+                            continue
+
                     # 2b. 获取市场数据
                     try:
                         ticker = exchange.get_ticker(symbol)
@@ -256,11 +319,52 @@ def main() -> int:
                         # 如果 entry_price 为 0（扫描器未输出价格），使用当前市价
                         if entry_price is None or entry_price == 0:
                             entry_price = float(ticker.get("last", 0))
+                        if entry_price is None or entry_price <= 0:
+                            console.print(f"  {symbol:12s} [yellow]SKIP[/yellow] 无效入场价格")
+                            continue
                     except Exception as exc:
                         log.warning("Market data fetch failed for %s: %s", symbol, exc)
                         continue
 
-                    # 2c. 计算 ATR 止损
+                    # 2c. Phase 2: LLM深度分析 — load_skill per dim → 综合评分
+                    if phase2_analyzer and req.dims:
+                        phase2_result = phase2_analyzer.analyze(req, ticker)
+                        if phase2_result:
+                            dims_str = "; ".join(
+                                f"{d}:{phase2_result.get('dimensions', {}).get(d, {}).get('verdict', '?')}"
+                                for d in req.dims
+                            )
+                            consensus = phase2_result.get("consensus", "PASS")
+                            summary = phase2_result.get("summary", "")
+                            if consensus == "FAIL":
+                                console.print(
+                                    f"  {symbol:12s} [red]PHASE2 FAIL[/red] — {summary}"
+                                )
+                                console.print(f"           {dims_str}")
+                                continue
+                            elif consensus == "NEUTRAL":
+                                console.print(
+                                    f"  {symbol:12s} [yellow]PHASE2 NEUTRAL[/yellow] — {summary}"
+                                )
+                                console.print(f"           {dims_str}")
+                                # 降级为 WATCH_ONLY 处理: 继续计算但标记
+                                watch_only_flag = True
+                            else:
+                                console.print(
+                                    f"  {symbol:12s} [green]PHASE2 PASS[/green] — {summary}"
+                                )
+                                console.print(f"           {dims_str}")
+                                watch_only_flag = False
+                        else:
+                            # Phase 2 分析失败（如 LLM JSON 解析错误），保守降级
+                            console.print(
+                                f"  {symbol:12s} [yellow]PHASE2 ERROR[/yellow] — LLM analysis failed, defaulting to WATCH_ONLY"
+                            )
+                            watch_only_flag = True
+                    else:
+                        watch_only_flag = False
+
+                    # 2d. 计算 ATR 止损
                     try:
                         kline_1h = exchange.get_kline(symbol, "1h", 50)
                         stop_price, atr_value = calculate_atr_stop(
@@ -295,6 +399,10 @@ def main() -> int:
 
                     gate_result = gate_engine.run_gate(live_signal, ticker, funding_rate, orderbook)
 
+                    # Phase 2 NEUTRAL 降级: 即使 Gate PASS 也降为 WATCH_ONLY
+                    if watch_only_flag and gate_result.status.value == "PASS":
+                        gate_result.status = GateStatus.WATCH_ONLY
+
                     # 2f. 输出 Gate 结果
                     status_icon = {
                         "PASS": "[green]PASS[/green]",
@@ -318,9 +426,9 @@ def main() -> int:
                     # 2g. Gate PASS → 开仓
                     if gate_result.status.value == "PASS":
                         notional = args.balance * args.position_size
-                        if notional < 10:
+                        if notional < 5:
                             console.print(
-                                f"           [yellow]SKIP — 名义价值 ${notional:.1f} < $10 最小限额[/yellow]"
+                                f"           [yellow]SKIP — 名义价值 ${notional:.1f} < $5 最小限额[/yellow]"
                             )
                             continue
                         if args.dry_run:
