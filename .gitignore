@@ -25,6 +25,7 @@ frontend/tsconfig.tsbuildinfo
 .vibe-record/
 .cache/
 .remotion/
+.omc/
 
 # DuckDB data cache
 data/*.duckdb
