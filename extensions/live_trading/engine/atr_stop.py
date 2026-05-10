@@ -80,4 +80,5 @@ def calculate_atr_stop(
     else:
         stop_price = entry_price + stop_distance
 
-    return round(stop_price, 2), round(atr_value, 2)
+    decimals = 6 if entry_price < 1 else 4 if entry_price < 100 else 2
+    return round(stop_price, decimals), round(atr_value, decimals)
