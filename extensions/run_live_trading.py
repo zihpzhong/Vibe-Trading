@@ -102,7 +102,8 @@ def build_status_table(
     table.add_row("[bold]Cycle[/bold]", f"#{cycle_count}")
     table.add_row("[bold]BTC[/bold]", btc_status)
     table.add_row("[bold]Positions[/bold]", str(active_positions))
-    table.add_row("[bold]Exposure[/bold]", f"{exposure:.1%}")
+    exp_str = f"{exposure:.1%}" if exposure < 1.0 else f"{exposure:.1f}x"
+    table.add_row("[bold]Exposure[/bold]", exp_str)
     table.add_row("[bold]Last Scan[/bold]", last_scan_time)
     table.add_row("[bold]Rankings[/bold]", str(rankings_count))
     table.add_row("[bold]Orders[/bold]", str(orders_count))
@@ -432,10 +433,15 @@ def main() -> int:
                 console.print("[dim]最近平仓:[/dim]")
                 for c in reversed(closed_records):
                     color = "[green]" if c.pnl_usdt >= 0 else "[red]"
+                    # 小金额显示更多小数位
+                    if abs(c.pnl_usdt) < 0.01:
+                        pnl_str = f"{c.pnl_usdt:+.4f}"
+                    else:
+                        pnl_str = f"{c.pnl_usdt:+.2f}"
                     console.print(
                         f"  {color}{c.symbol:12s} {c.direction:5s} "
                         f"exit={c.exit_price:.4f} "
-                        f"PnL={c.pnl_usdt:+.2f}USDT ({c.pnl_pct:+.2f}%) "
+                        f"PnL={pnl_str}USDT ({c.pnl_pct:+.2f}%) "
                         f"{c.reason}[/]"
                     )
 
@@ -802,10 +808,12 @@ def main() -> int:
                     tier_lines = ""
                     for tier_name, tier_data in score_tiers.items():
                         if tier_data["count"] > 0:
+                            tp = tier_data['total_pnl']
+                            pnl_str = f"{tp:+.2f}" if abs(tp) >= 0.01 else f"{tp:+.4f}"
                             tier_lines += (
                                 f"  {tier_name}: {tier_data['count']}笔 "
                                 f"胜率={tier_data['win_rate']:.0%} "
-                                f"总PnL={tier_data['total_pnl']:+.2f}\n"
+                                f"总PnL={pnl_str}\n"
                             )
                     panel_text = (
                         f"[bold]绩效报告 (Cycle #{cycle_count})[/bold]\n"
