@@ -11,7 +11,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from threading import Event, Thread
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .exchange import ExchangeBase
 from .position_tracker import Position, PositionTracker
@@ -49,6 +49,7 @@ class TPSLMonitor(Thread):
         on_error: Optional[Callable[[Exception], None]] = None,
         de_risk_config: Optional[DeRiskConfig] = None,
         dca_config: Optional[DCAConfig] = None,
+        dca_gate_engine: Optional[Any] = None,
         max_leverage: int = 5,
         position_size_pct: float = 0.05,
         status_log_interval: float = 60.0,
@@ -64,6 +65,7 @@ class TPSLMonitor(Thread):
         self._on_error = on_error
         self._stop_event = Event()
         self._dca_config = dca_config
+        self._dca_gate_engine = dca_gate_engine
         self._max_leverage = max_leverage
         self._position_size_pct = position_size_pct
         self._status_poll_counter = 0
@@ -144,16 +146,19 @@ class TPSLMonitor(Thread):
             if current_price <= 0:
                 continue
 
-            self._check_dca(pos, current_price)                       # 1. DCA when losing
-            self._update_trailing_stop(pos, current_price)            # 2. Trailing stop
+            self._update_trailing_stop(pos, current_price)            # 1. Trailing stop
             effective_sl = self._trailing_stops.get(pos.symbol, pos.stop_loss)
 
-            if self._check_take_profit(pos, current_price):           # 3. TP
-                self._execute_tp(pos, current_price)
-            elif self._check_de_risk(pos, current_price):             # 4. De-risk partial exit
-                pass
-            elif self._check_stop_loss(pos, current_price, effective_sl):  # 5. SL final guard
+            if self._check_stop_loss(pos, current_price, effective_sl):  # 2. SL hard guard before DCA
                 self._execute_sl(pos, current_price, effective_sl)
+                continue
+
+            self._check_dca(pos, current_price)                       # 3. DCA when losing
+
+            if self._check_take_profit(pos, current_price):           # 4. TP
+                self._execute_tp(pos, current_price)
+            elif self._check_de_risk(pos, current_price):             # 5. De-risk partial exit
+                pass
 
         # 定时持仓状态日志
         self._status_poll_counter += 1
@@ -243,12 +248,15 @@ class TPSLMonitor(Thread):
         else:
             tp_pct = 0.001
 
-        # If fixed TP is set, use it directly (time decay is fallback for no-TP positions)
+        thresholds = [tp_pct]
         if pos.take_profit is not None:
             if pos.direction == "LONG":
-                tp_pct = (pos.take_profit - pos.entry_price) / pos.entry_price
+                fixed_tp_pct = (pos.take_profit - pos.entry_price) / pos.entry_price
             else:
-                tp_pct = (pos.entry_price - pos.take_profit) / pos.entry_price
+                fixed_tp_pct = (pos.entry_price - pos.take_profit) / pos.entry_price
+            if fixed_tp_pct > 0:
+                thresholds.append(fixed_tp_pct)
+        tp_pct = min(thresholds)
 
         if pos.direction == "LONG":
             return price >= pos.entry_price * (1 + tp_pct)
@@ -306,7 +314,7 @@ class TPSLMonitor(Thread):
             return False
 
         # 暴露率检查
-        current_exposure = self._positions.get_exposure()
+        current_exposure = self._positions.get_exposure({pos.symbol: current_price}, include_unrealized=True)
         dca_mult = cfg.dca_multipliers[min(pos.dca_count, len(cfg.dca_multipliers) - 1)]
         max_exposure = self._positions.max_exposure_pct
         dca_lev = max(1, self._max_leverage // 2) if cfg.dca_leverage_halved else self._max_leverage
@@ -335,7 +343,64 @@ class TPSLMonitor(Thread):
             )
             return False
 
+        if self._dca_gate_engine is not None and not self._check_dca_gate(pos, dca_qty, current_price, dca_notional, dca_lev):
+            return False
+
         self._execute_dca(pos, dca_qty, current_price)
+        return True
+
+    def _check_dca_gate(
+        self,
+        pos: Position,
+        dca_qty: float,
+        current_price: float,
+        dca_notional: float,
+        dca_lev: int,
+    ) -> bool:
+        """Re-run a simplified Execution Gate before adding to a losing position."""
+        try:
+            ticker = self._exchange.get_ticker(pos.symbol)
+        except Exception as exc:
+            logger.warning("DCA SKIP %s: ticker unavailable before DCA gate: %s", pos.symbol, exc)
+            return False
+
+        funding_rate: Optional[float]
+        try:
+            funding_rate = self._exchange.get_funding_rate(pos.symbol)
+        except Exception as exc:
+            funding_rate = None
+            logger.warning("DCA SKIP %s: funding unavailable before DCA gate: %s", pos.symbol, exc)
+
+        try:
+            orderbook = self._exchange.get_orderbook(pos.symbol, 10)
+        except Exception as exc:
+            logger.warning("DCA SKIP %s: orderbook unavailable before DCA gate: %s", pos.symbol, exc)
+            return False
+
+        from extensions.live_trading.models import GateStatus, LiveSignal, SignalDirection
+
+        direction = SignalDirection(pos.direction)
+        targets = [pos.take_profit] if pos.take_profit else []
+        signal = LiveSignal(
+            symbol=pos.symbol,
+            direction=direction,
+            score=pos.entry_score,
+            entry_price=current_price,
+            stop_loss=pos.stop_loss,
+            target_prices=targets,
+        )
+        result = self._dca_gate_engine.run_gate(
+            signal,
+            ticker=ticker,
+            funding_rate=funding_rate,
+            orderbook=orderbook,
+            order_qty=dca_qty,
+            account_balance=self._positions.account_balance,
+            order_margin=dca_notional / max(dca_lev, 1),
+        )
+        if result.status != GateStatus.PASS:
+            logger.warning("DCA SKIP %s: gate=%s %s", pos.symbol, result.status.value, result.summary)
+            return False
         return True
 
     def _execute_dca(self, pos: Position, dca_qty: float, price: float) -> None:

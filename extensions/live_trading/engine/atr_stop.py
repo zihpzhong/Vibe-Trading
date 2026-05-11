@@ -77,10 +77,17 @@ def calculate_atr_stop(
     multiplier = cfg.multiplier_conservative if conservative else cfg.multiplier_default
     stop_distance = atr_value * multiplier
 
-    # Enforce minimum stop distance to keep DCA viable
+    # Bound stop distance by volatility-aware floor/cap. The floor prevents
+    # noise stops; the cap prevents short-horizon targets from being pushed
+    # unrealistically far away by score-based R:R expansion.
     min_distance = entry_price * (cfg.min_stop_distance_pct / 100)
     if stop_distance < min_distance:
         stop_distance = min_distance
+    max_distance_pct = getattr(cfg, "max_stop_distance_pct", 0.0) or 0.0
+    if max_distance_pct > 0:
+        max_distance = entry_price * (max_distance_pct / 100)
+        if stop_distance > max_distance:
+            stop_distance = max_distance
 
     if direction == SignalDirection.LONG:
         stop_price = entry_price - stop_distance

@@ -67,6 +67,14 @@ class TestExecGateEngine:
         assert result.status == GateStatus.REJECT
         assert any(c.name == "funding_rate" and not c.passed for c in result.checks)
 
+    def test_reject_missing_funding_rate(self) -> None:
+        """实盘合约 funding 获取失败时不能按 0 处理，应直接 REJECT."""
+        engine = ExecGateEngine()
+        signal = LiveSignal(symbol="BTCUSDT", direction=SignalDirection.LONG, score=6)
+        result = engine.run_gate(signal, ticker={"volume24h": 2_000_000}, funding_rate=None)
+        assert result.status == GateStatus.REJECT
+        assert any(c.name == "funding_rate" and not c.passed for c in result.checks)
+
     def test_reject_negative_funding_short(self) -> None:
         """资金费率 < -0.05% 且方向 SHORT → REJECT."""
         engine = ExecGateEngine()
@@ -109,6 +117,7 @@ class TestExecGateEngine:
         rr_check = [c for c in result.checks if c.name == "risk_reward"]
         assert len(rr_check) == 1
         assert not rr_check[0].passed
+        assert result.status == GateStatus.REJECT
 
     def test_gate_result_properties(self) -> None:
         """Gateway 属性正确反映通过/失败情况."""
@@ -178,6 +187,7 @@ class TestOrderbookImpact:
         assert len(ob_check) == 1
         assert not ob_check[0].passed
         assert "No orderbook data" in ob_check[0].detail
+        assert result.status == GateStatus.REJECT
 
     def test_impact_long_low_impact_passes(self) -> None:
         """LONG 小单吃 top level → VWAP 偏离 ≤ 0.5% → PASS."""
@@ -377,7 +387,7 @@ class TestATRStop:
 
     def test_conservative_multiplier(self) -> None:
         """保守模式止损距离更近."""
-        kline = self._make_kline()
+        kline = self._make_kline(vol_pct=2.0)
         stop_default, atr_d = calculate_atr_stop(kline, SignalDirection.LONG, 150.0, conservative=False)
         stop_conservative, atr_c = calculate_atr_stop(kline, SignalDirection.LONG, 150.0, conservative=True)
         # conservative uses 1.5x instead of 2.0x, so stop is closer to entry
@@ -387,7 +397,7 @@ class TestATRStop:
     def test_custom_atr_config(self) -> None:
         """ATR 配置可自定义."""
         kline = self._make_kline()
-        cfg = ATRStopConfig(multiplier_default=3.0, period=14)
+        cfg = ATRStopConfig(multiplier_default=3.0, period=14, max_stop_distance_pct=0.0)
         stop, atr = calculate_atr_stop(kline, SignalDirection.LONG, 150.0, config=cfg)
         expected_stop = round(150.0 - atr * 3.0, 2)
         assert stop == pytest.approx(expected_stop, rel=1e-3)
@@ -396,31 +406,38 @@ class TestATRStop:
         """数据不足时使用固定百分比止损."""
         kline = pd.DataFrame({"high": [100.0], "low": [98.0], "close": [99.0]})
         stop, atr = calculate_atr_stop(kline, SignalDirection.LONG, 100.0)
-        assert stop == 92.0  # 8% fallback (from ATRStopConfig.min_stop_distance_pct)
+        assert stop == 97.0  # 3% fallback (from ATRStopConfig.min_stop_distance_pct)
         assert atr == 0.0
 
     def test_min_stop_distance_pct_enforced(self) -> None:
         """ATR 计算出的距离小于最小距离时，使用最小距离."""
         kline = pd.DataFrame({
-            "high": [101.0] * 20,
-            "low": [99.0] * 20,
+            "high": [100.5] * 20,
+            "low": [99.5] * 20,
             "close": [100.0] * 20,
         })
-        # Very low volatility → ATR-based stop < 8% → should enforce min distance
+        # Very low volatility → ATR-based stop < dynamic floor → should enforce 3% min distance
         stop, atr = calculate_atr_stop(kline, SignalDirection.LONG, 100.0)
-        assert stop == pytest.approx(92.0, rel=1e-3)  # 8% of 100
+        assert stop == pytest.approx(97.0, rel=1e-3)  # 3% of 100
         assert atr > 0
 
     def test_min_stop_short_direction(self) -> None:
         """SHORT 方向最小止损距离."""
         kline = pd.DataFrame({
-            "high": [101.0] * 20,
-            "low": [99.0] * 20,
+            "high": [100.5] * 20,
+            "low": [99.5] * 20,
             "close": [100.0] * 20,
         })
         stop, atr = calculate_atr_stop(kline, SignalDirection.SHORT, 100.0)
-        assert stop == pytest.approx(108.0, rel=1e-3)  # 8% of 100, above entry
+        assert stop == pytest.approx(103.0, rel=1e-3)  # 3% of 100, above entry
         assert atr > 0
+
+    def test_max_stop_distance_pct_caps_wide_atr(self) -> None:
+        """极端波动下止损距离被上限约束，避免 TP 被 R:R 放到过远."""
+        kline = self._make_kline(vol_pct=30.0)
+        stop, atr = calculate_atr_stop(kline, SignalDirection.LONG, 100.0)
+        assert atr > 0
+        assert stop == pytest.approx(92.0, rel=1e-3)  # max 8% distance
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +515,8 @@ class TestLiveTradingConfig:
         assert cfg.funding_rate.max_long_funding == 0.0010
         assert cfg.funding_rate.min_short_funding == -0.0005
         assert cfg.atr_stop.multiplier_default == 2.0
+        assert cfg.atr_stop.min_stop_distance_pct == 3.0
+        assert cfg.atr_stop.max_stop_distance_pct == 8.0
         assert cfg.execution_gate.min_liquidity_usdt == 1_000_000
         assert cfg.execution_gate.min_risk_reward_ratio == 1.0
 
