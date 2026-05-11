@@ -197,9 +197,12 @@ class RealExchange(ExchangeBase):
         try:
             raw = _fetch(base_url, endpoint)
         except Exception as exc:
-            # Futures fapi blocked — try spot fallback
-            if self._market_type == "future" and "not reachable" in str(exc):
-                raw = _fetch("https://api.binance.com", "/api/v3/klines")
+            # Futures kline failures → try spot fallback (covers 404, rate limits, etc.)
+            if self._market_type == "future":
+                try:
+                    raw = _fetch("https://api.binance.com", "/api/v3/klines")
+                except Exception:
+                    raise exc
             else:
                 raise
 
