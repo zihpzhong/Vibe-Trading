@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Vibe Trading 全流程实盘自动交易系统")
     parser.add_argument("--mock", action="store_true", help="使用模拟交易所（测试用）")
     parser.add_argument("--dry-run", action="store_true", help="扫描但不交易")
-    parser.add_argument("--interval", type=int, default=15, help="扫描间隔（分钟）")
+    parser.add_argument("--interval", type=int, default=5, help="扫描间隔（分钟）")
     parser.add_argument("--balance", type=float, default=50.0, help="账户 USDT 余额")
     parser.add_argument("--mode", choices=["default", "conservative", "aggressive"],
                         default="default", help="风控模式")
@@ -537,16 +537,8 @@ def main() -> int:
 
                     # 2c. Phase 2: LLM深度分析 — load_skill per dim → 综合评分
                     if phase2_analyzer and req.dims:
-                        # score < 6: Phase 2 始终 NEUTRAL/FAIL, 无增加价值
-                        # 直接走 Execution Gate, 节省每轮 3-5 分钟 LLM API 时间
-                        if score < 6:
-                            console.print(
-                                f"  {symbol:12s} [dim]PHASE2 SKIP[/dim] — score={score} < 6, 直接走 Gate 评估"
-                            )
-                            watch_only_flag = False
-                        else:
-                            phase2_result = phase2_analyzer.analyze(req, ticker)
-                            if phase2_result:
+                        phase2_result = phase2_analyzer.analyze(req, ticker)
+                        if phase2_result:
                                 dims_str = "; ".join(
                                     f"{d}:{phase2_result.get('dimensions', {}).get(d, {}).get('verdict', '?')}"
                                     for d in req.dims
