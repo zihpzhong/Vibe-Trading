@@ -197,10 +197,21 @@ class RealExchange(ExchangeBase):
         try:
             raw = _fetch(base_url, endpoint)
         except Exception as exc:
-            # Futures kline failures → try spot fallback (covers 404, rate limits, etc.)
+            # Futures kline failures → try spot fallback for non-commodity pairs
             if self._market_type == "future":
                 try:
-                    raw = _fetch("https://api.binance.com", "/api/v3/klines")
+                    resp_check = self._session.get(
+                        f"https://api.binance.com{endpoint}",
+                        params={"symbol": symbol, "interval": tf, "limit": 1},
+                        timeout=10,
+                    )
+                    # spot 404 → symbol not on spot (commodities/杠杆代币), propagate futures error
+                    if resp_check.status_code == 404:
+                        raise RuntimeError(f"Klines unavailable for {symbol} on spot (futures-only pair)")
+                    raw_resp = resp_check.json()
+                    if not raw_resp or (isinstance(raw_resp, list) and len(raw_resp) == 0):
+                        raise RuntimeError(f"Klines unavailable for {symbol} (empty response)")
+                    raw = raw_resp
                 except Exception:
                     raise exc
             else:
