@@ -126,6 +126,16 @@ class TestExposure:
         # value = 500, balance = 10000, exposure = 0.05
         assert tracker.get_exposure() == pytest.approx(0.05)
 
+    def test_exposure_uses_mark_price_when_provided(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 50000.0, 0.01, 48000.0)
+        # mark value = 600, balance = 10000, exposure = 0.06
+        assert tracker.get_exposure({"BTCUSDT": 60000.0}) == pytest.approx(0.06)
+
+    def test_exposure_uses_equity_after_unrealized_pnl(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 50000.0, 0.01, 48000.0)
+        # mark notional = 400, equity = 10000 - 100 floating loss = 9900
+        assert tracker.get_exposure({"BTCUSDT": 40000.0}, include_unrealized=True) == pytest.approx(400 / 9900)
+
     def test_exposure_multiple_positions(self, tracker: PositionTracker) -> None:
         tracker.open_position("A", "LONG", 100.0, 10.0, 90.0)  # 1000
         tracker.open_position("B", "SHORT", 200.0, 5.0, 220.0)  # 1000
@@ -350,6 +360,29 @@ class TestAccountBalance:
         assert tracker.get_exposure() == pytest.approx(0.10)  # 1000/10000
         tracker.account_balance = 5000.0
         assert tracker.get_exposure() == pytest.approx(0.20)  # 1000/5000
+
+
+# ---------------------------------------------------------------------------
+# De-risk realized PnL records
+# ---------------------------------------------------------------------------
+
+class TestDeRiskRecords:
+    """De-risk partial exits should be visible to realized PnL accounting."""
+
+    def test_de_risk_partial_exit_creates_close_record(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 2.0, 80.0, entry_score=7)
+        tracker.de_risk_partial_exit("X", de_risk_level=1, sell_qty=0.5, current_price=90.0)
+
+        pos = tracker.get_position("X")
+        assert pos is not None
+        assert pos.quantity == pytest.approx(1.5)
+
+        closed = tracker.get_recent_closed(10)
+        assert len(closed) == 1
+        assert closed[0].reason == "DE_RISK_1"
+        assert closed[0].quantity == pytest.approx(0.5)
+        assert closed[0].pnl_usdt == pytest.approx(-5.0)
+        assert closed[0].entry_score == 7
 
 
 # ---------------------------------------------------------------------------

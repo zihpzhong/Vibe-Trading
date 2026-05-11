@@ -34,7 +34,7 @@ class ExecGateEngine:
         self,
         signal: LiveSignal,
         ticker: Optional[dict] = None,
-        funding_rate: float = 0.0,
+        funding_rate: Optional[float] = 0.0,
         orderbook: Optional[dict] = None,
         order_qty: float = 0.0,
         account_balance: float = 0.0,
@@ -45,7 +45,8 @@ class ExecGateEngine:
         Args:
             signal: The trading signal to evaluate.
             ticker: Ticker dict with keys: last, volume24h, etc.
-            funding_rate: Current perpetual funding rate.
+            funding_rate: Current perpetual funding rate. ``None`` means the
+                value could not be fetched and is treated as a hard failure.
             orderbook: Order book dict with bids/asks.
             order_qty: Expected order quantity in base asset. Used for
                 orderbook impact simulation. 0 = skip impact check.
@@ -71,9 +72,12 @@ class ExecGateEngine:
         self._check_position_cap(result, signal, order_qty, account_balance, order_margin)
 
         failed = result.failed_checks
-        if any(c.name == "funding_rate" for c in failed):
+        hard_fail_names = {"funding_rate", "orderbook_impact", "risk_reward", "position_cap"}
+        hard_failed = [c for c in failed if c.name in hard_fail_names]
+        if hard_failed:
+            names = [c.name for c in hard_failed]
             result.status = GateStatus.REJECT
-            result.summary = f"REJECTED: Hard block ({failed[0].detail})"
+            result.summary = f"REJECTED: Hard block: {', '.join(names)}"
         elif len(failed) >= 2:
             names = [c.name for c in failed]
             result.summary = f"REJECTED: {len(failed)} checks failed: {', '.join(names)}"
@@ -102,10 +106,17 @@ class ExecGateEngine:
                 f"24h vol {volume:,.0f} USDT < {min_vol:,.0f} (min liquidity)",
             )
 
-    def _check_funding_rate(self, result: ExecutionGateResult, funding_rate: float) -> None:
+    def _check_funding_rate(self, result: ExecutionGateResult, funding_rate: Optional[float]) -> None:
         """Check funding rate doesn't exceed thresholds."""
         cfg = self.config.funding_rate
         direction = result.direction
+
+        if funding_rate is None:
+            result.add_check(
+                "funding_rate", False,
+                "Funding unavailable → no futures entry",
+            )
+            return
 
         if direction == SignalDirection.LONG and funding_rate > cfg.max_long_funding:
             result.add_check(
