@@ -288,13 +288,17 @@ class MarketScanner:
         scored: list[dict[str, Any]] = []
         batch = tickers[:top_n]
         logger.info("Scanning %d symbols for Phase 1...", len(batch))
+        filtered_incompatible = 0
         for i, t in enumerate(batch):
             sym = t["symbol"]
             # Skip stablecoins — they should never generate trading signals
-            # Only USDT pairs reach this point; strip USDT suffix to find the base currency
             base_currency = sym.removesuffix("USDT")
             if base_currency in _STABLECOINS:
                 logger.info("  Filter(稳定币): %s skipped", sym)
+                continue
+            # Filter symbols not available on futures market
+            if not self._exchange.is_valid_symbol(sym):
+                filtered_incompatible += 1
                 continue
             if (i + 1) % 5 == 0 or i == 0:
                 logger.info("  Progress: %d/%d — %s", i + 1, len(batch), sym)
@@ -332,7 +336,7 @@ class MarketScanner:
         return ScanResult(
             rankings=rankings,
             watchlist=watchlist,
-            filtered_count=filtered,
+            filtered_count=filtered + filtered_incompatible,
             scan_time_ms=elapsed,
         )
 
