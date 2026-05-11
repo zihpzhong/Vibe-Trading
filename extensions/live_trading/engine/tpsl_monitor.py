@@ -485,20 +485,25 @@ class TPSLMonitor(Thread):
         """Execute a de-risk partial sell order.
 
         Returns:
-            True if the order was actually placed, False if skipped
-            (e.g. below Binance $20 minimum notional).
+            True if the order was actually placed, False if skipped.
         """
         if sell_qty <= 0:
             return False
 
-        # Binance 最小名义价值检查
         notional = sell_qty * current_price
         if notional < 20:
+            # 名义价值不足无法部分减持时，全平避免仓位僵死无风险管控
             logger.warning(
-                "DE-RISK level %d SKIP for %s: partial exit notional $%.2f < $20 min",
-                level, pos.symbol, notional,
+                "DE-RISK level %d FALLBACK for %s: partial exit notional $%.2f < $20 min, "
+                "closing all %.4f instead",
+                level, pos.symbol, notional, pos.quantity,
             )
-            return False
+            side = "sell" if pos.direction == "LONG" else "buy"
+            self._execute_order_with_retry(
+                pos, side, pos.quantity, current_price,
+                reason=f"DE_RISK_{level}", is_de_risk=True, de_risk_level=level,
+            )
+            return True
 
         side = "sell" if pos.direction == "LONG" else "buy"
         self._execute_order_with_retry(

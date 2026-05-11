@@ -460,7 +460,7 @@ class TestDeRisk:
         self, exchange: MockExchange, tracker: PositionTracker,
     ) -> None:
         """各级别 (L1→L2→L3→DOOM) 依次触发，每次 poll 一级."""
-        tracker.open_position("CASCADE", "LONG", 100.0, 10.0, 80.0)
+        tracker.open_position("CASCADE", "LONG", 100.0, 10.0, 50.0)  # SL 远离，让 de-risk 生效
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "CASCADE", "last": 70.0},  # -30%
         ])
@@ -504,23 +504,23 @@ class TestDeRisk:
         assert pos.quantity == 2.0  # 未减仓
         assert pos.de_risk_level == 0
 
-    def test_de_risk_skipped_below_20_min_notional(
+    def test_de_risk_fallback_close_when_notional_too_small(
         self, exchange: MockExchange, tracker: PositionTracker,
     ) -> None:
-        """低于 $20 最小限额时跳过部分减仓."""
-        tracker.open_position("TEST", "LONG", 100.0, 0.3, 80.0)
+        """名义价值低于 $20 无法部分减持时，fallback 全平避免仓位僵死."""
+        tracker.open_position("TEST", "LONG", 100.0, 0.3, 50.0)  # SL=50，让 de-risk 优先生效
         exchange.get_tickers = MagicMock(return_value=[
-            {"symbol": "TEST", "last": 85.0},  # -15%, past levels 1-3, below doom (18%)
+            {"symbol": "TEST", "last": 85.0},  # -15%，触发 L1+L2，但部分减持名义价值<20
         ])
         monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
-        with patch.object(monitor._positions, "de_risk_partial_exit", wraps=tracker.de_risk_partial_exit) as spy:
-            monitor._poll()
-            # 所有级别都应跳过，不调用 de_risk_partial_exit
-            spy.assert_not_called()
+        monitor._poll()
+        # de-risk L1 部分减持 notional=0.3*0.15*85=$3.825 < $20
+        # → fallback 全平 close_position(reason=DE_RISK_1)
         pos = tracker.get_position("TEST")
-        assert pos is not None
-        assert pos.quantity == 0.3  # 未变化
-        assert pos.de_risk_level == 0
+        assert pos is None  # 全平
+        closed = tracker.get_recent_closed(1)
+        assert len(closed) == 1
+        assert closed[0].reason == "DE_RISK_1"
 
     def test_first_entry_cost_backward_compat(self) -> None:
         """旧格式 JSON（无 first_entry_cost）加载时自动 fallback 为 entry_price."""
@@ -643,9 +643,10 @@ class TestDCA:
         self, exchange: MockExchange, tracker: PositionTracker,
     ) -> None:
         """仓位累计亏损超账户 8% 时跳过 DCA."""
-        # Small balance, large position: quick to hit 8% account loss
+        # 账户小额 + 中等仓位即可快速达到 8% 亏损线
+        # qty=2.0 确保 15% de-risk 部分减持 notional = 0.3 * 85 = $25.5 >= $20
         small_tracker = PositionTracker(account_balance=100.0, max_positions=3)
-        small_tracker.open_position("TEST", "LONG", 100.0, 0.5, 80.0)
+        small_tracker.open_position("TEST", "LONG", 100.0, 2.0, 50.0)  # SL=50 让 de-risk 先触发
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "TEST", "last": 85.0},  # -15% loss → 0.5*15=7.5 USDT = 7.5% of 100
         ])
@@ -818,12 +819,13 @@ class TestATRStopIntegration:
         assert 0.5 < atr < 15.0
 
     def test_conservative_mode_uses_tighter_stop(self) -> None:
-        """conservative=True -> stop closer to entry price."""
-        kline = self._make_kline()
+        """保守模式 (1.5x ATR) 止损距离比默认模式 (2.0x ATR) 更近."""
+        # 适度波动率确保 1.5x 和 2.0x 都落在 [3%, 8%] 范围内，不被 cap 截断
+        kline = self._make_kline(vol_pct=4.0)
         stop_default, atr_d = calculate_atr_stop(kline, SignalDirection.LONG, 150.0, conservative=False)
         stop_conservative, atr_c = calculate_atr_stop(kline, SignalDirection.LONG, 150.0, conservative=True)
-        assert stop_conservative > stop_default  # closer to entry
-        assert atr_d == atr_c  # same ATR value
+        assert stop_conservative > stop_default  # 更接近入场价
+        assert atr_d == atr_c  # ATR 值相同
 
 
 # ===================================================================

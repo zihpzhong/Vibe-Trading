@@ -127,7 +127,9 @@ class TestStopLoss:
         assert tracker.active_count == 0
 
     def test_sl_not_triggered_above_threshold(self, exchange: MockExchange, tracker: PositionTracker) -> None:
-        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0)
+        """价格在 SL 之上时 SL 不触发，且 de-risk notional 足够时不触发 fallback."""
+        # qty=2.0 确保 15% 部分减持名义价值 = 0.3 * 91 = $27.3 >= $20
+        tracker.open_position("LONGUSDT", "LONG", 100.0, 2.0, 90.0)
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "LONGUSDT", "last": 91.0},
         ])
@@ -194,7 +196,8 @@ class TestStopLoss:
         from extensions.live_trading.config import DCAConfig
         from extensions.live_trading.engine.execution_gate import ExecGateEngine
 
-        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 80.0, take_profit=120.0)
+        # qty=2.0 确保 15% de-risk 部分减持 notional = 0.3 * 94 = $28.2 >= $20
+        tracker.open_position("LONGUSDT", "LONG", 100.0, 2.0, 80.0, take_profit=120.0)
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "LONGUSDT", "last": 94.0},
         ])
@@ -217,6 +220,46 @@ class TestStopLoss:
         pos = tracker.get_position("LONGUSDT")
         assert pos is not None
         assert pos.dca_count == 0
+
+
+# ---------------------------------------------------------------------------
+# De-risk 降风险减仓
+# ---------------------------------------------------------------------------
+
+class TestDeRisk:
+    def test_de_risk_fallback_close_when_notional_too_small(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """部分减持名义价值 < $20 时 fallback 全平，避免仓位无限僵死."""
+        # 小仓位: qty=0.3, price=85, 15% 减持 = 0.045 * 85 = $3.825 < $20 min
+        tracker.open_position("SMALL", "LONG", 100.0, 0.3, 50.0)  # SL=50，de-risk 优先
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "SMALL", "last": 85.0},  # -15%
+        ])
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor._poll()
+        pos = tracker.get_position("SMALL")
+        assert pos is None
+        closed = tracker.get_recent_closed(1)
+        assert len(closed) == 1
+        assert closed[0].reason == "DE_RISK_1"
+        assert closed[0].quantity == pytest.approx(0.3)
+
+    def test_de_risk_partial_exit_when_notional_sufficient(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """名义价值足够时正常部分减持."""
+        # 大仓位: qty=10, price=93, 15% 减持 = 1.5 * 93 = $139.5 >= $20
+        tracker.open_position("BIG", "LONG", 100.0, 10.0, 50.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "BIG", "last": 93.0},  # -7% → de-risk L1
+        ])
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor._poll()
+        pos = tracker.get_position("BIG")
+        assert pos is not None
+        assert pos.quantity == pytest.approx(8.5)  # 15% 减持
+        assert pos.de_risk_level == 1
 
 
 # ---------------------------------------------------------------------------
