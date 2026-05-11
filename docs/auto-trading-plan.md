@@ -38,252 +38,266 @@
 
 ## 完整交易流程图
 
-```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║              SCHEDULER.run_once() 职责范围 — 纯代码，无 LLM                    ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 0: BTC 联动前置检查                                                     │
-│                                                                             │
-│  调用: btc_conduction.check_btc_conduction(kline_4h)                        │
-│        btc_conduction.check_btc_1h_trend(kline_1h)                          │
-│  数据: RealExchange.get_kline("BTCUSDT", "4h", 60)                          │
-│        RealExchange.get_kline("BTCUSDT", "1h", 50)                          │
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  EMA12 < EMA26 < EMA50  且  24h 跌幅 > 3%?                           │   │
-│  │    YES → LOCK_LONG (禁止所有做多) → 跳过本轮                          │   │
-│  │                                                                       │   │
-│  │  EMA12 > EMA26 > EMA50  且  24h 涨幅 > 3%?                           │   │
-│  │    YES → LOCK_SHORT (禁止所有做空) → 跳过本轮                         │   │
-│  │                                                                       │   │
-│  │  1h 短期趋势检查:                                                     │   │
-│  │    EMA12 < EMA26 → WEAKNESS → 跳过山寨币做多                         │   │
-│  │    EMA12 > EMA26 且 RSI(14) > 70 → STRENGTH → 跳过山寨币做空         │   │
-│  │                                                                       │   │
-│  │  CONDUCTION_OK → 继续                                                 │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │ (CONDUCTION_OK)
-                                      ▼
-╔══════════════════════════════════════════════════════════════════════════════╗
-║              PHASE 1: MarketScanner 纯代码扫描 (<1s, 无LLM)                    ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 1a: 获取币安 Top 20 交易对                                              │
-│                                                                             │
-│  调用: RealExchange.get_ticker() × 20                                       │
-│  数据: symbol, price, volume_24h, change_24h                                │
-│  过滤: 24h 交易量 < 100万 USDT → 跳过                                       │
-│  过滤: 稳定币 (USDC, FDUSD, USD1 等 13 种) → 跳过                            │
-│  注: 合约币种过滤在 _real_exchange.py exchange 层 _valid_symbols 预过滤，不是    │
-│       MarketScanner 的职责                                                      │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 1b: 获取 K 线数据 (每币种顺序处理)                                        │
-│                                                                             │
-│  调用: RealExchange.get_kline(symbol, "1h", 200) → 1h K线 (EMA200 需 ≥200)  │
-│        RealExchange.get_kline(symbol, "15m", 20) → 15m K线                   │
-│                                                                             │
-│  计算 7 个指标 (无需额外 API 调用):                                           │
-│  ┌──────────────┬──────────────────┬────────────────────────────────────┐   │
-│  │ 指标          │ 来源             │ 用途                                │   │
-│  ├──────────────┼──────────────────┼────────────────────────────────────┤   │
-│  │ 当前价格      │ ticker           │ 基准价                              │   │
-│  │ 24h 涨跌幅    │ ticker           │ 短期动量                             │   │
-│  │ RSI(14,1h)   │ 1h K线计算        │ 主周期超买超卖                        │   │
-│  │ RSI(14,15m)  │ 15m K线计算       │ 跨周期确认                            │   │
-│  │ 价格vsEMA200 │ 1h K线计算        │ 大趋势方向                            │   │
-│  │ 成交量比      │ 1h K线计算        │ 放量/缩量 = 量能异动                   │   │
-│  │ BB%          │ 1h K线(20,2)      │ (price-low)/(up-low) 超买超卖验证     │   │
-│  └──────────────┴──────────────────┴────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 1c: 双向评分  +  排名筛选 (max 10分)                                     │
-│                                                                             │
-│  LONG_Score (10分制)                    SHORT_Score (10分制)                 │
-│  ┌──────────────────────────┐         ┌──────────────────────────┐         │
-│  │ RSI(1h) < 30       +2   │         │ RSI(1h) > 70       +2   │         │
-│  │ RSI(1h) 30-40      +1   │         │ RSI(1h) 60-70      +1   │         │
-│  │ RSI(15m) < 30      +1   │         │ RSI(15m) > 70      +1   │         │
-│  │ RSI(15m) < RSI(1h) +1   │         │ RSI(15m) > RSI(1h) +1   │         │
-│  │ 24h 跌 > 5%        +1   │         │ 24h 涨 > 5%        +1   │         │
-│  │ 24h 跌 > 10%       +2   │         │ 24h 涨 > 10%       +2   │         │
-│  │ BB% < 0.2          +1   │         │ BB% > 0.8          +1   │         │
-│  │ 近8h低位区         +1   │         │ 近8h高位区         +1   │         │
-│  │ price > EMA200     +1   │         │ price < EMA200     +1   │         │
-│  │ 放量下跌           +1   │         │ 放量上涨           +1   │         │
-│  │ K线看涨形态        +1  │         │ K线看跌形态        +1   │         │
-│  └──────────────────────────┘         └──────────────────────────┘         │
-│                                                                             │
-│  排名: Signal = max(LONG_Score, SHORT_Score)                                │
-│        Score < 3 → 过滤                                                     │
-│        Score 3-4 → watchlist (记录但不分析)                                  │
-│        Score ≥ 5 → 进入 Phase 2 评估                                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-                              ┌───────┴───────┐
-                              │  分级决策       │
-                              └───────┬───────┘
-                    ┌─────────────────┼──────────────────┐
-                    ▼                 ▼                  ▼
-              Score ≥ 7          Score = 6          Score ≤ 5
-           (fast_track)         (enhanced)         ┌────┴────┐
-               │                    │               │         │
-               ▼                    ▼            Score=5   Score<5
-          Phase 2 (必做)       Phase 2 (必做)       │       watchlist
-          2 个 LLM dim         5 个 LLM dim         │     不生成请求
-          (技术+合约)          (技术+链上+          ▼       记录到报告
-                               合约+情绪+相关)  跳过 Phase 2
-                                               直接走 Gate
+### 系统架构总览
 
-═══════════════════════════════════════════════
- 主循环 (run_live_trading.py): 全链路执行
-═══════════════════════════════════════════════
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 0: 日亏损检查 + Scheduler.run_once()                                    │
-│                                                                             │
-│  DailyRiskTracker:                                                          │
-│  │ 当日已实现亏损 ≥ 账户余额 10% → 熔断 4 小时                              │
-│  │ 新自然日自动重置                                                         │
-│  │ 仅统计已平仓记录，不受浮动盈亏影响                                         │
-│  │                                                                          │
-│  │ 未熔断 → scheduler.run_once(top_n)                                      │
-│  │ 熔断 → 返回空报告，跳过本轮                                               │
-│  └                                                                          │
-│                                                                             │
-│  scheduler.run_once() 内部:                                                 │
-│    ├─ BTC 传导 + 1h 趋势检查                                                │
-│    ├─ Phase 1 扫描 (MarketScanner)                                          │
-│    └─ 分级决策 → Phase2Requests                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 余额同步                                                                    │
-│                                                                             │
-│  RealExchange.get_account_balance() → PositionTracker.account_balance       │
-│  RealExchange.get_available_balance() → _available_usdt                     │
-└─────────────────────────────────────────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 2: 对每个 Phase2Request 执行自动交易链路                                │
-│                                                                             │
-│  2a. 仓位上限检查 + cooling 检查                                            │
-│  2b. BTC 1h 趋势反方向过滤                                                  │
-│  2c. Phase 2 LLM 分析 (Phase2Analyzer.analyze())                           │
-│      → JSON verdict → consensus PASS/NEUTRAL/FAIL                           │
-│      (Score < 6 跳过 Phase 2 直接走 Gate, 节省 LLM 费用)                    │
-│      PASS → 继续                                                            │
-│      FAIL → 跳过该信号                                                       │
-│      NEUTRAL + fast_track → PASS (高分信号, LLM 保守不拦截)                  │
-│      NEUTRAL + enhanced → 降级 WATCH_ONLY (保守处理)                        │
-│      LLM 异常 → 降级 WATCH_ONLY                                             │
-│  2d. ATR 止损计算 (calculate_atr_stop)                                     │
-│      动态 R:R: Score≥8→4:1, ≥7→3:1, ≥6→2.5:1                              │
-│  2e. Execution Gate (5 项校验)                                              │
-│      Pass → 开仓 / Fail → WATCH_ONLY / REJECT → 跳过                       │
-│  2f. 下单: set_leverage → set_margin_mode → create_market_order            │
-│      动态杠杆: Score≥7→max, Score 5-6→max//2                               │
-│      超时未成交 (2s) → 自动取消                                             │
-│  2g. PositionTracker.open_position() 记录                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-                  │  ───────────────────────────────────────────────────
-                  │                                                    │
-                  ▼                                                    ▼
-╔═════════════════════════════════════════════════════════════════╗
-║          TP/SL MONITOR 守护进程 (后台独立线程)                   ║
-╚═════════════════════════════════════════════════════════════════╝
-      (每 5 秒轮询，与主循环并行运行)                                    
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  FOR EACH 活跃持仓 (按顺序执行 5 步联检):                                     │
-│                                                                             │
-│  1. DCA 阶梯加仓 (亏损 ≥ 5% 时)                                              │
-│     ┌──────────────────────────────────────────────────────────────────┐    │
-│     │ 亏损计算参照 first_entry_cost (不变参照系, DCA 后不漂移)           │    │
-│     │ 条件: DCA 已启用 + 未达最大 DCA 次数 + 亏损 ≥ trigger_loss_pct    │    │
-│     │       + 账户累计亏损 ≤ max_account_loss_pct                       │    │
-│     │       + 加仓后总敞口 ≤ max_exposure_pct                           │    │
-│     │ 执行: dca_multiplier × 基础开仓量 × (max_leverage // 2)          │    │
-│     │       Binance $20 最小名义价值检查                                 │    │
-│     │       update: adjust_position(new_qty, new_price)                 │    │
-│     └──────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-│  2. Trailing Stop (浮盈 ≥ 3% 激活)                                          │
-│     ┌──────────────────────────────────────────────────────────────────┐    │
-│     │ 激活: PnL% ≥ trailing_activation_pct (3%)                         │    │
-│     │ LONG: trail_sl = peak_price × (1 - trail_distance_pct/100)       │    │
-│     │ SHORT: trail_sl = peak_price × (1 + trail_distance_pct/100)      │    │
-│     │ 单向移动 (向有利方向, 永不回退) 持久化到 JSON                        │    │
-│     └──────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-│  3. 止盈 TP (时间衰减 或 固定止盈)                                           │
-│     ┌──────────────────────────────────────────────────────────────────┐    │
-│     │ 无固定 TP 时按持仓时间衰减:                                          │    │
-│     │   < 30 min → +5%  30-60 min → +3%                                │    │
-│     │   60-120 min → +1%  > 120 min → +0.1% (保本)                     │    │
-│     │ 有固定 TP 时优先使用固定值                                          │    │
-│     │ 市价平仓 (reduce_only) + 3x 重试 + dust 处理                      │    │
-│     └──────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-│  4. DeRisk 分级减仓 (NFI 风格, 参照 first_entry_cost)                        │
-│     ┌──────────────────────────────────────────────────────────────────┐    │
-│     │ Level 1 (≥ 5%): 卖出 15%          Level 2 (≥ 8%): 卖出 30%      │    │
-│     │ Level 3 (≥ 12%): 卖出 50%         Doom (≥ 18%): 全平            │    │
-│     │ 防重复: level 只升不降                                              │    │
-│     │ 低于 $20 名义价值跳过 (>20 才能下单)                                │    │
-│     └──────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-│  5. 硬止损 SL (最后防线)                                                    │
-│     ┌──────────────────────────────────────────────────────────────────┐    │
-│     │ 使用 effective_sl = max(trailing_sl, fixed_sl)  (LONG)            │    │
-│     │ 市价平仓 (reduce_only) + 3x 重试 + dust 处理 + on_error 回调      │    │
-│     └──────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-│  每轮末尾: 持久化 trailing_stops + peak_prices 到 JSON                       │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph MAIN["主循环 (每 interval min)"]
+        direction TB
+        DR[DailyRiskTracker] --> RUN_ONCE[Scheduler.run_once]
+        RUN_ONCE --> BAL[余额同步]
+        BAL --> STEP2[STEP 2: 逐个处理信号]
+        STEP2 --> EXTREME["极端指标监控 (每3轮)"]
+        EXTREME --> REPORT["绩效报告 (每10轮)"]
+        REPORT --> WAIT["等待到下一周期"] -.-> DR
+    end
 
-                      主循环继续 ↓
-                  ┌──────────────────────────┐
-                  │ 极端指标监控 (每 3 轮)      │
-                  │ RSI < 20 或 > 80 告警      │
-                  └──────────────────────────┘
-                  │
-                  ▼
-                  ┌──────────────────────────┐
-                  │ 绩效报告 (每 10 轮)        │
-                  │ 交易数/胜率/获利因子/      │
-                  │ 夏普/回撤/分档统计          │
-                  │                          │
-                  │ 交易数: 25  胜率: 72%      │
-                  │ 获利因子: 1.8  夏普: 0.65  │
-                  │ 最大回撤: 12%  总收益:+35% │
-                  │ 按评分分档:                │
-                  │   high(7-10): 10笔 80%     │
-                  │   medium(5-6): 8笔 62%     │
-                  │   low(0-4): 2笔 50%        │
-                  └──────────────────────────┘
-                  │
-                  ▼
-           等待到下一周期 ──────→ ↺
-        (interval - elapsed)
+    subgraph DAEMON["TPSL Monitor (独立 daemon 线程)"]
+        direction TB
+        POLL["批量获取持仓价格 (每5s)"] --> CHECK["每持仓 5步联检"]
+        CHECK --> PERSIST["持久化 trailing 状态"]
+        PERSIST --> POLL
+    end
+
+    MAIN -->|开仓记录| PT[(PositionTracker)]
+    PT -->|持仓数据| DAEMON
+    MAIN -.->|并行运行| DAEMON
 ```
-                  │
-                  ▼
-           等待到下一周期 ──────→ ↺
-        (interval - elapsed)
+
+### SCHEDULER.run_once() 流程 — 纯代码，无 LLM
+
+```mermaid
+flowchart TD
+    START(["每轮开始"]) --> BTC[get_kline BTCUSDT 4h/1h]
+    BTC --> COND{传导状态?}
+
+    COND -->|EMA12<EMA26<EMA50<br>且 24h 跌>3%| LOCK_LONG[LOCK_LONG<br>禁止做多, 跳过本轮]
+    COND -->|EMA12>EMA26>EMA50<br>且 24h 涨>3%| LOCK_SHORT[LOCK_SHORT<br>禁止做空, 跳过本轮]
+    COND -->|CONDUCTION_OK| TREND{1h 趋势?}
+
+    TREND -->|EMA12<EMA26| WEAK[WEAKNESS<br>后续跳过山寨币做多]
+    TREND -->|EMA12>EMA26 且 RSI>70| STRONG[STRENGTH<br>后续跳过山寨币做空]
+    TREND -->|其他| NEUTRAL[NEUTRAL<br>无额外限制]
+
+    WEAK --> SCAN
+    STRONG --> SCAN
+    NEUTRAL --> SCAN
+
+    subgraph PHASE1["Phase 1 扫描 (MarketScanner)"]
+        SCAN["MarketScanner.scan(top_n=20)"] --> TICKER["STEP 1a: 获取 Top20 ticker<br>过滤: 交易量<1M USDT<br>过滤: 13种稳定币"]
+        TICKER --> KLINE["STEP 1b: 获取K线(每币种顺序)<br>1h x 200 + 15m x 20"]
+        KLINE --> INDICATORS["计算 7 个指标<br>价格/24h涨跌/RSI(1h/15m)/<br>EMA200/BB%/成交量比"]
+        INDICATORS --> SCORE["STEP 1c: 双向评分<br>LONG_Score vs SHORT_Score<br>满分各 10 分"]
+    end
+
+    SCORE --> RANK{"Signal = max(L,S)"}
+    RANK -->|Score < 3| FILTER[过滤丢弃]
+    RANK -->|Score 3-4| WATCH[watchlist: 记录不分析]
+    RANK -->|Score ≥ 5| TIER{分级决策}
+
+    TIER -->|Score ≥ 7| FAST[fast_track<br>Phase 2 必做<br>2 LLM dims: 技术+合约]
+    TIER -->|Score = 6| ENHANCED[enhanced<br>Phase 2 必做<br>5 LLM dims: 技术+链上+合约+情绪+相关]
+    TIER -->|Score = 5| NOLLM[直接走 Gate<br>无 LLM 分析]
+    TIER -->|Score < 5| END[watchlist: 不生成请求]
+```
+
+### Phase 1 — 7 个指标
+
+| 指标 | 来源 | 用途 |
+|------|------|------|
+| 当前价格 | ticker | 基准价 |
+| 24h 涨跌幅 | ticker | 短期动量 |
+| RSI(14, 1h) | 1h K线计算 | 主周期超买超卖 |
+| RSI(14, 15m) | 15m K线计算 | 跨周期确认 |
+| 价格 vs EMA200 | 1h K线计算 | 大趋势方向 |
+| 成交量比 | 1h K线计算 | 放量/缩量 = 量能异动 |
+| BB% | 1h K线(20,2) | (price-low)/(up-low) 超买超卖验证 |
+
+### Phase 1 — 双向评分 (满分 10 分)
+
+| LONG 条件 | +分 | SHORT 条件 | +分 |
+|-----------|-----|-----------|-----|
+| RSI(1h) < 30 | +2 | RSI(1h) > 70 | +2 |
+| RSI(1h) 30-40 | +1 | RSI(1h) 60-70 | +1 |
+| RSI(15m) < 30 | +1 | RSI(15m) > 70 | +1 |
+| RSI(15m) < RSI(1h) | +1 | RSI(15m) > RSI(1h) | +1 |
+| 24h 跌 > 5% | +1 | 24h 涨 > 5% | +1 |
+| 24h 跌 > 10% | +2 | 24h 涨 > 10% | +2 |
+| BB% < 0.2 | +1 | BB% > 0.8 | +1 |
+| 近8h 低位区 | +1 | 近8h 高位区 | +1 |
+| price > EMA200 | +1 | price < EMA200 | +1 |
+| 放量下跌 | +1 | 放量上涨 | +1 |
+| K线看涨形态 | +1 | K线看跌形态 | +1 |
+
+**趋势过滤清零**: LONG 时若 price < EMA200 且 RSI(1h) > 40 → score = 0（下降趋势中非超卖不做多）。SHORT 时若 price > EMA200 且 RSI(1h) < 60 → score = 0（上升趋势中非超买不做空）。
+
+### STEP 2 — 自动交易链路 (每信号顺序处理)
+
+```mermaid
+flowchart TD
+    %% Styles
+    classDef proc fill:#e3f2fd,stroke:#1565c0,color:#000
+    classDef dec fill:#fff3e0,stroke:#e65100,color:#000
+    classDef skip fill:#ffebee,stroke:#c62828,color:#c62828
+    classDef ok fill:#e8f5e9,stroke:#2e7d32,color:#2e7d32
+    classDef watch fill:#fff8e1,stroke:#f57f17,color:#f57f17
+
+    START(["Phase2Request 进入 STEP 2"]):::proc
+
+    %% 2a
+    subgraph A["2a. 仓位 + 冷却检查"]
+        A1{"can_open_new(symbol)?"}:::dec
+        A2{"in_cooldown(symbol, dir)?"}:::dec
+    end
+    START --> A1
+    A1 -->|No| S1["SKIP: 仓位已达上限"]:::skip
+    A1 -->|Yes| A2
+    A2 -->|Yes| S2["SKIP: 冷却中 (30min)"]:::skip
+    A2 -->|No| B1
+
+    %% 2ab
+    B1{"BTC 1h 反方向?"}:::dec
+    B1 -->|WEAKNESS + LONG| S3["SKIP: 弱势不做多"]:::skip
+    B1 -->|STRENGTH + SHORT| S4["SKIP: 强势不做空"]:::skip
+    B1 -->|NEUTRAL/无| C1
+
+    %% 2b
+    C1["获取 ticker + orderbook"]:::proc
+    C1 -->|无效价格| S5["SKIP: 无效入场价"]:::skip
+    C1 -->|有效| D1
+
+    %% 2c
+    D1{"score < 6?"}:::dec
+    D1 -->|Yes| D2["watch_only=False<br>跳过 Phase 2"]:::ok
+    D1 -->|No| D3["Phase2Analyzer.analyze()"]:::proc
+    D3 --> D4{"consensus?"}:::dec
+    D4 -->|PASS| D5["watch_only=False"]:::ok
+    D4 -->|NEUTRAL| D6{"tier?"}:::dec
+    D4 -->|FAIL| S6["SKIP: LLM 不通过"]:::skip
+    D4 -->|ERROR| D7["watch_only=True<br>LLM 异常, 降级"]:::watch
+    D6 -->|fast_track| D8["watch_only=False<br>高分信号放过"]:::ok
+    D6 -->|enhanced| D9["watch_only=True<br>NEUTRAL 降级"]:::watch
+
+    D2 & D5 & D8 & D7 & D9 --> E1
+
+    %% 2d
+    E1["ATR 止损计算 + 动态 R:R"]:::proc
+    E1 -->|ATR 失败| S7["SKIP: 止损计算失败"]:::skip
+    E1 -->|成功| E2["动态 R:R<br>Score≥8→4:1, ≥7→3:1, ≥6→2.5:1"]:::proc
+    E2 --> E3["获取资金费率"]:::proc
+
+    %% 2e
+    E3 --> F1["计算下单量"]:::proc
+    F1 -->|Score≥7→max_lev, 5-6→max//2| F2["position_margin = balance × size<br>order_notional = margin × lev"]:::proc
+
+    %% 2f
+    subgraph GATE["2f. Execution Gate (5项)"]
+        direction TB
+        G1["① liquidity<br>24h vol ≥ min_liquidity?"]:::proc
+        G2["② funding_rate<br>HARD BLOCK"]:::dec
+        G3["③ orderbook_impact<br>VWAP ≤ max_pct?"]:::proc
+        G4["④ risk_reward<br>R:R ≥ min?"]:::proc
+        G5["⑤ position_cap<br>敞口 ≤ max?"]:::proc
+        G6["Gate 裁决"]:::dec
+        G1 --> G2 --> G3 --> G4 --> G5 --> G6
+    end
+
+    F2 --> G1
+    G6 -->|funding_rate 失败| GS1["REJECT: 硬拦"]:::skip
+    G6 -->|≥ 2项 失败| GS2["REJECT"]:::skip
+    G6 -->|1项 失败| GS3["WATCH_ONLY"]:::watch
+    G6 -->|全部通过| GS4["PASS"]:::ok
+
+    %% Phase 2 override
+    GS4 --> H1{"watch_only_flag<br>且 Gate=PASS?"}:::dec
+    H1 -->|True| H2["强制 WATCH_ONLY"]:::watch
+    H1 -->|False| I1
+
+    %% 2g-OPEN
+    I1{"notional < $20?"}:::dec
+    I1 -->|Yes| S8["SKIP: 低于最小名义价值"]:::skip
+    I1 -->|No| I2{"--dry-run?"}:::dec
+    I2 -->|Yes| I3["打印模拟信息, 不开仓"]:::watch
+    I2 -->|No| I4["can_open_new(notional) 风控复查"]:::dec
+    I4 -->|不通过| S9["SKIP: 风控拦截"]:::skip
+    I4 -->|通过| I5["round(notional/price, 6)"]:::proc
+    I5 --> I6{"qty < min_qty?"}:::dec
+    I6 -->|Yes| S10["SKIP: 小于最小交易量"]:::skip
+    I6 -->|No| I7["set_leverage()"]:::proc
+    I7 --> I8["set_margin_mode(ISOLATED)"]:::proc
+    I8 --> I9["create_market_order()"]:::proc
+    I9 --> I10{"订单状态?"}:::dec
+    I10 -->|已成交| I11["open_position() 记录"]:::ok
+    I10 -->|NEW/PARTIAL| I12["sleep 2s"]:::proc
+    I12 --> I13{"仍 NEW?"}:::dec
+    I13 -->|Yes| I14["cancel_order()"]:::proc
+    I13 -->|No| I11
+    I14 --> S11["SKIP: 超时未成交"]:::skip
+```
+
+### TPSL Monitor 守护进程 (独立 daemon 线程)
+
+```mermaid
+flowchart TD
+    classDef proc fill:#e3f2fd,stroke:#1565c0,color:#000
+    classDef dec fill:#fff3e0,stroke:#e65100,color:#000
+    classDef action fill:#f3e5f5,stroke:#6a1b9a,color:#000
+    classDef close fill:#ffebee,stroke:#c62828,color:#c62828
+
+    LOOP(["每 5s 轮询"]) --> PRICE["批量获取所有持仓价格"]:::proc
+    PRICE --> FOR["FOR EACH 活跃持仓"]:::dec
+
+    FOR --> DCA["1. DCA 阶梯加仓"]:::dec
+    DCA -->|亏损≥5% 且条件满足| DCA_EXEC["阶梯加仓<br>1.25x/1.5x/1.75x 杠杆减半"]:::action
+    DCA -->|不触发| TRAIL
+
+    DCA_EXEC --> TRAIL
+    TRAIL["2. Trailing Stop"]:::dec
+    TRAIL -->|浮盈≥3%| TRAIL_EXEC["更新 trailing_sl<br>单向移动, 永不回退"]:::action
+    TRAIL -->|不触发| TP
+
+    TRAIL_EXEC --> TP
+    TP["3. 止盈 TP"]:::dec
+    TP -->|价格达标| TP_EXEC["市价平仓 (reduce_only)<br>3x 重试, dust 处理"]:::close
+    TP -->|不触发| DERISK
+
+    TP_EXEC --> NEXT
+    DERISK["4. DeRisk 分级减仓"]:::dec
+    DERISK -->|≥5% 卖15%, ≥8% 卖30%<br>≥12% 卖50%, ≥18% 全平| DERISK_EXEC["部分平仓<br>level 只升不降"]:::close
+    DERISK -->|不触发| SL
+
+    DERISK_EXEC --> NEXT
+    SL["5. 硬止损 SL"]:::dec
+    SL -->|价格触及| SL_EXEC["市价平仓 (reduce_only)<br>effective_sl=trailing vs fixed 取优"]:::close
+    SL -->|不触发| NEXT
+
+    SL_EXEC --> NEXT
+    NEXT["下一持仓"]:::dec -->|还有持仓| FOR
+    NEXT -->|全部检查完| PERSIST["持久化 trailing_stops + peak_prices"]:::proc
+    PERSIST --> LOOP
+```
+
+### 主循环末尾 (每轮)
+
+```mermaid
+flowchart TD
+    classDef proc fill:#e3f2fd,stroke:#1565c0,color:#000
+    classDef watch fill:#fff8e1,stroke:#f57f17,color:#f57f17
+
+    TPSL_DONE["STEP 2 完成 (所有信号处理完毕)"]:::proc
+
+    TPSL_DONE --> EXTREME{"cycle_count % 3 == 0?"}:::dec
+    EXTREME -->|Yes| EXTREME_LOG["扫描 RSI 极端值<br>RSI < 20 或 RSI > 80 告警"]:::watch
+    EXTREME -->|No| PERF
+
+    EXTREME_LOG --> PERF
+    PERF{"cycle_count % 10 == 0?"}:::dec
+    PERF -->|Yes| PERF_LOG["输出绩效报告<br>交易数/胜率/获利因子/夏普/回撤/分档统计"]:::proc
+    PERF -->|No| WAIT
+
+    PERF_LOG --> WAIT
+    WAIT["等待到下一周期<br>(interval - elapsed)"]:::proc
+    WAIT -.->|下一轮| LOOP_AGAIN(["每日重置 → 重回 BTC 传导检查"]):::proc
 ```
 
 ### 核心模块调用清单
