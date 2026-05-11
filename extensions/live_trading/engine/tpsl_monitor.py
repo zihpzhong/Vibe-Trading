@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 from .exchange import ExchangeBase
 from .position_tracker import Position, PositionTracker
+from extensions.live_trading.config import DCAConfig, DeRiskConfig
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,10 @@ class TPSLMonitor(Thread):
         on_take_profit: Optional[Callable[[Position], None]] = None,
         on_stop_loss: Optional[Callable[[Position], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
+        de_risk_config: Optional[DeRiskConfig] = None,
+        dca_config: Optional[DCAConfig] = None,
+        max_leverage: int = 5,
+        position_size_pct: float = 0.05,
     ) -> None:
         super().__init__(daemon=True, name="TPSLMonitor")
         self._exchange = exchange
@@ -57,10 +62,21 @@ class TPSLMonitor(Thread):
         self._on_stop_loss = on_stop_loss
         self._on_error = on_error
         self._stop_event = Event()
+        self._dca_config = dca_config
+        self._max_leverage = max_leverage
+        self._position_size_pct = position_size_pct
         # Track trailing stop levels per position (symbol → adjusted_stop_loss)
         self._trailing_stops: dict[str, float] = {}
         # Track peak prices for trailing stop calculation
         self._peak_prices: dict[str, float] = {}
+        # De-risk config
+        dr = de_risk_config or DeRiskConfig()
+        self._de_risk_levels = [
+            (dr.level1_loss_pct, dr.level1_sell_fraction),  # 0 → level 1
+            (dr.level2_loss_pct, dr.level2_sell_fraction),  # 1 → level 2
+            (dr.level3_loss_pct, dr.level3_sell_fraction),  # 2 → level 3
+        ]
+        self._doom_loss_pct = dr.doom_loss_pct
 
         # 从持久化状态恢复 trailing stop
         if hasattr(self._positions, "get_trailing_state"):
@@ -125,18 +141,16 @@ class TPSLMonitor(Thread):
             if current_price <= 0:
                 continue
 
-            self._update_trailing_stop(pos, current_price)
+            self._check_dca(pos, current_price)                       # 1. DCA when losing
+            self._update_trailing_stop(pos, current_price)            # 2. Trailing stop
             effective_sl = self._trailing_stops.get(pos.symbol, pos.stop_loss)
 
-            if self._check_take_profit(pos, current_price):
+            if self._check_take_profit(pos, current_price):           # 3. TP
                 self._execute_tp(pos, current_price)
-            elif self._check_stop_loss(pos, current_price, effective_sl):
+            elif self._check_de_risk(pos, current_price):             # 4. De-risk partial exit
+                pass
+            elif self._check_stop_loss(pos, current_price, effective_sl):  # 5. SL final guard
                 self._execute_sl(pos, current_price, effective_sl)
-
-    # ------------------------------------------------------------------
-    # Threshold checking
-    # ------------------------------------------------------------------
-
 
         # 持久化 trailing stop 状态
         if hasattr(self._positions, "set_trailing_state"):
@@ -144,6 +158,11 @@ class TPSLMonitor(Thread):
                 self._positions.set_trailing_state(self._trailing_stops, self._peak_prices)
             except Exception as exc:
                 logger.debug("Failed to persist trailing state: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Threshold checking
+    # ------------------------------------------------------------------
+
     def _check_take_profit(self, pos: Position, price: float) -> bool:
         """Check if TP level is reached — time-decaying minimal_roi style.
 
@@ -183,6 +202,274 @@ class TPSLMonitor(Thread):
         if pos.direction == "LONG":
             return price <= effective_sl
         return price >= effective_sl
+
+    # ------------------------------------------------------------------
+    # DCA (阶梯加仓)
+    # ------------------------------------------------------------------
+
+    def _check_dca(self, pos: Position, current_price: float) -> bool:
+        """Check and execute DCA if conditions are met.
+
+        DCA trigger threshold references ``first_entry_cost`` (not average
+        entry_price), consistent with de-risk, so triggers do not drift
+        after previous DCA adds.
+
+        Returns:
+            True if a DCA order was executed, False otherwise.
+        """
+        cfg = self._dca_config
+        if cfg is None or not cfg.enabled:
+            return False
+        if pos.dca_count >= cfg.max_dca_count:
+            return False
+
+        # 亏损计算（参照 first_entry_cost）
+        if pos.direction == "LONG":
+            loss_pct = (current_price - pos.first_entry_cost) / pos.first_entry_cost
+        else:
+            loss_pct = (pos.first_entry_cost - current_price) / pos.first_entry_cost
+        if loss_pct >= 0:
+            return False
+
+        abs_loss_pct = abs(loss_pct) * 100
+        if abs_loss_pct < cfg.trigger_loss_pct:
+            return False
+
+        # 账户级累计亏损检查
+        if pos.direction == "LONG":
+            total_unrealized = (current_price - pos.entry_price) * pos.quantity
+        else:
+            total_unrealized = (pos.entry_price - current_price) * pos.quantity
+        loss_pct_of_account = abs(total_unrealized) / self._positions.account_balance
+        if loss_pct_of_account > cfg.max_account_loss_pct / 100:
+            logger.warning(
+                "DCA SKIP %s: cumulative loss %.2f USDT (%.1f%% account) > %.0f%%",
+                pos.symbol, total_unrealized, loss_pct_of_account * 100, cfg.max_account_loss_pct,
+            )
+            return False
+
+        # 暴露率检查
+        current_exposure = self._positions.get_exposure()
+        dca_mult = cfg.dca_multipliers[min(pos.dca_count, len(cfg.dca_multipliers) - 1)]
+        max_exposure = self._positions.max_exposure_pct
+        dca_lev = max(1, self._max_leverage // 2) if cfg.dca_leverage_halved else self._max_leverage
+        dca_notional = (self._positions.account_balance * self._position_size_pct) * dca_mult * dca_lev
+        post_dca_exposure = current_exposure + (dca_notional / self._positions.account_balance)
+        if post_dca_exposure > max_exposure:
+            logger.warning(
+                "DCA SKIP %s: post-DCA exposure %.1f%% > %.0f%% cap",
+                pos.symbol, post_dca_exposure * 100, max_exposure * 100,
+            )
+            return False
+
+        # 单次不超账户 50%
+        if dca_notional > self._positions.account_balance * 0.5:
+            return False
+
+        dca_qty = dca_notional / current_price
+        if dca_qty <= 0:
+            return False
+
+        # Binance $20 最小名义价值
+        if dca_notional < cfg.dca_min_notional_usdt:
+            logger.warning(
+                "DCA SKIP %s: notional $%.2f < $%.0f min",
+                pos.symbol, dca_notional, cfg.dca_min_notional_usdt,
+            )
+            return False
+
+        self._execute_dca(pos, dca_qty, current_price)
+        return True
+
+    def _execute_dca(self, pos: Position, dca_qty: float, price: float) -> None:
+        """Execute a DCA market order and update position."""
+        dca_lev = max(1, self._max_leverage // 2) if self._dca_config.dca_leverage_halved else self._max_leverage
+        logger.info(
+            "DCA %s %s +%.4f @ %.4f (loss %.1f%%)",
+            pos.symbol, pos.direction, dca_qty, price,
+            (price - pos.first_entry_cost) / pos.first_entry_cost * 100,
+        )
+        try:
+            if hasattr(self._exchange, "set_leverage"):
+                self._exchange.set_leverage(pos.symbol, leverage=dca_lev)
+            order = self._exchange.create_market_order(pos.symbol, pos.direction.lower(), dca_qty)
+            logger.info("DCA order filled: %s", order)
+            self._positions.adjust_position(pos.symbol, dca_qty, price)
+        except Exception as exc:
+            logger.warning("DCA execution failed for %s: %s", pos.symbol, exc)
+
+    # ------------------------------------------------------------------
+    # De-risk (NFI 风格分级减仓)
+    # ------------------------------------------------------------------
+
+    def _check_de_risk(self, pos: Position, current_price: float) -> bool:
+        """Check and execute de-risk levels.
+
+        De-risk thresholds are always referenced to ``first_entry_cost``
+        (not average entry_price), making them invariant across DCA events.
+
+        Returns:
+            True if a de-risk partial exit or doom was actually executed.
+            False if no action was taken (e.g. position in profit, or partial
+            exit below Binance $20 minimum notional).
+        """
+        first_cost = pos.first_entry_cost
+        if first_cost <= 0:
+            return False
+
+        # 计算亏损百分比（相对于首次入场成本）
+        if pos.direction == "LONG":
+            loss_pct = (current_price - first_cost) / first_cost * 100
+        else:
+            loss_pct = (first_cost - current_price) / first_cost * 100
+
+        # 盈利时不触发 de-risk
+        if loss_pct >= 0:
+            return False
+
+        abs_loss = abs(loss_pct)
+
+        # 从当前 de_risk_level 开始检查后续级别（不重复触发已触发的级别）
+        start_idx = max(0, pos.de_risk_level)  # de_risk_level: 0=none, 1=level1...
+        if start_idx > 0 and start_idx <= len(self._de_risk_levels):
+            start_idx = min(start_idx, len(self._de_risk_levels))
+
+        for i in range(start_idx, len(self._de_risk_levels)):
+            threshold_pct, sell_fraction = self._de_risk_levels[i]
+            if abs_loss >= threshold_pct:
+                level_number = i + 1
+                sell_qty = pos.quantity * sell_fraction
+                if self._execute_de_risk(pos, sell_qty, current_price, level_number):
+                    return True
+                # 跳过此级别（如 < $20 最小限额），继续检查下一级
+                continue
+
+        # Doom stop
+        if abs_loss >= self._doom_loss_pct:
+            logger.info(
+                "DOOM triggered for %s: loss=%.1f%% >= %.1f%%, closing all",
+                pos.symbol, abs_loss, self._doom_loss_pct,
+            )
+            side = "sell" if pos.direction == "LONG" else "buy"
+            self._execute_order_with_retry(
+                pos, side, pos.quantity, current_price,
+                reason="DOOM", is_de_risk=True, de_risk_level=4,
+            )
+            return True
+
+        return False
+
+    def _execute_de_risk(self, pos: Position, sell_qty: float, current_price: float, level: int) -> bool:
+        """Execute a de-risk partial sell order.
+
+        Returns:
+            True if the order was actually placed, False if skipped
+            (e.g. below Binance $20 minimum notional).
+        """
+        if sell_qty <= 0:
+            return False
+
+        # Binance 最小名义价值检查
+        notional = sell_qty * current_price
+        if notional < 20:
+            logger.warning(
+                "DE-RISK level %d SKIP for %s: partial exit notional $%.2f < $20 min",
+                level, pos.symbol, notional,
+            )
+            return False
+
+        side = "sell" if pos.direction == "LONG" else "buy"
+        self._execute_order_with_retry(
+            pos, side, sell_qty, current_price,
+            reason=f"DE_RISK_{level}", is_de_risk=True, de_risk_level=level,
+        )
+        return True
+
+    def _execute_order_with_retry(
+        self, pos: Position, side: str, qty: float, price: float,
+        reason: str, is_de_risk: bool = False, de_risk_level: int = 0,
+    ) -> None:
+        """Execute a market order with 3x retry, then update tracker state.
+
+        Args:
+            pos: The position object.
+            side: "buy" or "sell".
+            qty: Quantity to trade.
+            price: Current market price (for tracker update).
+            reason: Close reason ("TP", "SL", "DOOM", "DE_RISK_1", etc.).
+            is_de_risk: If True, call de_risk_partial_exit instead of close.
+            de_risk_level: De-risk level (1-4), only used when is_de_risk=True.
+        """
+        logger.info(
+            "%s for %s %s @ %.4f qty=%.4f",
+            reason, pos.symbol, pos.direction, price, qty,
+        )
+
+        last_err: Optional[Exception] = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                order = self._exchange.create_market_order(pos.symbol, side, qty, reduce_only=True)
+                filled = order.get("filled", 0) or 0
+
+                if is_de_risk and de_risk_level < 4:
+                    # De-risk partial exit
+                    if filled > 0:
+                        self._positions.de_risk_partial_exit(
+                            pos.symbol, de_risk_level, filled, price,
+                        )
+                    if filled < qty:
+                        remaining = qty - filled
+                        if remaining > 0:
+                            min_qty = self._exchange.get_min_qty(pos.symbol)
+                            if min_qty > 0 and remaining < min_qty:
+                                self._positions.de_risk_partial_exit(
+                                    pos.symbol, de_risk_level, remaining, price,
+                                )
+                else:
+                    # Full close (TP, SL, DOOM, partial fill cleanup)
+                    if filled < qty:
+                        remaining = qty - filled
+                        logger.warning(
+                            "%s partial fill for %s: filled=%.4f of %.4f",
+                            reason, pos.symbol, filled, qty,
+                        )
+                        self._positions.reduce_position(pos.symbol, filled or qty, price)
+                        min_qty = self._exchange.get_min_qty(pos.symbol)
+                        if min_qty > 0 and remaining < min_qty:
+                            self._positions.close_position(pos.symbol, exit_price=price, reason=reason)
+                    else:
+                        self._positions.close_position(pos.symbol, exit_price=price, reason=reason)
+
+                self._trailing_stops.pop(pos.symbol, None)
+                self._peak_prices.pop(pos.symbol, None)
+
+                if reason == "TP" and self._on_take_profit:
+                    self._on_take_profit(pos)
+                elif reason in ("SL", "DOOM") and self._on_stop_loss:
+                    self._on_stop_loss(pos)
+                return
+            except Exception as exc:
+                err_msg = str(exc)
+                if "below minimum tradeable" in err_msg or "Quantity less than or equal to zero" in err_msg:
+                    logger.warning(
+                        "%s dust: %s qty=%.6f untradeable, closing in tracker",
+                        reason, pos.symbol, qty,
+                    )
+                    if is_de_risk:
+                        self._positions.de_risk_partial_exit(pos.symbol, de_risk_level, qty, price)
+                    else:
+                        self._positions.close_position(pos.symbol, exit_price=price, reason=reason)
+                    return
+                last_err = exc
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BACKOFF[attempt]
+                    logger.warning("%s retry %d/%d in %.1fs: %s", reason, attempt + 1, MAX_RETRIES, delay, exc)
+                    time.sleep(delay)
+
+        logger.error("%s failed after %d attempts for %s: %s", reason, MAX_RETRIES, pos.symbol, last_err)
+        if self._on_error:
+            assert last_err is not None
+            self._on_error(last_err)
 
     # ------------------------------------------------------------------
     # Trailing stop
@@ -244,7 +531,6 @@ class TPSLMonitor(Thread):
                         pos.symbol, filled, pos.quantity, remaining,
                     )
                     self._positions.reduce_position(pos.symbol, filled or pos.quantity, price)
-                    # If remaining is below exchange minQty, close in tracker (dust)
                     min_qty = self._exchange.get_min_qty(pos.symbol)
                     if min_qty > 0 and remaining < min_qty:
                         self._positions.close_position(pos.symbol, exit_price=price, reason="TP")
@@ -261,7 +547,6 @@ class TPSLMonitor(Thread):
                 return
             except Exception as exc:
                 err_msg = str(exc)
-                # If quantity rounds to zero (below minimum tradeable), close as dust and give up
                 if "below minimum tradeable" in err_msg or "Quantity less than or equal to zero" in err_msg:
                     logger.warning(
                         "TP dust: %s remaining qty=%.6f untradeable, closing in tracker",
@@ -290,8 +575,10 @@ class TPSLMonitor(Thread):
         Binance spot API does not support STOP_LOSS on /api/v3/order.
         """
         side = "sell" if pos.direction == "LONG" else "buy"
-        detail = f"SL triggered: {pos.symbol} {pos.direction} @ {price:.4f} (SL={effective_sl:.4f})"
-        logger.info(detail)
+        logger.info(
+            "SL triggered: %s %s @ %.4f (SL=%.4f)",
+            pos.symbol, pos.direction, price, effective_sl,
+        )
 
         last_err: Optional[Exception] = None
         for attempt in range(MAX_RETRIES):
@@ -305,7 +592,6 @@ class TPSLMonitor(Thread):
                         pos.symbol, filled, pos.quantity, remaining,
                     )
                     self._positions.reduce_position(pos.symbol, filled or pos.quantity, price)
-                    # If remaining is below exchange minQty, close in tracker (dust)
                     min_qty = self._exchange.get_min_qty(pos.symbol)
                     if min_qty > 0 and remaining < min_qty:
                         self._positions.close_position(pos.symbol, exit_price=price, reason="SL")

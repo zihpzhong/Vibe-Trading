@@ -557,8 +557,9 @@ class RealExchange(ExchangeBase):
                         result: dict[str, float] = {}
                         for entry in (resp.json() if isinstance(resp.json(), list) else []):
                             asset = entry.get("asset", "")
-                            # 使用 availableBalance（可用余额）而非 balance（总钱包=可用+持仓保证金）
-                            balance = float(entry.get("availableBalance", 0))
+                            # 使用 wallet balance（总钱包余额=可用+持仓保证金）而非 availableBalance（仅可用余额）
+                            # availableBalance 在有持仓时远低于总余额，导致 exposure 计算虚高和系统死锁
+                            balance = float(entry.get("balance", 0))
                             if balance > 0:
                                 result[asset] = balance
                         return result
@@ -581,6 +582,34 @@ class RealExchange(ExchangeBase):
                 if free > 0:
                     result[entry.get("asset", "")] = free
             return result
+
+    def get_available_balance(self) -> dict[str, float]:
+        """Fetch available (free) balances — not locked by open positions.
+
+        For futures, reads ``availableBalance`` from Binance /fapi/v2/balance.
+        For spot, uses the same logic as get_account_balance() since spot has
+        no margin lock in the same sense.
+        """
+        with self._lock:
+            if not self._has_auth:
+                return {}
+            if self._market_type == "future":
+                try:
+                    resp = self._signed_request(self._fapi_url(), "/fapi/v2/balance")
+                    if resp.ok:
+                        result: dict[str, float] = {}
+                        for entry in (resp.json() if isinstance(resp.json(), list) else []):
+                            asset = entry.get("asset", "")
+                            free = float(entry.get("availableBalance", 0))
+                            if free > 0:
+                                result[asset] = free
+                        return result
+                    logger.warning("Available balance fetch failed (%d): %s", resp.status_code, resp.text[:200])
+                except Exception as exc:
+                    logger.warning("Available balance fetch unavailable: %s", exc)
+                return {}
+            # Spot: same as get_account_balance
+            return self.get_account_balance()
 
     def get_positions(self) -> list[dict[str, Any]]:
         """Fetch current positions. Spot: non-zero balances. Futures: open positions."""
