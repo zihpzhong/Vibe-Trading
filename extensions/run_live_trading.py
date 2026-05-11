@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["default", "conservative", "aggressive"],
                         default="default", help="风控模式")
     parser.add_argument("--position-size", type=float, default=DEFAULT_POSITION_SIZE_PCT,
-                        help=f"单次开仓保证金比例 (默认 {DEFAULT_POSITION_SIZE_PCT:.0%})")
+                        help=f"单次开仓保证金比例 (默认 {DEFAULT_POSITION_SIZE_PCT * 100:.0f}%%)")
     parser.add_argument("--rr", type=float, default=DEFAULT_REWARD_RISK_RATIO,
                         help=f"目标 R:R 止盈比 (默认 {DEFAULT_REWARD_RISK_RATIO}:1)")
     parser.add_argument("--max-leverage", type=int, default=5,
