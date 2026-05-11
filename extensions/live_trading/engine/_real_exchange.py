@@ -94,7 +94,7 @@ class RealExchange(ExchangeBase):
       - BINANCE_API_KEY
       - BINANCE_SECRET
       - BINANCE_TESTNET=true  (optional, defaults to false)
-      - BINANCE_MARKET_TYPE=spot|future  (optional, defaults to spot)
+      - BINANCE_MARKET_TYPE=spot|future  (optional, defaults to future)
 
     Without API keys, market-data methods still work (public endpoints).
     Trading methods raise RuntimeError with a clear message.
@@ -106,7 +106,9 @@ class RealExchange(ExchangeBase):
         testnet = os.environ.get("BINANCE_TESTNET", "").lower() == "true"
         api_key = os.environ.get("BINANCE_API_KEY", "")
         secret = os.environ.get("BINANCE_SECRET", "")
-        market_type = os.environ.get("BINANCE_MARKET_TYPE", "spot").lower()
+        market_type = os.environ.get("BINANCE_MARKET_TYPE", "future").lower()
+        if market_type not in {"spot", "future"}:
+            raise ValueError("BINANCE_MARKET_TYPE must be 'spot' or 'future'")
 
         self._testnet = testnet
         self._has_auth = bool(api_key and secret)
@@ -216,11 +218,9 @@ class RealExchange(ExchangeBase):
 
     @property
     def _data_prefix(self) -> str:
-        """Market data prefix — always api.binance.com/api/v3 (spot).
-
-        Futures market data is read from spot endpoints for volume/price screening.
-        Klines use a separate endpoint (api.binance.com/fapi/v1/klines works).
-        """
+        """Market data prefix for ticker/depth endpoints."""
+        if self._market_type == "future":
+            return f"{self._fapi_url()}/fapi/v1"
         return "https://api.binance.com/api/v3"
 
     @property
@@ -304,8 +304,7 @@ class RealExchange(ExchangeBase):
                 timeout=10,
             ))
             if resp.status_code == 404:
-                logger.warning("Funding rate 404 for %s (no perpetual futures contract), returning 0.0", symbol)
-                return 0.0
+                raise RuntimeError(f"Funding rate unavailable for {symbol} (no perpetual futures contract)")
             resp.raise_for_status()
             raw = resp.json()
             fr = raw.get("lastFundingRate")
