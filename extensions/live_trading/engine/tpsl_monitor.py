@@ -51,6 +51,7 @@ class TPSLMonitor(Thread):
         dca_config: Optional[DCAConfig] = None,
         max_leverage: int = 5,
         position_size_pct: float = 0.05,
+        status_log_interval: float = 60.0,
     ) -> None:
         super().__init__(daemon=True, name="TPSLMonitor")
         self._exchange = exchange
@@ -65,6 +66,8 @@ class TPSLMonitor(Thread):
         self._dca_config = dca_config
         self._max_leverage = max_leverage
         self._position_size_pct = position_size_pct
+        self._status_poll_counter = 0
+        self._status_poll_threshold = max(1, int(status_log_interval / poll_interval))
         # Track trailing stop levels per position (symbol → adjusted_stop_loss)
         self._trailing_stops: dict[str, float] = {}
         # Track peak prices for trailing stop calculation
@@ -152,12 +155,66 @@ class TPSLMonitor(Thread):
             elif self._check_stop_loss(pos, current_price, effective_sl):  # 5. SL final guard
                 self._execute_sl(pos, current_price, effective_sl)
 
+        # 定时持仓状态日志
+        self._status_poll_counter += 1
+        if self._status_poll_counter >= self._status_poll_threshold:
+            self._status_poll_counter = 0
+            self._log_position_status(prices)
+
         # 持久化 trailing stop 状态
         if hasattr(self._positions, "set_trailing_state"):
             try:
                 self._positions.set_trailing_state(self._trailing_stops, self._peak_prices)
             except Exception as exc:
                 logger.debug("Failed to persist trailing state: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Periodic status logging
+    # ------------------------------------------------------------------
+
+    def _log_position_status(self, prices: dict[str, float]) -> None:
+        """Log a concise status of all active positions to stdout.
+
+        Called periodically (default every 60s) to provide real-time
+        visibility into position PnL, SL distances, and trailing stop status.
+        """
+        active = self._positions.get_active_positions()
+        if not active:
+            return
+
+        lines: list[str] = []
+        total_floating = 0.0
+        for pos in active:
+            price = prices.get(pos.symbol, 0)
+            if price <= 0:
+                continue
+
+            if pos.direction == "LONG":
+                pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
+            else:
+                pnl_pct = (pos.entry_price - price) / pos.entry_price * 100
+            pnl_usdt = pnl_pct / 100 * pos.entry_price * pos.quantity
+            total_floating += pnl_usdt
+
+            effective_sl = self._trailing_stops.get(pos.symbol, pos.stop_loss)
+            if pos.direction == "LONG":
+                sl_dist = (price - effective_sl) / effective_sl * 100
+            else:
+                sl_dist = (effective_sl - price) / effective_sl * 100
+            trailing_tag = " T" if pos.symbol in self._trailing_stops else ""
+            dca_tag = f" DCA{pos.dca_count}" if pos.dca_count > 0 else ""
+
+            lines.append(
+                f"  {pos.symbol:12s} {pos.direction:5s} "
+                f"entry={pos.entry_price:.4f} cur={price:.4f} "
+                f"PnL={pnl_pct:+.2f}% ({pnl_usdt:+.3f}USDT)"
+                f" SL距={sl_dist:.1f}%{trailing_tag}{dca_tag}"
+            )
+
+        logger.info(
+            "TPSL持仓状态 (%d active, 浮动合计: %+.3f USDT):\n%s",
+            len(active), total_floating, "\n".join(lines),
+        )
 
     # ------------------------------------------------------------------
     # Threshold checking
