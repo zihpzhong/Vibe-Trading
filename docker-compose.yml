@@ -23,7 +23,7 @@ services:
       - HOME=/home/vibe
     volumes:
       - live-trading-data:/home/vibe/.vibe-trading
-    command: ["python", "extensions/run_live_trading.py", "--balance", "50", "--interval", "5", "--position-size", "0.2"]
+    command: ["python", "extensions/run_live_trading.py", "--live", "--confirm-live", "I_UNDERSTAND", "--balance", "50", "--interval", "5", "--position-size", "0.2"]
     restart: unless-stopped
     healthcheck:
       disable: true
