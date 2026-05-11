@@ -10,6 +10,7 @@ the conduction check — a known TODO).
 
 from __future__ import annotations
 
+import json
 import random
 import shutil
 import tempfile
@@ -370,7 +371,9 @@ class TestTPSLMonitorIntegration:
     def test_sl_triggers_when_price_reaches_stop_loss(
         self, exchange: MockExchange, tracker: PositionTracker,
     ) -> None:
-        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0)
+        # qty=0.7 ensures de-risk partial exits all skip ($20 min notional)
+        # at price $89 (loss -11%): levels 1&2 notional < $20, level 3/doom don't trigger
+        tracker.open_position("LONGUSDT", "LONG", 100.0, 0.7, 90.0)
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "LONGUSDT", "last": 89.0},
         ])
@@ -381,7 +384,8 @@ class TestTPSLMonitorIntegration:
     def test_sl_retries_three_times_on_failure(
         self, exchange: MockExchange, tracker: PositionTracker,
     ) -> None:
-        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0)
+        # qty=0.7 ensures de-risk levels skip, SL fires and retries 3x
+        tracker.open_position("LONGUSDT", "LONG", 100.0, 0.7, 90.0)
         call_count: list[int] = [0]
 
         def failing_sl(*args, **kwargs):
@@ -416,7 +420,261 @@ class TestTPSLMonitorIntegration:
 
 
 # ===================================================================
-# 7. Cooldown (2 tests)
+# 7. De-risk (7 tests)
+# ===================================================================
+
+class TestDeRisk:
+    """E2E: NFI-style de-risk partial exit logic."""
+
+    def test_first_entry_cost_invariant_after_dca(self, tracker: PositionTracker) -> None:
+        """first_entry_cost 在 DCA 后保持不变（de-risk 参照系）."""
+        tracker.open_position("TEST", "LONG", 100.0, 1.0, 90.0)
+        pos = tracker.get_position("TEST")
+        assert pos.first_entry_cost == 100.0
+        assert pos.first_entry_quantity == 1.0
+
+        tracker.adjust_position("TEST", 0.5, 90.0)
+        pos = tracker.get_position("TEST")
+        assert pos.first_entry_cost == 100.0  # 首次入场成本不变
+        assert pos.first_entry_quantity == 1.0
+        expected_avg = (100.0 * 1.0 + 90.0 * 0.5) / 1.5
+        assert pos.entry_price == pytest.approx(expected_avg)  # 均价已变
+        assert pos.quantity == 1.5
+
+    def test_de_risk_level1_reduces_position(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """Level 1 (-5%) 触发减仓 15%."""
+        tracker.open_position("TEST", "LONG", 100.0, 2.0, 80.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 93.0},  # -7% → past level 1 (5%), below level 2 (8%)
+        ])
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor._poll()
+        pos = tracker.get_position("TEST")
+        assert pos is not None
+        assert pos.quantity == pytest.approx(2.0 - 2.0 * 0.15)  # 1.7
+        assert pos.de_risk_level == 1
+
+    def test_de_risk_cascades_all_levels_to_doom(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """各级别 (L1→L2→L3→DOOM) 依次触发，每次 poll 一级."""
+        tracker.open_position("CASCADE", "LONG", 100.0, 10.0, 80.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "CASCADE", "last": 70.0},  # -30%
+        ])
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+
+        # Level 1: sell 15% = 1.5, remaining = 8.5
+        monitor._poll()
+        pos = tracker.get_position("CASCADE")
+        assert pos is not None
+        assert pos.de_risk_level == 1
+        assert pos.quantity == pytest.approx(10.0 * (1 - 0.15))
+
+        # Level 2: sell 30% of 8.5 = 2.55, remaining = 5.95
+        monitor._poll()
+        pos = tracker.get_position("CASCADE")
+        assert pos.de_risk_level == 2
+        assert pos.quantity == pytest.approx(8.5 * (1 - 0.30))
+
+        # Level 3: sell 50% of 5.95 = 2.975, remaining = 2.975
+        monitor._poll()
+        pos = tracker.get_position("CASCADE")
+        assert pos.de_risk_level == 3
+        assert pos.quantity == pytest.approx(5.95 * (1 - 0.50))
+
+        # Doom: 全平
+        monitor._poll()
+        assert tracker.get_position("CASCADE") is None
+
+    def test_de_risk_not_triggered_in_profit(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """盈利时 de-risk 不触发（价格在 TP 阈值之下）。"""
+        tracker.open_position("TEST", "LONG", 100.0, 2.0, 80.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 102.5},  # +2.5%, below TP (+5%) and trailing activation (+3%)
+        ])
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor._poll()
+        pos = tracker.get_position("TEST")
+        assert pos is not None
+        assert pos.quantity == 2.0  # 未减仓
+        assert pos.de_risk_level == 0
+
+    def test_de_risk_skipped_below_20_min_notional(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """低于 $20 最小限额时跳过部分减仓."""
+        tracker.open_position("TEST", "LONG", 100.0, 0.3, 80.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 85.0},  # -15%, past levels 1-3, below doom (18%)
+        ])
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        with patch.object(monitor._positions, "de_risk_partial_exit", wraps=tracker.de_risk_partial_exit) as spy:
+            monitor._poll()
+            # 所有级别都应跳过，不调用 de_risk_partial_exit
+            spy.assert_not_called()
+        pos = tracker.get_position("TEST")
+        assert pos is not None
+        assert pos.quantity == 0.3  # 未变化
+        assert pos.de_risk_level == 0
+
+    def test_first_entry_cost_backward_compat(self) -> None:
+        """旧格式 JSON（无 first_entry_cost）加载时自动 fallback 为 entry_price."""
+        tmp = tempfile.mkdtemp()
+        try:
+            persist_path = Path(tmp) / "positions.json"
+            old_data: dict[str, Any] = {
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT", "direction": "LONG",
+                        "entry_price": 65000.0, "quantity": 0.1,
+                        "stop_loss": 63000.0, "take_profit": 67000.0,
+                        "opened_at": "2025-01-01T00:00:00",
+                        "dca_count": 0, "leverage": 1, "entry_score": 0,
+                    },
+                ],
+            }
+            persist_path.write_text(json.dumps(old_data))
+            t = PositionTracker(account_balance=10_000.0, max_positions=3, persist_dir=tmp)
+            assert t.active_count == 1
+            pos = t.get_position("BTCUSDT")
+            assert pos.first_entry_cost == 65000.0  # fallback → entry_price
+            assert pos.first_entry_quantity == 0.1
+            assert pos.de_risk_level == 0
+            t.clear()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_dca_then_de_risk_coexist(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """DCA 拉低均价后，de-risk 仍以 first_entry_cost 为参照系."""
+        tracker.open_position("TEST", "LONG", 100.0, 2.0, 80.0)
+        first_cost = tracker.get_position("TEST").first_entry_cost
+
+        # DCA 加仓
+        tracker.adjust_position("TEST", 1.0, 90.0)
+        pos = tracker.get_position("TEST")
+        assert pos.first_entry_cost == first_cost  # 首次成本不变
+        expected_avg = (100.0 * 2.0 + 90.0 * 1.0) / 3.0
+        assert pos.entry_price == pytest.approx(expected_avg)
+        assert pos.quantity == 3.0
+        assert pos.dca_count == 1
+
+        # 价格下跌触发 de-risk
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 85.0},  # loss from first_cost: -15%
+        ])
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor._poll()
+        pos = tracker.get_position("TEST")
+        assert pos.de_risk_level == 1  # level 1 fired
+        assert pos.first_entry_cost == 100.0  # 参照系不变
+        level1_qty = 3.0 * 0.15
+        assert pos.quantity == pytest.approx(3.0 - level1_qty)
+
+
+# ===================================================================
+# 7b. DCA (5 tests)
+# ===================================================================
+
+class TestDCA:
+    """Phase 2: DCA logic in TPSLMonitor."""
+
+    def _make_monitor(
+        self, exchange: MockExchange, tracker: PositionTracker,
+        dca_enabled: bool = True,
+    ) -> TPSLMonitor:
+        """Helper: create TPSLMonitor with DCA enabled."""
+        from extensions.live_trading.config import DCAConfig
+        return TPSLMonitor(
+            exchange, tracker, poll_interval=0.05,
+            dca_config=DCAConfig(enabled=dca_enabled),
+            max_leverage=5, position_size_pct=0.05,
+        )
+
+    def test_dca_triggers_on_5_percent_loss(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """亏损 >= 5% 时 DCA 触发加仓."""
+        tracker.open_position("TEST", "LONG", 100.0, 1.0, 80.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 94.0},  # -6% from first_entry_cost
+        ])
+        monitor = self._make_monitor(exchange, tracker)
+        monitor._poll()
+        pos = tracker.get_position("TEST")
+        assert pos is not None
+        assert pos.dca_count == 1  # DCA 执行了一次
+
+    def test_dca_max_count_respected(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """超过 max_dca_count (3) 后不再 DCA."""
+        tracker.open_position("TEST", "LONG", 100.0, 1.0, 80.0)
+        # Artificially set dca_count to max
+        tracker._positions["TEST"].dca_count = 3
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 94.0},
+        ])
+        monitor = self._make_monitor(exchange, tracker)
+        with patch.object(monitor._positions, "adjust_position", wraps=tracker.adjust_position) as spy:
+            monitor._poll()
+            spy.assert_not_called()
+
+    def test_dca_not_triggered_on_small_loss(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """亏损 < 5% 时 DCA 不触发."""
+        tracker.open_position("TEST", "LONG", 100.0, 1.0, 80.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 97.0},  # -3% from first_entry_cost
+        ])
+        monitor = self._make_monitor(exchange, tracker)
+        with patch.object(monitor._positions, "adjust_position", wraps=tracker.adjust_position) as spy:
+            monitor._poll()
+            spy.assert_not_called()
+
+    def test_dca_skipped_when_account_loss_exceeds_8_percent(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """仓位累计亏损超账户 8% 时跳过 DCA."""
+        # Small balance, large position: quick to hit 8% account loss
+        small_tracker = PositionTracker(account_balance=100.0, max_positions=3)
+        small_tracker.open_position("TEST", "LONG", 100.0, 0.5, 80.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 85.0},  # -15% loss → 0.5*15=7.5 USDT = 7.5% of 100
+        ])
+        monitor = self._make_monitor(exchange, small_tracker)
+        monitor._poll()
+        pos = small_tracker.get_position("TEST")
+        assert pos is not None
+        assert pos.dca_count == 0  # DCA should not have executed
+        small_tracker.clear()
+
+    def test_dca_skipped_when_exposure_exceeds_limit(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """加仓后暴露率超限时跳过 DCA."""
+        # Near max exposure already
+        constrained = PositionTracker(account_balance=100.0, max_exposure_pct=0.05, max_positions=3)
+        constrained.open_position("TEST", "LONG", 100.0, 0.04, 80.0)  # 4% exposure
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "TEST", "last": 94.0},  # -6% loss → DCA trigger
+        ])
+        monitor = self._make_monitor(exchange, constrained)
+        with patch.object(monitor._positions, "adjust_position", wraps=constrained.adjust_position) as spy:
+            monitor._poll()
+            spy.assert_not_called()
+        constrained.clear()
+
+
+# ===================================================================
+# 8. Cooldown (2 tests)
 # ===================================================================
 
 class TestCooldown:
