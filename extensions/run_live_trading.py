@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Vibe Trading 全流程实盘自动交易系统")
     parser.add_argument("--mock", action="store_true", help="使用模拟交易所（测试用）")
     parser.add_argument("--dry-run", action="store_true", help="扫描但不交易")
-    parser.add_argument("--interval", type=int, default=5, help="扫描间隔（分钟）")
+    parser.add_argument("--interval", type=int, default=10, help="扫描间隔（分钟）")
     parser.add_argument("--balance", type=float, default=50.0, help="账户 USDT 余额")
     parser.add_argument("--mode", choices=["default", "conservative", "aggressive"],
                         default="default", help="风控模式")
