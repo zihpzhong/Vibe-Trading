@@ -88,6 +88,14 @@ class ExchangeBase(ABC):
         """Return minimum tradeable quantity for symbol (0.0 = unknown)."""
         return 0.0
 
+    def is_valid_symbol(self, symbol: str) -> bool:
+        """Check if symbol exists on this exchange market.
+
+        RealExchange overrides this to check futures exchangeInfo.
+        MockExchange returns True for all symbols (handles all mock data).
+        """
+        return True
+
 
 class MockExchange(ExchangeBase):
     """Mock exchange that returns simulated data.
