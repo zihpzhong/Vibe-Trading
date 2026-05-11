@@ -119,6 +119,10 @@ def parse_args() -> argparse.Namespace:
                         help="最大杠杆倍数 (默认 5), score≥7 用最大值, score 5-6 用半值")
     parser.add_argument("--no-phase2", action="store_true",
                         help="跳过 Phase 2 LLM 深度分析 (仅 Phase 1 + Gate)")
+    parser.add_argument(
+        "--pairs", nargs="*", default=None,
+        help="交易对白名单 e.g. --pairs BTC ETH SOL (空=Top-N 模式, 也支持 TRADING_PAIRS 环境变量)",
+    )
     args = parser.parse_args()
     if args.live and args.dry_run:
         parser.error("--live and --dry-run cannot be used together")
@@ -203,6 +207,14 @@ def main() -> int:
     elif args.mode == "aggressive":
         config = LiveTradingConfig.aggressive()
     config.default_scan_interval_minutes = args.interval
+
+    # Trading pair whitelist: --pairs CLI > TRADING_PAIRS env var
+    if args.pairs is not None:
+        config.pair_whitelist = list(args.pairs)
+    elif os.environ.get("TRADING_PAIRS"):
+        config.pair_whitelist = [
+            p.strip() for p in os.environ["TRADING_PAIRS"].split(",") if p.strip()
+        ]
 
     config_err = config.validate()
     if config_err:
@@ -476,7 +488,7 @@ def main() -> int:
                 )
                 # 仍显示持仓，但不交易
             else:
-                report = scheduler.run_once(top_n=config.scan_top_n)
+                report = scheduler.run_once(top_n=config.scan_top_n, whitelist=config.pair_whitelist or None)
 
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
             btc_label = report.btc_status

@@ -51,7 +51,7 @@ class TradingScheduler:
     # Public API
     # ------------------------------------------------------------------
 
-    def run_once(self, top_n: int = 20) -> ScheduleReport:
+    def run_once(self, top_n: int = 20, whitelist: Optional[list[str]] = None) -> ScheduleReport:
         """Execute one full scan→decide cycle.
 
         1. BTC conduction check
@@ -89,7 +89,7 @@ class TradingScheduler:
             )
 
         # Step 2: Phase 1 scan
-        scan_result = self._scanner.scan(top_n=top_n)
+        scan_result = self._scanner.scan(top_n=top_n, whitelist=whitelist)
 
         # Step 3: Tiered decisions
         phase2_requests: list[Phase2Request] = []
