@@ -268,7 +268,7 @@ class ExecGateEngine:
 
         position_pct = measured_value / account_balance * 100
 
-        if position_pct <= max_pct:
+        if position_pct <= max_pct + 1e-9:
             result.add_check(
                 "position_cap", True,
                 f"Position {measured_label} ${measured_value:.2f} ({position_pct:.1f}%) ≤ cap {max_pct}%",

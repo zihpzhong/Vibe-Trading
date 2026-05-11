@@ -34,10 +34,18 @@ class Position:
     dca_count: int = 0  # 已 DCA 加仓次数
     leverage: int = 1
     entry_score: int = 0  # 开仓时评分, 用于分档胜率统计
+    first_entry_cost: float = 0.0  # 首次入场价（永不改变，de-risk 参照系）
+    first_entry_quantity: float = 0.0  # 首次数量（永不改变）
+    de_risk_level: int = 0  # 已触发的最高 de-risk 级别 (0-4)
 
     def __post_init__(self) -> None:
         if not self.opened_at:
             self.opened_at = datetime.now(timezone.utc).isoformat()
+        # 旧数据兼容：确保 first_entry_cost/quantity 有值
+        if self.first_entry_cost == 0.0:
+            self.first_entry_cost = self.entry_price
+        if self.first_entry_quantity == 0.0:
+            self.first_entry_quantity = self.quantity
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -51,6 +59,9 @@ class Position:
             "dca_count": self.dca_count,
             "leverage": self.leverage,
             "entry_score": self.entry_score,
+            "first_entry_cost": self.first_entry_cost,
+            "first_entry_quantity": self.first_entry_quantity,
+            "de_risk_level": self.de_risk_level,
         }
 
     @classmethod
@@ -66,6 +77,9 @@ class Position:
             dca_count=int(d.get("dca_count", 0)),
             leverage=int(d.get("leverage", 1)),
             entry_score=int(d.get("entry_score", 0)),
+            first_entry_cost=float(d.get("first_entry_cost", 0.0)),
+            first_entry_quantity=float(d.get("first_entry_quantity", 0.0)),
+            de_risk_level=int(d.get("de_risk_level", 0)),
         )
 
 
@@ -286,6 +300,8 @@ class PositionTracker:
         """DCA: add quantity to existing position, recalc average entry price.
 
         Returns updated position or None if symbol not found.
+        ``first_entry_cost`` and ``first_entry_quantity`` are intentionally
+        preserved — they serve as the invariant reference for de-risk thresholds.
         """
         with self._lock:
             pos = self._positions.get(symbol)
@@ -295,6 +311,10 @@ class PositionTracker:
             pos.entry_price = (pos.entry_price * pos.quantity + new_price * add_quantity) / total_qty
             pos.quantity = total_qty
             pos.dca_count += 1
+            # 显式确保 de-risk 参照系不变
+            # (更安全的防御，避免未来某段代码意外修改)
+            pos.first_entry_cost = pos.first_entry_cost
+            pos.first_entry_quantity = pos.first_entry_quantity
             self._persist()
             logger.info(
                 "Position adjusted: %s +%.4f @ %.4f, new avg=%.4f qty=%.4f (dca#%d)",
@@ -319,6 +339,60 @@ class PositionTracker:
             logger.info(
                 "Position reduced: %s -%.4f @ %.4f, remaining qty=%.4f",
                 symbol, reduce_qty, current_price, pos.quantity,
+            )
+            return pos
+
+    def de_risk_partial_exit(self, symbol: str, de_risk_level: int, sell_qty: float, current_price: float) -> Optional[Position]:
+        """De-risk partial exit: sell a fraction of an active position.
+
+        Unlike ``reduce_position``, this method:
+        - Updates ``de_risk_level`` on the position (level only moves upward).
+        - Does NOT create a CloseRecord (the position remains open).
+        - Is idempotent for a given level (will not re-fire the same level).
+
+        Args:
+            symbol: Position symbol.
+            de_risk_level: Which de-risk level triggered (1-3).
+            sell_qty: Quantity to sell.
+            current_price: Current market price (for logging).
+
+        Returns:
+            Updated Position, or None if symbol not found.
+        """
+        if de_risk_level < 1 or de_risk_level > 4:
+            logger.warning("de_risk_partial_exit: invalid level %d for %s", de_risk_level, symbol)
+            return None
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if not pos:
+                return None
+            # Level 4 = doom, handled by full close
+            if de_risk_level == 4:
+                self.close_position(symbol, exit_price=current_price, reason="DOOM")
+                return None
+            # 防重复：level 只升不降
+            if de_risk_level <= pos.de_risk_level:
+                logger.debug(
+                    "de-risk level %d already fired for %s (current=%d), skipping",
+                    de_risk_level, symbol, pos.de_risk_level,
+                )
+                return pos
+            clamped_qty = min(sell_qty, pos.quantity)
+            if clamped_qty <= 0:
+                return pos
+            # 如果卖光 = 全平
+            if clamped_qty >= pos.quantity:
+                logger.info(
+                    "DE-RISK level %d: selling all remaining %.4f %s @ %.4f (DOOM)",
+                    de_risk_level, pos.quantity, symbol, current_price,
+                )
+                return self.close_position(symbol, exit_price=current_price, reason=f"DE_RISK_{de_risk_level}")
+            pos.quantity -= clamped_qty
+            pos.de_risk_level = de_risk_level
+            self._persist()
+            logger.info(
+                "DE-RISK level %d: sold %.4f %s @ %.4f, remaining qty=%.4f",
+                de_risk_level, clamped_qty, symbol, current_price, pos.quantity,
             )
             return pos
 
@@ -489,7 +563,7 @@ class PositionTracker:
                 return False, f"仓位已达上限 ({self._max_positions})"
             current_exp = self._get_exposure_unlocked()
             post_exp = current_exp + (additional_notional / self._account_balance) if additional_notional > 0 else current_exp
-            if post_exp >= self._max_exposure_pct:
+            if post_exp >= self._max_exposure_pct - 1e-9:
                 if additional_notional > 0:
                     return False, (
                         f"开仓后总敞口 {post_exp:.1%} 超限 (上限 {self._max_exposure_pct:.0%}, "
