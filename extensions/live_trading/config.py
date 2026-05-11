@@ -7,7 +7,7 @@ Override via environment variables or by creating a local config instance.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 
 @dataclass
@@ -104,6 +104,7 @@ class LiveTradingConfig:
     scan_top_n: int = 20  # Phase 1 扫描数量
     scan_batch_size: int = 5  # 并发批次大小
     default_scan_interval_minutes: int = 5  # 闪电模式默认间隔
+    pair_whitelist: List[str] = field(default_factory=list)  # 白名单，空=Top-N模式
 
     @classmethod
     def aggressive(cls) -> LiveTradingConfig:

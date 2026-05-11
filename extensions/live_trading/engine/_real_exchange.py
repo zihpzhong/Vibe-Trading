@@ -164,11 +164,11 @@ class RealExchange(ExchangeBase):
     def _get_kline_urls(self) -> tuple[str, str]:
         """Return (base_url, endpoint) for kline fetching.
 
-        Both routes use api.binance.com (proxies fapi too — fapi.binance.com has SSL issues in Docker).
-        Falls back to spot api if fapi is unreachable.
+        Uses fapi.binance.com for futures, with api.binance.com fallback.
+        Spot market always uses api.binance.com.
         """
         if self._market_type == "future":
-            return ("https://api.binance.com", "/fapi/v1/klines")
+            return ("https://fapi.binance.com", "/fapi/v1/klines")
         return ("https://api.binance.com", "/api/v3/klines")
 
     def get_kline(self, symbol: str, timeframe: str = "1h", limit: int = 200) -> pd.DataFrame:
@@ -197,15 +197,15 @@ class RealExchange(ExchangeBase):
         try:
             raw = _fetch(base_url, endpoint)
         except Exception as exc:
-            # Futures kline failures → try spot fallback for non-commodity pairs
+            # Futures kline failures → try spot API fallback for non-commodity pairs
             if self._market_type == "future":
                 try:
+                    spot_ep = "/api/v3/klines"
                     resp_check = self._session.get(
-                        f"https://api.binance.com{endpoint}",
+                        f"https://api.binance.com{spot_ep}",
                         params={"symbol": symbol, "interval": tf, "limit": 1},
                         timeout=10,
                     )
-                    # spot 404 → symbol not on spot (commodities/杠杆代币), propagate futures error
                     if resp_check.status_code == 404:
                         raise RuntimeError(f"Klines unavailable for {symbol} on spot (futures-only pair)")
                     raw_resp = resp_check.json()
@@ -708,15 +708,26 @@ class RealExchange(ExchangeBase):
 
         Uses cached stepSize from exchangeInfo.
         Falls back to rounding to 6 decimal places if stepSize unknown.
+        When rounded result is 0, falls back to the step size (minimum tradable unit)
+        to avoid order rejection.
         """
         step = self._step_sizes.get(symbol)
         if step is None or step <= 0:
             return round(qty, 6)
+        min_qty = self._min_qtys.get(symbol, step)
         # Use Decimal for precise step rounding (avoids float 24.400000000000002 bugs)
         step_d = Decimal(str(step))
         qty_d = Decimal(str(qty))
         rounded = (qty_d / step_d).to_integral_value(rounding=ROUND_FLOOR) * step_d
-        return float(rounded)
+        result = float(rounded)
+        if result == 0.0 and qty > 0:
+            fallback = max(step, min_qty)
+            logger.warning(
+                "_round_qty(%s, %.6f) rounded to 0 (step=%.6f), falling back to %.6f",
+                symbol, qty, step, fallback,
+            )
+            return fallback
+        return result
 
     def _fapi_post(self, path: str, params: dict) -> dict:
         """Send a signed POST to fapi.binance.com with full path.

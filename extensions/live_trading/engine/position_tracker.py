@@ -33,7 +33,7 @@ class Position:
     opened_at: str = ""  # ISO 8601
     dca_count: int = 0  # 已 DCA 加仓次数
     leverage: int = 1
-    entry_score: int = 0  # 开仓时评分, 用于分档胜率统计
+    entry_score: int = -1  # 开仓时评分, -1 表示旧数据无评分, 用于分档胜率统计
     first_entry_cost: float = 0.0  # 首次入场价（永不改变，de-risk 参照系）
     first_entry_quantity: float = 0.0  # 首次数量（永不改变）
     de_risk_level: int = 0  # 已触发的最高 de-risk 级别 (0-4)
@@ -76,7 +76,7 @@ class Position:
             opened_at=d.get("opened_at", ""),
             dca_count=int(d.get("dca_count", 0)),
             leverage=int(d.get("leverage", 1)),
-            entry_score=int(d.get("entry_score", 0)),
+            entry_score=int(d.get("entry_score", -1)),
             first_entry_cost=float(d.get("first_entry_cost", 0.0)),
             first_entry_quantity=float(d.get("first_entry_quantity", 0.0)),
             de_risk_level=int(d.get("de_risk_level", 0)),
@@ -137,7 +137,7 @@ class CloseRecord:
             closed_at=d.get("closed_at", ""),
             dca_count=int(d.get("dca_count", 0)),
             leverage=int(d.get("leverage", 1)),
-            entry_score=int(d.get("entry_score", 0)),
+            entry_score=int(d.get("entry_score", -1)),
         )
 
     def to_trade_record(self):
@@ -216,7 +216,7 @@ class PositionTracker:
         stop_loss: float,
         take_profit: Optional[float] = None,
         leverage: int = 1,
-        entry_score: int = 0,
+        entry_score: int = -1,
     ) -> Position:
         """Record a new position. Overwrites existing position for the same symbol."""
         with self._lock:

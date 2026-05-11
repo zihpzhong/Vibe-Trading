@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,19 @@ MIN_SCORE = 3
 _STABLECOINS: frozenset[str] = frozenset({
     "USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDP",
     "USD1", "USTC", "USDD", "FRAX", "LUSD", "PAXG",
+})
+
+# Low-quality meme/shitcoins with extreme volatility, thin liquidity, or pump-and-dump risk
+# Keyed by base currency (symbol without USDT suffix)
+_MEMECOIN_BLACKLIST: frozenset[str] = frozenset({
+    "BIO",  # low-cap biotech meme, caused -$1.53 loss on 2026-05-11
+})
+
+# Commodity futures that require signing Binance TradFi-Perps agreement (-4411 error)
+# Keyed by base currency (symbol without USDT suffix)
+_TRADFI_REQUIRED: frozenset[str] = frozenset({
+    "XAG",   # Silver — requires TradFi-Perps agreement
+    "XAU",   # Gold — requires TradFi-Perps agreement
 })
 
 
@@ -270,11 +283,14 @@ class MarketScanner:
     # Public API
     # ------------------------------------------------------------------
 
-    def scan(self, top_n: int = 20) -> ScanResult:
+    def scan(self, top_n: int = 20, whitelist: Optional[list[str]] = None) -> ScanResult:
         """Run full Phase 1 scan pipeline.
 
         Args:
-            top_n: Number of top-volume symbols to screen.
+            top_n: Number of top-volume symbols to screen (used when whitelist is empty).
+            whitelist: Optional list of base currencies (e.g. ["BTC","ETH"]) or full
+                       symbols (e.g. ["BTCUSDT","ETHUSDT"]). When non-empty, only
+                       these pairs are scanned instead of top-N by volume.
 
         Returns:
             ScanResult with rankings (score ≥ MIN_SCORE) and watchlist (score 3-4).
@@ -286,8 +302,16 @@ class MarketScanner:
             return ScanResult(rankings=[], watchlist=[], filtered_count=0, scan_time_ms=elapsed)
 
         scored: list[dict[str, Any]] = []
-        batch = tickers[:top_n]
-        logger.info("Scanning %d symbols for Phase 1...", len(batch))
+        if whitelist:
+            wl_set = {w.upper().removesuffix("USDT") for w in whitelist}
+            batch = [t for t in tickers if t["symbol"].removesuffix("USDT") in wl_set]
+            logger.info(
+                "Scanning %d whitelist symbols for Phase 1... (%d matched from market)",
+                len(whitelist), len(batch),
+            )
+        else:
+            batch = tickers[:top_n]
+            logger.info("Scanning %d symbols for Phase 1...", len(batch))
         filtered_incompatible = 0
         for i, t in enumerate(batch):
             sym = t["symbol"]
@@ -295,6 +319,14 @@ class MarketScanner:
             base_currency = sym.removesuffix("USDT")
             if base_currency in _STABLECOINS:
                 logger.info("  Filter(稳定币): %s skipped", sym)
+                continue
+            # Skip meme/shitcoins — extreme risk, thin liquidity
+            if base_currency in _MEMECOIN_BLACKLIST:
+                logger.info("  Filter(MEME币): %s skipped", sym)
+                continue
+            # Skip commodity futures requiring TradFi-Perps agreement (gold, silver)
+            if base_currency in _TRADFI_REQUIRED:
+                logger.info("  Filter(TradFi协议): %s skipped", sym)
                 continue
             # Filter symbols not available on futures market
             if not self._exchange.is_valid_symbol(sym):

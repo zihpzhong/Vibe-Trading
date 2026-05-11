@@ -71,20 +71,20 @@ class TestTakeProfit:
         assert tracker.active_count == 0
 
     def test_tp_not_triggered_below_threshold(self, exchange: MockExchange, tracker: PositionTracker) -> None:
-        """Dynamic TP at +5% (held <30min) should not trigger at +4%."""
+        """Dynamic TP at +8% (held <30min) should not trigger at +6%."""
         tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0, 120.0)
         exchange.get_tickers = MagicMock(return_value=[
-            {"symbol": "LONGUSDT", "last": 104.0},  # +4% < +5% dynamic TP
+            {"symbol": "LONGUSDT", "last": 106.0},  # +6% < +8% dynamic TP
         ])
         monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
         monitor._poll()
         assert tracker.active_count == 1  # still open
 
     def test_tp_triggered_by_dynamic_threshold(self, exchange: MockExchange, tracker: PositionTracker) -> None:
-        """Dynamic TP (+5% for <30min) triggers even without fixed TP."""
+        """Dynamic TP (+8% for <30min) triggers even without fixed TP."""
         tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0)  # no fixed TP
         exchange.get_tickers = MagicMock(return_value=[
-            {"symbol": "LONGUSDT", "last": 106.0},  # +6% > +5% dynamic TP
+            {"symbol": "LONGUSDT", "last": 109.0},  # +9% > +8% dynamic TP
         ])
         monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
         monitor._poll()
@@ -96,7 +96,7 @@ class TestTakeProfit:
         """Fixed TP and time-decay TP use the nearer threshold, not fixed-only."""
         tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0, 130.0)
         exchange.get_tickers = MagicMock(return_value=[
-            {"symbol": "LONGUSDT", "last": 106.0},  # +6% reaches dynamic +5%, fixed TP still far
+            {"symbol": "LONGUSDT", "last": 109.0},  # +9% reaches dynamic +8%, fixed TP still far
         ])
         monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
         monitor._poll()

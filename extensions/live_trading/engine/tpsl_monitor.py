@@ -229,10 +229,10 @@ class TPSLMonitor(Thread):
         """Check if TP level is reached — time-decaying minimal_roi style.
 
         The longer the position is held, the lower the TP threshold:
-          < 30 min : +5%
-          30-60 min : +3%
-          60-120 min: +1%
-          > 120 min : +0.1% (保本附近)
+          < 30 min : +8%
+          30-60 min : +5%
+          60-120 min: +2%
+          > 120 min : +0.5% (保本附近)
 
         If a fixed take_profit is set, uses the tighter of the two.
         """
@@ -240,13 +240,13 @@ class TPSLMonitor(Thread):
         elapsed_min = elapsed / 60
 
         if elapsed_min < 30:
-            tp_pct = 0.05
+            tp_pct = 0.08
         elif elapsed_min < 60:
-            tp_pct = 0.03
+            tp_pct = 0.05
         elif elapsed_min < 120:
-            tp_pct = 0.01
+            tp_pct = 0.02
         else:
-            tp_pct = 0.001
+            tp_pct = 0.005
 
         thresholds = [tp_pct]
         if pos.take_profit is not None:
@@ -499,9 +499,12 @@ class TPSLMonitor(Thread):
                 level, pos.symbol, notional, pos.quantity,
             )
             side = "sell" if pos.direction == "LONG" else "buy"
+            # Full close via fallback: use is_de_risk=False so tracker calls
+            # close_position() instead of de_risk_partial_exit(), preventing
+            # ghost positions on partial fills.
             self._execute_order_with_retry(
                 pos, side, pos.quantity, current_price,
-                reason=f"DE_RISK_{level}", is_de_risk=True, de_risk_level=level,
+                reason=f"DE_RISK_{level}", is_de_risk=False, de_risk_level=level,
             )
             return True
 
