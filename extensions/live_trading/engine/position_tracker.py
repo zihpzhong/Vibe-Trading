@@ -197,6 +197,7 @@ class PositionTracker:
         self._positions: dict[str, Position] = {}
         self._closed: list[CloseRecord] = []  # 已平仓历史（最多保留最近 50 条）
         self._cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → timestamp
+        self._extended_cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → expiry_timestamp (de-risk long cooldown)
         self._trailing_stops: dict[str, float] = {}
         self._peak_prices: dict[str, float] = {}
         self._equity_history: list[dict[str, Any]] = []  # 权益曲线快照
@@ -623,14 +624,32 @@ class PositionTracker:
                     )
             return True, ""
 
+    def set_extended_cooldown(self, symbol: str, direction: str, minutes: int) -> None:
+        """Set a longer cooldown for a symbol+direction (e.g. after de-risk event).
+
+        Overrides the default cooldown duration. Used to prevent revenge-trading
+        on symbols that triggered de-risk.
+        """
+        with self._lock:
+            key = f"{symbol}:{direction}"
+            self._extended_cooldowns[key] = time.time() + minutes * 60
+            self._persist()
+
     def is_in_cooldown(self, symbol: str, direction: str) -> bool:
         """Check if symbol+direction pair is in cooldown period."""
         with self._lock:
             key = f"{symbol}:{direction}"
+            if key in self._extended_cooldowns:
+                if time.time() < self._extended_cooldowns[key]:
+                    return True
+                del self._extended_cooldowns[key]  # expired, clean up
             if key not in self._cooldowns:
                 return False
             elapsed = time.time() - self._cooldowns[key]
-            return elapsed < self._cooldown_minutes * 60
+            if elapsed < self._cooldown_minutes * 60:
+                return True
+            del self._cooldowns[key]  # expired, clean up
+            return False
 
     @property
     def active_count(self) -> int:
@@ -686,6 +705,7 @@ class PositionTracker:
             "positions": [p.to_dict() for p in self._positions.values()],
             "closed": [c.to_dict() for c in self._closed],
             "cooldowns": {k: v for k, v in self._cooldowns.items()},
+            "extended_cooldowns": {k: v for k, v in self._extended_cooldowns.items()},
             "trailing_stops": getattr(self, "_trailing_stops", {}),
             "peak_prices": getattr(self, "_peak_prices", {}),
             "account_balance": self._account_balance,
@@ -715,6 +735,7 @@ class PositionTracker:
                 except (KeyError, ValueError) as exc:
                     logger.warning("Skipping invalid close record: %s", exc)
             self._cooldowns = {k: float(v) for k, v in raw.get("cooldowns", {}).items()}
+            self._extended_cooldowns = {k: float(v) for k, v in raw.get("extended_cooldowns", {}).items()}
             self._trailing_stops = raw.get("trailing_stops", {})
             self._peak_prices = raw.get("peak_prices", {})
             if "account_balance" in raw:
@@ -736,6 +757,7 @@ class PositionTracker:
             self._positions.clear()
             self._closed.clear()
             self._cooldowns.clear()
+            self._extended_cooldowns.clear()
             self._equity_history.clear()
             if self._persist_path.exists():
                 self._persist_path.unlink()
