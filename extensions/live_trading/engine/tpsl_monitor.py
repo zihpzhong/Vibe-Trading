@@ -19,6 +19,10 @@ from extensions.live_trading.config import DCAConfig, DeRiskConfig
 
 logger = logging.getLogger(__name__)
 
+STALE_POSITION_HOURS = 24  # 持仓超过此时长且 PnL 在 ±3% 内视为僵尸仓位
+STALE_POSITION_PNL_PCT = 3.0  # 僵尸仓位 PnL 浮动范围
+DE_RISK_EXTENDED_COOLDOWN_MINUTES = 240  # de-risk 后延长冷却 4 小时
+
 RETRY_BACKOFF = (1, 2, 4)
 MAX_RETRIES = 3
 
@@ -160,6 +164,11 @@ class TPSLMonitor(Thread):
             elif self._check_de_risk(pos, current_price):             # 5. De-risk partial exit
                 pass
 
+        # 6. 僵尸仓位检测
+        if self._check_stale_positions(active, prices):
+            # stale position(s) closed, reload active list
+            active = self._positions.get_active_positions()
+
         # 定时持仓状态日志
         self._status_poll_counter += 1
         if self._status_poll_counter >= self._status_poll_threshold:
@@ -220,6 +229,49 @@ class TPSLMonitor(Thread):
             "TPSL持仓状态 (%d active, 浮动合计: %+.3f USDT):\n%s",
             len(active), total_floating, "\n".join(lines),
         )
+
+    # ------------------------------------------------------------------
+    # Stale position detection
+    # ------------------------------------------------------------------
+
+    def _check_stale_positions(self, active: list[Position], prices: dict[str, float]) -> bool:
+        """Close positions that have been open > 24h with PnL stuck within ±3%.
+
+        Returns True if at least one stale position was closed.
+        """
+        closed_any = False
+        now = time.time()
+        for pos in active:
+            try:
+                opened_ts = datetime.fromisoformat(pos.opened_at).timestamp()
+            except (ValueError, OSError):
+                continue
+            age_hours = (now - opened_ts) / 3600
+            if age_hours < STALE_POSITION_HOURS:
+                continue
+
+            price = prices.get(pos.symbol, 0)
+            if price <= 0:
+                continue
+
+            if pos.direction == "LONG":
+                pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
+            else:
+                pnl_pct = (pos.entry_price - price) / pos.entry_price * 100
+
+            if abs(pnl_pct) <= STALE_POSITION_PNL_PCT:
+                side = "sell" if pos.direction == "LONG" else "buy"
+                logger.warning(
+                    "STALE position %s %s (%dh old, PnL=%+.1f%%): closing to release margin",
+                    pos.symbol, pos.direction, int(age_hours), pnl_pct,
+                )
+                self._execute_order_with_retry(
+                    pos, side, pos.quantity, price,
+                    reason="STALE", is_de_risk=False,
+                )
+                closed_any = True
+
+        return closed_any
 
     # ------------------------------------------------------------------
     # Threshold checking
@@ -477,6 +529,7 @@ class TPSLMonitor(Thread):
                 pos, side, pos.quantity, current_price,
                 reason="DOOM", is_de_risk=True, de_risk_level=4,
             )
+            self._positions.set_extended_cooldown(pos.symbol, pos.direction, DE_RISK_EXTENDED_COOLDOWN_MINUTES)
             return True
 
         return False
@@ -492,20 +545,17 @@ class TPSLMonitor(Thread):
 
         notional = sell_qty * current_price
         if notional < 20:
-            # 名义价值不足无法部分减持时，全平避免仓位僵死无风险管控
             logger.warning(
                 "DE-RISK level %d FALLBACK for %s: partial exit notional $%.2f < $20 min, "
                 "closing all %.4f instead",
                 level, pos.symbol, notional, pos.quantity,
             )
             side = "sell" if pos.direction == "LONG" else "buy"
-            # Full close via fallback: use is_de_risk=False so tracker calls
-            # close_position() instead of de_risk_partial_exit(), preventing
-            # ghost positions on partial fills.
             self._execute_order_with_retry(
                 pos, side, pos.quantity, current_price,
                 reason=f"DE_RISK_{level}", is_de_risk=False, de_risk_level=level,
             )
+            self._positions.set_extended_cooldown(pos.symbol, pos.direction, DE_RISK_EXTENDED_COOLDOWN_MINUTES)
             return True
 
         side = "sell" if pos.direction == "LONG" else "buy"
@@ -513,6 +563,7 @@ class TPSLMonitor(Thread):
             pos, side, sell_qty, current_price,
             reason=f"DE_RISK_{level}", is_de_risk=True, de_risk_level=level,
         )
+        self._positions.set_extended_cooldown(pos.symbol, pos.direction, DE_RISK_EXTENDED_COOLDOWN_MINUTES)
         return True
 
     def _execute_order_with_retry(

@@ -43,6 +43,8 @@ DIM_SKILL_MAP: dict[str, list[str]] = {
     "dim8": ["correlation-analysis", "sector-rotation"],
 }
 
+MIN_LOADED_DIMS_FOR_LLM = 3  # 至少 3 个维度有 skill 数据才发起 LLM 调用
+
 DIM_LABELS: dict[str, str] = {
     "dim1": "技术面",
     "dim2": "链上数据",
@@ -133,6 +135,13 @@ Rules:
             if not skills:
                 logger.info("Phase2: No skills loaded for %s, skipping", req.symbol)
                 return None
+            loaded_count = len(skills)
+            if loaded_count < MIN_LOADED_DIMS_FOR_LLM:
+                logger.info(
+                    "Phase2: %s only %d/%d dims have data (< %d), skipping LLM (NEUTRAL)",
+                    req.symbol, loaded_count, len(needed), MIN_LOADED_DIMS_FOR_LLM,
+                )
+                return {"symbol": req.symbol, "consensus": "NEUTRAL", "summary": "insufficient dimension data", "dimensions": {}}
             prompt = self._build_prompt(req, ticker or {}, skills)
             llm = self._get_llm()
             response = llm.chat(

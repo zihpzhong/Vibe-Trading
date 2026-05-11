@@ -387,7 +387,7 @@ class TestATRStop:
 
     def test_conservative_multiplier(self) -> None:
         """保守模式止损距离更近."""
-        kline = self._make_kline(vol_pct=2.0)
+        kline = self._make_kline(vol_pct=4.0)
         stop_default, atr_d = calculate_atr_stop(kline, SignalDirection.LONG, 150.0, conservative=False)
         stop_conservative, atr_c = calculate_atr_stop(kline, SignalDirection.LONG, 150.0, conservative=True)
         # conservative uses 1.5x instead of 2.0x, so stop is closer to entry
@@ -406,7 +406,7 @@ class TestATRStop:
         """数据不足时使用固定百分比止损."""
         kline = pd.DataFrame({"high": [100.0], "low": [98.0], "close": [99.0]})
         stop, atr = calculate_atr_stop(kline, SignalDirection.LONG, 100.0)
-        assert stop == 97.0  # 3% fallback (from ATRStopConfig.min_stop_distance_pct)
+        assert stop == 95.0  # 5% fallback (from ATRStopConfig.min_stop_distance_pct)
         assert atr == 0.0
 
     def test_min_stop_distance_pct_enforced(self) -> None:
@@ -416,9 +416,8 @@ class TestATRStop:
             "low": [99.5] * 20,
             "close": [100.0] * 20,
         })
-        # Very low volatility → ATR-based stop < dynamic floor → should enforce 3% min distance
         stop, atr = calculate_atr_stop(kline, SignalDirection.LONG, 100.0)
-        assert stop == pytest.approx(97.0, rel=1e-3)  # 3% of 100
+        assert stop == pytest.approx(95.0, rel=1e-3)  # 5% of 100
         assert atr > 0
 
     def test_min_stop_short_direction(self) -> None:
@@ -429,7 +428,7 @@ class TestATRStop:
             "close": [100.0] * 20,
         })
         stop, atr = calculate_atr_stop(kline, SignalDirection.SHORT, 100.0)
-        assert stop == pytest.approx(103.0, rel=1e-3)  # 3% of 100, above entry
+        assert stop == pytest.approx(105.0, rel=1e-3)  # 5% of 100, above entry
         assert atr > 0
 
     def test_max_stop_distance_pct_caps_wide_atr(self) -> None:
@@ -515,7 +514,7 @@ class TestLiveTradingConfig:
         assert cfg.funding_rate.max_long_funding == 0.0010
         assert cfg.funding_rate.min_short_funding == -0.0005
         assert cfg.atr_stop.multiplier_default == 2.0
-        assert cfg.atr_stop.min_stop_distance_pct == 3.0
+        assert cfg.atr_stop.min_stop_distance_pct == 5.0
         assert cfg.atr_stop.max_stop_distance_pct == 8.0
         assert cfg.execution_gate.min_liquidity_usdt == 1_000_000
         assert cfg.execution_gate.min_risk_reward_ratio == 1.0
