@@ -253,35 +253,8 @@ class PositionTracker:
         with self._lock:
             pos = self._positions.pop(symbol, None)
             if pos:
-                if exit_price is not None and exit_price > 0:
-                    if pos.direction == "LONG":
-                        pnl_usdt = (exit_price - pos.entry_price) * pos.quantity
-                        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
-                    else:
-                        pnl_usdt = (pos.entry_price - exit_price) * pos.quantity
-                        pnl_pct = (pos.entry_price - exit_price) / pos.entry_price * 100
-                else:
-                    pnl_usdt = 0.0
-                    pnl_pct = 0.0
-
-                record = CloseRecord(
-                    symbol=pos.symbol,
-                    direction=pos.direction,
-                    entry_price=pos.entry_price,
-                    exit_price=exit_price or pos.entry_price,
-                    quantity=pos.quantity,
-                    pnl_usdt=round(pnl_usdt, 4),
-                    pnl_pct=round(pnl_pct, 2),
-                    reason=reason,
-                    opened_at=pos.opened_at,
-                    dca_count=pos.dca_count,
-                    leverage=pos.leverage,
-                    entry_score=pos.entry_score,
-                )
-                self._closed.append(record)
-                # Keep only last 50 records
-                if len(self._closed) > 50:
-                    self._closed = self._closed[-50:]
+                pnl_usdt, pnl_pct = self._calculate_pnl_unlocked(pos, exit_price, pos.quantity)
+                self._append_close_record_unlocked(pos, exit_price or pos.entry_price, pos.quantity, pnl_usdt, pnl_pct, reason)
 
                 self._persist()
                 self._record_equity_snapshot_unlocked()
@@ -290,6 +263,51 @@ class PositionTracker:
                     symbol, pos.direction, reason, pnl_usdt, pnl_pct,
                 )
             return pos
+
+    def _calculate_pnl_unlocked(
+        self,
+        pos: Position,
+        exit_price: Optional[float],
+        quantity: float,
+    ) -> tuple[float, float]:
+        """Calculate realized PnL for a full or partial close. Caller holds _lock."""
+        if exit_price is None or exit_price <= 0 or pos.entry_price <= 0 or quantity <= 0:
+            return 0.0, 0.0
+        if pos.direction == "LONG":
+            pnl_usdt = (exit_price - pos.entry_price) * quantity
+            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+        else:
+            pnl_usdt = (pos.entry_price - exit_price) * quantity
+            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price * 100
+        return pnl_usdt, pnl_pct
+
+    def _append_close_record_unlocked(
+        self,
+        pos: Position,
+        exit_price: float,
+        quantity: float,
+        pnl_usdt: float,
+        pnl_pct: float,
+        reason: str,
+    ) -> None:
+        """Append a close record for realized PnL accounting. Caller holds _lock."""
+        record = CloseRecord(
+            symbol=pos.symbol,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            pnl_usdt=round(pnl_usdt, 4),
+            pnl_pct=round(pnl_pct, 2),
+            reason=reason,
+            opened_at=pos.opened_at,
+            dca_count=pos.dca_count,
+            leverage=pos.leverage,
+            entry_score=pos.entry_score,
+        )
+        self._closed.append(record)
+        if len(self._closed) > 50:
+            self._closed = self._closed[-50:]
 
     def get_recent_closed(self, n: int = 10) -> list[CloseRecord]:
         """Return the most recent N closed position records."""
@@ -347,7 +365,7 @@ class PositionTracker:
 
         Unlike ``reduce_position``, this method:
         - Updates ``de_risk_level`` on the position (level only moves upward).
-        - Does NOT create a CloseRecord (the position remains open).
+        - Creates a CloseRecord for the realized partial PnL.
         - Is idempotent for a given level (will not re-fire the same level).
 
         Args:
@@ -387,6 +405,10 @@ class PositionTracker:
                     de_risk_level, pos.quantity, symbol, current_price,
                 )
                 return self.close_position(symbol, exit_price=current_price, reason=f"DE_RISK_{de_risk_level}")
+            pnl_usdt, pnl_pct = self._calculate_pnl_unlocked(pos, current_price, clamped_qty)
+            self._append_close_record_unlocked(
+                pos, current_price, clamped_qty, pnl_usdt, pnl_pct, f"DE_RISK_{de_risk_level}",
+            )
             pos.quantity -= clamped_qty
             pos.de_risk_level = de_risk_level
             self._persist()
@@ -410,16 +432,42 @@ class PositionTracker:
         with self._lock:
             return self._positions.get(symbol)
 
-    def get_exposure(self) -> float:
-        """Total exposure as a fraction of account balance (0.0–1.0)."""
-        with self._lock:
-            return self._get_exposure_unlocked()
+    def get_exposure(
+        self,
+        mark_prices: Optional[dict[str, float]] = None,
+        include_unrealized: bool = False,
+    ) -> float:
+        """Total mark/notional exposure as a fraction of balance or equity.
 
-    def _get_exposure_unlocked(self) -> float:
-        total_value = sum(p.entry_price * p.quantity for p in self._positions.values())
-        if self._account_balance <= 0:
+        Args:
+            mark_prices: Optional symbol → current mark price map. Missing
+                symbols fall back to entry price for backward compatibility.
+            include_unrealized: If True, denominator is balance plus floating
+                PnL computed from ``mark_prices``.
+        """
+        with self._lock:
+            return self._get_exposure_unlocked(mark_prices, include_unrealized)
+
+    def _get_exposure_unlocked(
+        self,
+        mark_prices: Optional[dict[str, float]] = None,
+        include_unrealized: bool = False,
+    ) -> float:
+        total_value = 0.0
+        floating_pnl = 0.0
+        prices = mark_prices or {}
+        for pos in self._positions.values():
+            mark = float(prices.get(pos.symbol, pos.entry_price) or pos.entry_price)
+            total_value += mark * pos.quantity
+            if include_unrealized:
+                if pos.direction == "LONG":
+                    floating_pnl += (mark - pos.entry_price) * pos.quantity
+                else:
+                    floating_pnl += (pos.entry_price - mark) * pos.quantity
+        denominator = self._account_balance + floating_pnl if include_unrealized else self._account_balance
+        if denominator <= 0:
             return 1.0
-        return total_value / self._account_balance
+        return total_value / denominator
 
     # ------------------------------------------------------------------
     # Equity curve tracking

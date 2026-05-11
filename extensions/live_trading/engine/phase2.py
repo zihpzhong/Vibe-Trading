@@ -166,7 +166,7 @@ Rules:
 - 24h Change: {req.change_24h:+.2f}%
 - RSI(1h): {req.rsi_1h:.1f}
 - Current Price: ${ticker.get("last", "N/A")}
-- 24h Volume: ${ticker.get("volume", "N/A")}
+- 24h Volume: ${ticker.get("volume24h", ticker.get("volume", "N/A"))}
 
 ## Required Dimensions (load_skill per dim)
 {dim_list}

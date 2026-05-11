@@ -19,8 +19,11 @@ from .position_tracker import PositionTracker
 logger = logging.getLogger(__name__)
 
 # Phase 2 dimension sets per tier
-FAST_TRACK_DIMS = ["dim1", "dim3"]  # Technical + Funding
-ENHANCED_DIMS = ["dim1", "dim2", "dim3", "dim4", "dim8"]  # Tech + OnChain + Funding + Sentiment + Correlation
+FAST_TRACK_DIMS = ["dim1", "dim3", "dim5", "dim6", "dim7"]
+"""High-score checks: technical, derivatives, volatility, microstructure, risk."""
+
+ENHANCED_DIMS = ["dim1", "dim2", "dim3", "dim4", "dim5", "dim6", "dim7", "dim8"]
+"""Medium-score checks: full skill coverage, including deterministic risk dimensions."""
 
 
 class TradingScheduler:
@@ -119,8 +122,8 @@ class TradingScheduler:
     def _score_to_request(ranking: dict) -> Optional[Phase2Request]:
         """Convert a Phase 1 ranking entry into a Phase2Request based on score tier.
 
-        Score ≥ 7 → fast_track (dim1=Technical, dim3=Derivatives)
-        Score 5-6 → enhanced (dim1..dim4, dim8)
+        Score ≥ 7 → fast_track (tech + derivatives + volatility + microstructure + risk)
+        Score 5-6 → enhanced (all 8 dimensions)
         Score < 5  → None (watchlist only)
         """
         score = ranking.get("score", 0)

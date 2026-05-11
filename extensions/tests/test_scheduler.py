@@ -119,6 +119,7 @@ class TestScoreToRequest:
         assert req is not None
         assert req.tier == "fast_track"
         assert req.dims == FAST_TRACK_DIMS
+        assert {"dim5", "dim6", "dim7"}.issubset(req.dims)
         assert req.symbol == "A"
 
     def test_score_5_to_6_enhanced(self) -> None:
@@ -127,6 +128,7 @@ class TestScoreToRequest:
         assert req is not None
         assert req.tier == "enhanced"
         assert req.dims == ENHANCED_DIMS
+        assert {"dim5", "dim6", "dim7"}.issubset(req.dims)
 
     def test_score_below_5_returns_none(self) -> None:
         ranking = {"symbol": "C", "direction": "LONG", "score": 4}

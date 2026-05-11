@@ -4,9 +4,9 @@
   BTC传导 → Phase 1 扫描 → ATR止损 → Execution Gate → 自动开仓 → TP/SL守护
 
 Usage:
-    python extensions/run_live_trading.py              # 实盘全自动
+    python extensions/run_live_trading.py              # 默认 dry-run，仅扫描不交易
     python extensions/run_live_trading.py --mock       # 模拟测试
-    python extensions/run_live_trading.py --dry-run    # 仅扫描不交易
+    python extensions/run_live_trading.py --live --confirm-live I_UNDERSTAND
 """
 
 from __future__ import annotations
@@ -16,14 +16,38 @@ import logging
 import os
 import signal as _signal
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+except ModuleNotFoundError:
+    class Console:  # type: ignore[no-redef]
+        def print(self, *args, **kwargs) -> None:
+            print(*args)
+
+    class Table:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs) -> None:
+            self._rows: list[tuple[str, ...]] = []
+
+        def add_column(self, *args, **kwargs) -> None:
+            return None
+
+        def add_row(self, *args: str, **kwargs) -> None:
+            self._rows.append(tuple(args))
+
+        def __str__(self) -> str:
+            return "\n".join(" ".join(row) for row in self._rows)
+
+    class Panel:  # type: ignore[no-redef]
+        @staticmethod
+        def fit(text: str, *args, **kwargs) -> str:
+            return text
 
 # ------------------------------------------------------------
 # 确保能找到 extensions/ 和 agent/src 包
@@ -36,8 +60,12 @@ sys.path.insert(0, str(_SCRIPT_DIR))
 from logging.handlers import RotatingFileHandler
 
 # 日志目录
-_LOG_DIR = Path.home() / ".vibe-trading" / "logs"
-_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_DIR = Path(os.environ.get("VIBE_TRADING_LOG_DIR", Path.home() / ".vibe-trading" / "logs"))
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+except (PermissionError, OSError):
+    _LOG_DIR = Path(tempfile.gettempdir()) / "vibe-trading" / "logs"
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # 文件日志（带轮转，保留 7 天）
 _file_handler = RotatingFileHandler(
@@ -66,25 +94,64 @@ console = Console()
 DEFAULT_POSITION_SIZE_PCT = 0.05  # 5% of account
 # 默认R:R = 2:1 计算止盈
 DEFAULT_REWARD_RISK_RATIO = 2.0
+LIVE_CONFIRM_PHRASE = "I_UNDERSTAND"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Vibe Trading 全流程实盘自动交易系统")
     parser.add_argument("--mock", action="store_true", help="使用模拟交易所（测试用）")
     parser.add_argument("--dry-run", action="store_true", help="扫描但不交易")
+    parser.add_argument("--live", action="store_true", help="显式启用真实下单")
+    parser.add_argument(
+        "--confirm-live",
+        default="",
+        help=f"实盘确认短语，必须为 {LIVE_CONFIRM_PHRASE}",
+    )
     parser.add_argument("--interval", type=int, default=10, help="扫描间隔（分钟）")
     parser.add_argument("--balance", type=float, default=50.0, help="账户 USDT 余额")
     parser.add_argument("--mode", choices=["default", "conservative", "aggressive"],
                         default="default", help="风控模式")
     parser.add_argument("--position-size", type=float, default=DEFAULT_POSITION_SIZE_PCT,
-                        help=f"单次开仓保证金比例 (默认 {DEFAULT_POSITION_SIZE_PCT:.0%})")
+                        help=f"单次开仓保证金比例 (默认 {DEFAULT_POSITION_SIZE_PCT * 100:.0f}%%)")
     parser.add_argument("--rr", type=float, default=DEFAULT_REWARD_RISK_RATIO,
                         help=f"目标 R:R 止盈比 (默认 {DEFAULT_REWARD_RISK_RATIO}:1)")
     parser.add_argument("--max-leverage", type=int, default=5,
                         help="最大杠杆倍数 (默认 5), score≥7 用最大值, score 5-6 用半值")
     parser.add_argument("--no-phase2", action="store_true",
                         help="跳过 Phase 2 LLM 深度分析 (仅 Phase 1 + Gate)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.live and args.dry_run:
+        parser.error("--live and --dry-run cannot be used together")
+    args.dry_run = not args.live
+    return args
+
+
+def validate_live_mode(args: argparse.Namespace) -> str:
+    """Return an error string if live trading was requested unsafely."""
+    if args.live and args.confirm_live != LIVE_CONFIRM_PHRASE:
+        return f"Live trading requires --confirm-live {LIVE_CONFIRM_PHRASE}"
+    return ""
+
+
+def estimate_max_order_notional(
+    balance: float,
+    position_size: float,
+    max_leverage: int,
+    max_position_pct: float,
+) -> float:
+    """Estimate the largest initial order notional possible under current knobs."""
+    effective_position_size = min(position_size, max_position_pct / 100)
+    return min(balance * effective_position_size * max_leverage, balance)
+
+
+def validate_min_order_notional(max_order_notional: float, min_notional: float = 20.0) -> str:
+    """Return an error string when the config cannot meet exchange min notional."""
+    if max_order_notional < min_notional:
+        return (
+            f"当前 balance/position-size/leverage 组合最大名义价值 ${max_order_notional:.2f} "
+            f"< ${min_notional:.2f} 最小下单名义价值"
+        )
+    return ""
 
 
 def build_status_table(
@@ -112,6 +179,11 @@ def build_status_table(
 
 def main() -> int:
     args = parse_args()
+    live_mode_error = validate_live_mode(args)
+    if live_mode_error:
+        log.error(live_mode_error)
+        console.print(f"[red]{live_mode_error}[/red]")
+        return 2
 
     # ---- 导入 (from extensions, not upstream) ----
     from extensions.live_trading.engine.exchange import create_exchange
@@ -206,6 +278,7 @@ def main() -> int:
         exchange, positions, poll_interval=5.0,
         de_risk_config=config.de_risk,
         dca_config=config.dca,
+        dca_gate_engine=gate_engine,
         max_leverage=args.max_leverage,
         position_size_pct=args.position_size,
     )
@@ -325,6 +398,22 @@ def main() -> int:
             return self._realized_pnl
 
     daily_risk = DailyRiskTracker(max_daily_loss_pct=0.10, cooldown_hours=4.0)
+
+    max_initial_notional = estimate_max_order_notional(
+        balance=positions.account_balance,
+        position_size=args.position_size,
+        max_leverage=args.max_leverage,
+        max_position_pct=config.execution_gate.max_position_pct,
+    )
+    min_notional_error = validate_min_order_notional(max_initial_notional, config.dca.dca_min_notional_usdt)
+    if min_notional_error:
+        if args.live:
+            log.error(min_notional_error)
+            console.print(f"[red]{min_notional_error}[/red]")
+            monitor.stop(timeout=5.0)
+            return 1
+        log.warning(min_notional_error)
+        console.print(f"[yellow]{min_notional_error}；dry-run 继续，仅用于观察信号[/yellow]")
 
     # ---- 信号处理 ----
     stop_event = Event()
@@ -539,44 +628,44 @@ def main() -> int:
                     if phase2_analyzer and req.dims:
                         phase2_result = phase2_analyzer.analyze(req, ticker)
                         if phase2_result:
-                                dims_str = "; ".join(
-                                    f"{d}:{phase2_result.get('dimensions', {}).get(d, {}).get('verdict', '?')}"
-                                    for d in req.dims
+                            dims_str = "; ".join(
+                                f"{d}:{phase2_result.get('dimensions', {}).get(d, {}).get('verdict', '?')}"
+                                for d in req.dims
+                            )
+                            consensus = phase2_result.get("consensus", "NEUTRAL")
+                            summary = phase2_result.get("summary", "")
+                            if consensus == "FAIL":
+                                console.print(
+                                    f"  {symbol:12s} [red]PHASE2 FAIL[/red] — {summary}"
                                 )
-                                consensus = phase2_result.get("consensus", "PASS")
-                                summary = phase2_result.get("summary", "")
-                                if consensus == "FAIL":
+                                console.print(f"           {dims_str}")
+                                continue
+                            elif consensus == "NEUTRAL":
+                                # fast_track: Phase 1 评分已确认技术信号, LLM 保守可放过
+                                if req.tier == "fast_track":
                                     console.print(
-                                        f"  {symbol:12s} [red]PHASE2 FAIL[/red] — {summary}"
-                                    )
-                                    console.print(f"           {dims_str}")
-                                    continue
-                                elif consensus == "NEUTRAL":
-                                    # fast_track: Phase 1 评分已确认技术信号, LLM 保守可放过
-                                    if req.tier == "fast_track":
-                                        console.print(
-                                            f"  {symbol:12s} [green]PHASE2 FAST_TRACK PASS[/green] — {summary}"
-                                        )
-                                        console.print(f"           {dims_str}")
-                                        watch_only_flag = False
-                                    else:
-                                        console.print(
-                                            f"  {symbol:12s} [yellow]PHASE2 NEUTRAL[/yellow] — {summary}"
-                                        )
-                                        console.print(f"           {dims_str}")
-                                        watch_only_flag = True
-                                else:
-                                    console.print(
-                                        f"  {symbol:12s} [green]PHASE2 PASS[/green] — {summary}"
+                                        f"  {symbol:12s} [green]PHASE2 FAST_TRACK PASS[/green] — {summary}"
                                     )
                                     console.print(f"           {dims_str}")
                                     watch_only_flag = False
+                                else:
+                                    console.print(
+                                        f"  {symbol:12s} [yellow]PHASE2 NEUTRAL[/yellow] — {summary}"
+                                    )
+                                    console.print(f"           {dims_str}")
+                                    watch_only_flag = True
                             else:
-                                # Phase 2 分析失败（如 LLM JSON 解析错误），保守降级
                                 console.print(
-                                    f"  {symbol:12s} [yellow]PHASE2 ERROR[/yellow] — LLM analysis failed, defaulting to WATCH_ONLY"
+                                    f"  {symbol:12s} [green]PHASE2 PASS[/green] — {summary}"
                                 )
-                                watch_only_flag = True
+                                console.print(f"           {dims_str}")
+                                watch_only_flag = False
+                        else:
+                            # Phase 2 分析失败（如 LLM JSON 解析错误），保守降级
+                            console.print(
+                                f"  {symbol:12s} [yellow]PHASE2 ERROR[/yellow] — LLM analysis failed, defaulting to WATCH_ONLY"
+                            )
+                            watch_only_flag = True
                     else:
                         watch_only_flag = False
 
@@ -606,11 +695,11 @@ def main() -> int:
                         continue
 
                     # 2d. 获取资金费率
-                    funding_rate = 0.0
+                    funding_rate = None
                     try:
                         funding_rate = exchange.get_funding_rate(symbol)
-                    except Exception:
-                        pass  # 非 futures 交易对无资金费率，跳过
+                    except Exception as exc:
+                        log.warning("Funding rate fetch failed for %s: %s", symbol, exc)
 
                     # 2e. 计算预期下单量（Gate 需要此值做盘口冲击检查）
                     max_lev = args.max_leverage

@@ -2,26 +2,26 @@
 
 ## Context
 
-当前**全部 7 个 User Story 已实现并部署**，覆盖实盘交易完整链路：
+当前自动交易链路已实现，覆盖实盘前的扫描、复核、Gate、开仓、持仓管理和退出风控：
 
-- `_real_exchange.py` — Binance 直连 HTTP（非 ccxt，HMAC-SHA256 签名，3 次指数退避重试）
+- `_real_exchange.py` — Binance 直连 HTTP（默认 futures，HMAC-SHA256 签名，3 次指数退避重试）
 - `market_scanner.py` — Phase 1 纯代码扫描（7 指标 + 双向 10 分制评分 + 趋势过滤清零）
-- `position_tracker.py` — 持仓管理（RLock 保护 + JSON 持久化 + DCA/DeRisk 支持）
-- `tpsl_monitor.py` — 止盈止损守护线程（DCA → Trailing Stop → TP → DeRisk → SL 5 步联检）
-- `scheduler.py` — 调度引擎（BTC 传导 → Phase 1 → 分级决策 → Phase2Request）
-- `execution_gate.py` — 5 项 Gate 校验（流动性、资金费率、盘口冲击、R:R、仓位上限）
+- `position_tracker.py` — 持仓管理（RLock 保护 + JSON 持久化 + mark/equity exposure + DCA/DeRisk 已实现盈亏记录）
+- `tpsl_monitor.py` — 止盈止损守护线程（Trailing Stop → SL → DCA Gate → TP → DeRisk 5 步联检）
+- `scheduler.py` — 调度引擎（BTC 传导 → Phase 1 → 分级决策 → Phase2Request，接入 dim5/6/7 风控维度）
+- `execution_gate.py` — 5 项 Gate 校验（流动性、资金费率、盘口冲击、R:R、仓位上限；硬失败直接 REJECT）
 - `btc_conduction.py` — BTC 4h 趋势联动锁定 + 1h 短期趋势检查
 - `atr_stop.py` — Wilder 平滑 ATR(14) 动态止损计算
 - `phase2.py` — Phase 2 LLM 分析，SkillsLoader + ChatLLM 8 维评分
 - `config.py` — 完整配置体系（DeRisk + DCA + ATR + Gate + BTC + Funding）
-- 40+ 个单元测试全部通过
+- 扩展测试覆盖 Gate、ATR、Scheduler、Phase2、PositionTracker、TPSLMonitor、RealExchange 与入口安全
 
 ### 部署架构 vs 原方案差异
 
 | 维度 | 原方案 | 实际实现 |
 |------|--------|---------|
 | RealExchange | ccxt (`fetch_ohlcv`, `fetch_ticker` 等) | **直连 HTTP** (`requests.get` → `api.binance.com`)，避免 ccxt load_markets 开销 |
-| 批量行情 | `ccxt.fetch_tickers()` | `/api/v3/ticker/24hr` 单次获取全部 USDT 交易对 |
+| 批量行情 | `ccxt.fetch_tickers()` | futures 默认 `/fapi/v1/ticker/24hr`，spot 模式 `/api/v3/ticker/24hr` |
 | K线数据 | ccxt `fetch_ohlcv()` | `/api/v3/klines` 直连，futures 不可用时自动 fallback 到 spot |
 | 签名方式 | ccxt 内置 | **HMAC-SHA256** 自实现，无第三方依赖 |
 | 部署方式 | 未指定 | **`python run_live_trading.py`** 直接进程运行（非 Docker） |
@@ -29,12 +29,12 @@
 | Docker 权限 | `vibe` 非 root | `user: root` + `HOME=/home/vibe` |
 | 持仓持久化 | 直接写入 | `_persist()` 加 `try/except PermissionError`，不可写时降级内存 |
 | 稳定币过滤 | 无 | 14 种稳定币被过滤 |
-| 合约可用性 | 无 | 仅返回 `_valid_symbols` 中的合约币种 |
+| 合约可用性 | 无 | `BINANCE_MARKET_TYPE` 默认 `future`，仅返回 `_valid_symbols` 中的合约币种 |
 | SSL 连接 | 裸 `requests.get()` | `requests.Session` + 连接池 (pool_maxsize=20) + urllib3 Retry |
 | 过滤可见性 | 静默 | INFO 日志记录稳定币过滤；合约过滤 DEBUG 级别 |
 | 持仓模式 | 双向持仓 | **单向持仓 (one-way)** — `set_position_mode(dual=False)` |
 | 保证金模式 | 全仓 | **逐仓 (ISOLATED)** — 开仓前设置，已有持仓时回退全仓 |
-| 风控 | 基础 TP/SL | **DCA 阶梯加仓 + DeRisk 分级减仓 + Trailing Stop + Doom + 日亏损熔断** |
+| 风控 | 基础 TP/SL | **SL 优先 + DCA 前重跑 Gate + DeRisk 实现盈亏记录 + Trailing Stop + Doom + 日亏损熔断** |
 
 ## 完整交易流程图
 
@@ -95,9 +95,8 @@ flowchart TD
     RANK -->|Score 3-4| WATCH[watchlist: 记录不分析]
     RANK -->|Score ≥ 5| TIER{分级决策}
 
-    TIER -->|Score ≥ 7| FAST[fast_track<br>Phase 2 必做<br>2 LLM dims: 技术+合约]
-    TIER -->|Score = 6| ENHANCED[enhanced<br>Phase 2 必做<br>5 LLM dims: 技术+链上+合约+情绪+相关]
-    TIER -->|Score = 5| NOLLM[直接走 Gate<br>无 LLM 分析]
+    TIER -->|Score ≥ 7| FAST[fast_track<br>Phase 2 必做<br>5 dims: 技术+合约+波动率+微观结构+风险]
+    TIER -->|Score 5-6| ENHANCED[enhanced<br>Phase 2 必做<br>8 dims: 全维度复核]
     TIER -->|Score < 5| END[watchlist: 不生成请求]
 ```
 
@@ -167,9 +166,9 @@ flowchart TD
     C1 -->|有效| D1
 
     %% 2c
-    D1{"score < 6?"}:::dec
-    D1 -->|Yes| D2["watch_only=False<br>跳过 Phase 2"]:::ok
-    D1 -->|No| D3["Phase2Analyzer.analyze()"]:::proc
+    D1{"--no-phase2?"}:::dec
+    D1 -->|Yes| D2["watch_only=False<br>仅 Phase 1 + Gate"]:::ok
+    D1 -->|No| D3["Phase2Analyzer.analyze()<br>score≥5 均复核"]:::proc
     D3 --> D4{"consensus?"}:::dec
     D4 -->|PASS| D5["watch_only=False"]:::ok
     D4 -->|NEUTRAL| D6{"tier?"}:::dec
@@ -203,9 +202,9 @@ flowchart TD
     end
 
     F2 --> G1
-    G6 -->|funding_rate 失败| GS1["REJECT: 硬拦"]:::skip
-    G6 -->|≥ 2项 失败| GS2["REJECT"]:::skip
-    G6 -->|1项 失败| GS3["WATCH_ONLY"]:::watch
+    G6 -->|funding/orderbook/R:R/position_cap 失败| GS1["REJECT: 硬失败"]:::skip
+    G6 -->|其他 ≥ 2项失败| GS2["REJECT"]:::skip
+    G6 -->|仅 liquidity 等软失败 1项| GS3["WATCH_ONLY"]:::watch
     G6 -->|全部通过| GS4["PASS"]:::ok
 
     %% Phase 2 override
@@ -247,31 +246,31 @@ flowchart TD
     LOOP(["每 5s 轮询"]) --> PRICE["批量获取所有持仓价格"]:::proc
     PRICE --> FOR["FOR EACH 活跃持仓"]:::dec
 
-    FOR --> DCA["1. DCA 阶梯加仓"]:::dec
-    DCA -->|亏损≥5% 且条件满足| DCA_EXEC["阶梯加仓<br>1.25x/1.5x/1.75x 杠杆减半"]:::action
-    DCA -->|不触发| TRAIL
-
-    DCA_EXEC --> TRAIL
-    TRAIL["2. Trailing Stop"]:::dec
+    FOR --> TRAIL["1. Trailing Stop"]:::dec
     TRAIL -->|浮盈≥3%| TRAIL_EXEC["更新 trailing_sl<br>单向移动, 永不回退"]:::action
-    TRAIL -->|不触发| TP
+    TRAIL -->|不触发| SL
 
-    TRAIL_EXEC --> TP
-    TP["3. 止盈 TP"]:::dec
+    TRAIL_EXEC --> SL
+    SL["2. 硬止损 SL"]:::dec
+    SL -->|价格触及| SL_EXEC["市价平仓 (reduce_only)<br>SL 优先于 DCA"]:::close
+    SL -->|不触发| DCA
+
+    SL_EXEC --> NEXT
+    DCA["3. DCA 阶梯加仓"]:::dec
+    DCA -->|亏损≥5% 且 Gate=PASS| DCA_EXEC["重跑 Gate 后阶梯加仓<br>1.25x/1.5x/1.75x 杠杆减半"]:::action
+    DCA -->|不触发/ Gate失败| TP
+
+    DCA_EXEC --> TP
+    TP["4. 止盈 TP"]:::dec
     TP -->|价格达标| TP_EXEC["市价平仓 (reduce_only)<br>3x 重试, dust 处理"]:::close
     TP -->|不触发| DERISK
 
     TP_EXEC --> NEXT
-    DERISK["4. DeRisk 分级减仓"]:::dec
+    DERISK["5. DeRisk 分级减仓"]:::dec
     DERISK -->|≥5% 卖15%, ≥8% 卖30%<br>≥12% 卖50%, ≥18% 全平| DERISK_EXEC["部分平仓<br>level 只升不降"]:::close
-    DERISK -->|不触发| SL
+    DERISK -->|不触发| NEXT
 
     DERISK_EXEC --> NEXT
-    SL["5. 硬止损 SL"]:::dec
-    SL -->|价格触及| SL_EXEC["市价平仓 (reduce_only)<br>effective_sl=trailing vs fixed 取优"]:::close
-    SL -->|不触发| NEXT
-
-    SL_EXEC --> NEXT
     NEXT["下一持仓"]:::dec -->|还有持仓| FOR
     NEXT -->|全部检查完| PERSIST["持久化 trailing_stops + peak_prices"]:::proc
     PERSIST --> LOOP
@@ -326,7 +325,8 @@ flowchart TD
 | TP/SL 监控 | `tpsl_monitor.TPSLMonitor` (Thread, 5s 轮询, 批量 ticker) | 代码 | ✅ |
 | 日亏损熔断 | `DailyRiskTracker` (内联在 run_live_trading.py) | 代码 | ✅ |
 | 主循环集成 | `run_live_trading.py` 主循环 → Phase2Analyzer → ATR → Gate → 下单 | 代码 | ✅ |
-| 部署 | `python extensions/run_live_trading.py --balance 50 --interval 15` | 部署 | ✅ 运行中 |
+| 启动 | `python extensions/run_live_trading.py --balance 50 --interval 15` | dry-run | ✅ 默认观察模式 |
+| 实盘启动 | `python extensions/run_live_trading.py --live --confirm-live I_UNDERSTAND ...` | live | ✅ 显式确认 |
 
 ## 配置体系 (config.py)
 
@@ -365,7 +365,8 @@ class ATRStopConfig:
     multiplier_default: float = 2.0        # 2.0 × ATR(14)
     multiplier_conservative: float = 1.5   # 保守 1.5 × ATR(14)
     period: int = 14
-    min_stop_distance_pct: float = 8.0     # 最小止损距离，保 DCA 空间
+    min_stop_distance_pct: float = 3.0     # 止损距离下限，避免噪声止损
+    max_stop_distance_pct: float = 8.0     # 止损距离上限，避免 TP 过远
 ```
 
 ### ExecutionGateConfig — 开仓校验
@@ -473,11 +474,11 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 ### 5 步联检 (每持仓每轮)
 
 ```
-1. DCA 检查       ← 亏损 ≥ 5% → 阶梯加仓 (1.25×/1.5×/1.75×)
-2. Trailing Stop  ← 浮盈 ≥ 3% → 追踪锁定利润 (1.5% 距离)
-3. 止盈 TP        ← 价格达标 → 市价平仓 (时间衰减或无固定 TP)
-4. DeRisk 减仓    ← 亏损扩大 → 分级减仓 (15%/30%/50%)
-5. 硬止损 SL      ← 价格触及 → 市价平仓 (最后防线)
+1. Trailing Stop  ← 浮盈 ≥ 3% → 追踪锁定利润 (1.5% 距离)
+2. 硬止损 SL      ← 价格触及 → 市价平仓；优先于 DCA
+3. DCA 检查       ← 亏损 ≥ 5% 且简化 Gate=PASS → 阶梯加仓
+4. 止盈 TP        ← 固定 TP 与时间衰减阈值取更近者
+5. DeRisk 减仓    ← 亏损扩大 → 分级减仓并记录已实现盈亏
 ```
 
 ### 执行保障
@@ -488,7 +489,7 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 - **事件回调**：`on_take_profit` / `on_stop_loss` / `on_error`
 - **Trailing stop 持久化**：重启恢复 trailing_stops + peak_prices
 
-### 时间衰减止盈 (no-fixed-TP 场景)
+### 时间衰减止盈
 
 | 持仓时间 | TP 阈值 |
 |----------|---------|
@@ -497,7 +498,7 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 | 60-120 min | +1% |
 | > 120 min | +0.1% (保本附近) |
 
-固定 `take_profit` 优先使用。
+若持仓同时有固定 `take_profit`，系统取固定 TP 与时间衰减 TP 中**更近的盈利阈值**，避免高 R:R 目标过远导致盈利长期不落袋。
 
 ### DeRisk 执行细节
 
@@ -506,6 +507,7 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 - Level 4(Doom) = 全平，不走 partial_exit
 - 空仓时自动改 full close
 - Binance $20 最小名义价值跳过
+- 部分减仓会写入 `CloseRecord`，纳入日亏损熔断和绩效统计
 
 ### DCA 执行细节
 
@@ -513,6 +515,7 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 - 暴露率检查：加仓后总敞口 ≤ max_exposure_pct
 - 账户级保护：该仓位累计亏损 ≤ max_account_loss_pct
 - 杠杆减半：`max_leverage // 2`
+- 实盘主循环传入 `ExecGateEngine` 后，DCA 前重跑简化 Gate：ticker、funding、orderbook impact、position cap；funding/orderbook 缺失时跳过加仓
 
 ## 主循环完整流程 (run_live_trading.py)
 
@@ -531,9 +534,9 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
   ├─ FOR each Phase2Request:
   │   ├─ can_open_new + is_in_cooldown
   │   ├─ BTC 1h 反方向过滤
-  │   ├─ Phase 2 LLM (score≥6 才调用)
+  │   ├─ Phase 2 LLM (score≥5 均调用；--no-phase2 时跳过)
   │   │   PASS→继续 / FAIL→跳过 / NEUTRAL→fast_track放过,enhanced降级
-  │   ├─ ATR stop + 动态 R:R (Score≥8→4:1, ≥7→3:1, ≥6→2.5:1)
+  │   ├─ ATR stop (3%-8% 距离约束) + 动态 R:R (Score≥8→4:1, ≥7→3:1, ≥6→2.5:1)
   │   ├─ 动态杠杆 (Score≥7→max, 5-6→max//2)
   │   ├─ Execution Gate (5 项)
   │   └─ PASS → set_leverage + set_margin + market_order
@@ -547,27 +550,30 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 | CLI 标志 | 效果 |
 |----------|------|
 | `--mock` | 使用 MockExchange 模拟 |
-| `--dry-run` | 扫描评估但不执行订单 |
+| 默认 / `--dry-run` | 扫描评估但不执行订单 |
+| `--live --confirm-live I_UNDERSTAND` | 显式启用真实下单 |
 | `--no-phase2` | 跳过 LLM 分析，仅 Phase 1 + Gate |
+
+启动时会估算 `balance × min(position_size, max_position_pct) × max_leverage` 的最大初始名义价值。若低于 Binance $20 最小名义价值，dry-run 仅告警继续，live 模式直接退出。
 
 ## 文件变更清单
 
 | 文件 | 状态 | 说明 |
 |------|------|------|
-| `extensions/live_trading/engine/_real_exchange.py` | ✅ | Binance 直连 HTTP (HMAC-SHA256, urllib3 Retry, pool_maxsize=20) |
+| `extensions/live_trading/engine/_real_exchange.py` | ✅ | Binance 直连 HTTP (默认 futures, fapi ticker/depth, HMAC-SHA256, urllib3 Retry) |
 | `extensions/live_trading/engine/market_scanner.py` | ✅ | Phase 1 纯代码扫描 (7 指标+10分制+稳定币过滤) |
-| `extensions/live_trading/engine/position_tracker.py` | ✅ | 持仓管理 (RLock + DCA/DeRisk 支持 + trailing 持久化) |
-| `extensions/live_trading/engine/tpsl_monitor.py` | ✅ | TP/SL 守护 (DCA+Trailing+TP+DeRisk+SL 5步联检) |
-| `extensions/live_trading/engine/scheduler.py` | ✅ | 扫描调度引擎 (BTC → Phase 1 → 分级决策) |
-| `extensions/live_trading/engine/atr_stop.py` | ✅ | Wilder ATR(14) 动态止损 |
-| `extensions/live_trading/engine/execution_gate.py` | ✅ | 5 项 Gate 校验 (含盘口冲击模拟) |
-| `extensions/live_trading/engine/phase2.py` | ✅ | Phase 2 LLM 分析 (SkillsLoader + ChatLLM) |
+| `extensions/live_trading/engine/position_tracker.py` | ✅ | 持仓管理 (mark/equity exposure + DeRisk CloseRecord + trailing 持久化) |
+| `extensions/live_trading/engine/tpsl_monitor.py` | ✅ | TP/SL 守护 (SL优先 + DCA Gate + 时间衰减TP + DeRisk) |
+| `extensions/live_trading/engine/scheduler.py` | ✅ | 扫描调度引擎 (BTC → Phase 1 → score≥5 Phase2Request) |
+| `extensions/live_trading/engine/atr_stop.py` | ✅ | Wilder ATR(14) 动态止损 (3%-8% 距离约束) |
+| `extensions/live_trading/engine/execution_gate.py` | ✅ | 5 项 Gate 校验 (硬失败分层 + 盘口冲击模拟) |
+| `extensions/live_trading/engine/phase2.py` | ✅ | Phase 2 LLM 分析 (SkillsLoader + ChatLLM, volume24h 修正) |
 | `extensions/live_trading/engine/btc_conduction.py` | ✅ | BTC 4h 联动 + 1h 趋势检查 |
 | `extensions/live_trading/__init__.py` | ✅ | 包导出 |
 | `extensions/live_trading/models.py` | ✅ | 核心数据模型 |
 | `extensions/live_trading/config.py` | ✅ | 完整配置 (DeRisk + DCA + ATR + Gate + BTC + Funding) |
 | `extensions/tools/live_trading_tool.py` | ✅ | 8 actions (Agent 工具集成) |
-| `extensions/run_live_trading.py` | ✅ | 实盘入口脚本 (含 DailyRiskTracker) |
+| `extensions/run_live_trading.py` | ✅ | 入口脚本 (默认 dry-run, live 显式确认, 最小名义价值检查, DailyRiskTracker) |
 | `extensions/tests/test_live_trading_e2e.py` | ✅ | 端到端集成测试 |
 | `extensions/tests/test_market_scanner.py` | ✅ | 评分规则单元测试 (12+) |
 | `extensions/tests/test_execution_gate.py` | ✅ | Gate 校验测试 |
@@ -575,6 +581,8 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 | `extensions/tests/test_tpsl_monitor.py` | ✅ | TP/SL 测试 |
 | `extensions/tests/test_scheduler.py` | ✅ | 调度器测试 |
 | `extensions/tests/test_real_exchange.py` | ✅ | RealExchange 直连测试 |
+| `extensions/tests/test_phase2.py` | ✅ | Phase2 prompt 数据字段测试 |
+| `extensions/tests/test_run_live_trading_safety.py` | ✅ | 实盘入口安全测试 |
 
 ## 验证计划 — 当前状态
 

@@ -90,6 +90,18 @@ class TestTakeProfit:
         monitor._poll()
         assert tracker.active_count == 0  # triggered by dynamic TP
 
+    def test_time_decay_tp_can_trigger_before_far_fixed_tp(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """Fixed TP and time-decay TP use the nearer threshold, not fixed-only."""
+        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 90.0, 130.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "LONGUSDT", "last": 106.0},  # +6% reaches dynamic +5%, fixed TP still far
+        ])
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor._poll()
+        assert tracker.active_count == 0
+
 
 # ---------------------------------------------------------------------------
 # SL execution
@@ -155,6 +167,56 @@ class TestStopLoss:
         monitor._poll()
         assert tracker.active_count == 0
         exchange.create_market_order.assert_called_once()
+
+    def test_stop_loss_has_priority_over_dca(self, exchange: MockExchange, tracker: PositionTracker) -> None:
+        """SL 已击穿时应先止损，不能先 DCA 扩大亏损仓位."""
+        from extensions.live_trading.config import DCAConfig
+
+        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 95.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "LONGUSDT", "last": 94.0},
+        ])
+        monitor = TPSLMonitor(
+            exchange, tracker, poll_interval=0.05,
+            dca_config=DCAConfig(enabled=True),
+            max_leverage=5,
+            position_size_pct=0.05,
+        )
+        monitor._poll()
+        assert tracker.active_count == 0
+        closed = tracker.get_recent_closed(1)
+        assert closed and closed[-1].reason == "SL"
+
+    def test_dca_gate_rejects_when_funding_unavailable(
+        self, exchange: MockExchange, tracker: PositionTracker,
+    ) -> None:
+        """DCA 前重跑 Gate，funding 缺失时不加仓."""
+        from extensions.live_trading.config import DCAConfig
+        from extensions.live_trading.engine.execution_gate import ExecGateEngine
+
+        tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 80.0, take_profit=120.0)
+        exchange.get_tickers = MagicMock(return_value=[
+            {"symbol": "LONGUSDT", "last": 94.0},
+        ])
+        exchange.get_ticker = MagicMock(return_value={"symbol": "LONGUSDT", "last": 94.0, "volume24h": 5_000_000})
+        exchange.get_funding_rate = MagicMock(side_effect=RuntimeError("funding down"))
+        exchange.get_orderbook = MagicMock(return_value={
+            "bids": [["93.9", "100"]],
+            "asks": [["94.1", "100"]],
+        })
+        monitor = TPSLMonitor(
+            exchange, tracker, poll_interval=0.05,
+            dca_config=DCAConfig(enabled=True),
+            dca_gate_engine=ExecGateEngine(),
+            max_leverage=5,
+            position_size_pct=0.05,
+        )
+
+        monitor._poll()
+
+        pos = tracker.get_position("LONGUSDT")
+        assert pos is not None
+        assert pos.dca_count == 0
 
 
 # ---------------------------------------------------------------------------

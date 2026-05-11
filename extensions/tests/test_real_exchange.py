@@ -186,6 +186,24 @@ class TestTestnetConfig:
         assert ex.is_testnet is True
 
 
+class TestMarketTypeConfig:
+    """RealExchange should default to futures for the auto-trading pipeline."""
+
+    def test_market_type_defaults_to_future(self, monkeypatch) -> None:
+        monkeypatch.delenv("BINANCE_MARKET_TYPE", raising=False)
+        from extensions.live_trading.engine._real_exchange import RealExchange
+        ex = RealExchange()
+        assert ex._market_type == "future"
+        assert "/fapi/v1" in ex._data_prefix
+
+    def test_market_type_can_be_set_to_spot(self, monkeypatch) -> None:
+        monkeypatch.setenv("BINANCE_MARKET_TYPE", "spot")
+        from extensions.live_trading.engine._real_exchange import RealExchange
+        ex = RealExchange()
+        assert ex._market_type == "spot"
+        assert ex._data_prefix.endswith("/api/v3")
+
+
 class TestCreateExchangeFactory:
     """create_exchange factory still works."""
 
