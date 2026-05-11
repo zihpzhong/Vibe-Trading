@@ -184,6 +184,9 @@ def main() -> int:
         max_positions=5,
         max_exposure_pct=5.0,  # 总敞口上限 500%（含杠杆名义价值, 5 仓 × 100%/仓）
     )
+    # 确保 _load() 不覆盖构造函数传入的交易所真实余额
+    if actual_usdt_balance is not None:
+        positions.account_balance = actual_usdt_balance
 
     # ---- Phase 2 分析引擎 ----
     phase2_analyzer = Phase2Analyzer() if not args.no_phase2 else None
@@ -199,9 +202,19 @@ def main() -> int:
     scheduler = TradingScheduler(exchange, positions, trading_enabled=True)
 
     # ---- TP/SL 守护 ----
-    monitor = TPSLMonitor(exchange, positions, poll_interval=5.0)
+    monitor = TPSLMonitor(
+        exchange, positions, poll_interval=5.0,
+        de_risk_config=config.de_risk,
+        dca_config=config.dca,
+        max_leverage=args.max_leverage,
+        position_size_pct=args.position_size,
+    )
     monitor.start()
-    log.info("TPSL Monitor started")
+    log.info("TPSL Monitor started (de-risk: [%.0f%%:%.0f%%, %.0f%%:%.0f%%, %.0f%%:%.0f%%], doom=%.0f%%)",
+             config.de_risk.level1_loss_pct, config.de_risk.level1_sell_fraction * 100,
+             config.de_risk.level2_loss_pct, config.de_risk.level2_sell_fraction * 100,
+             config.de_risk.level3_loss_pct, config.de_risk.level3_sell_fraction * 100,
+             config.de_risk.doom_loss_pct)
 
     # ---- 日亏损熔断 ----
     # ---- 日亏损熔断 ----
@@ -463,16 +476,20 @@ def main() -> int:
             # ================================================================
             # STEP 2: 自动交易 — 对每个 Phase2Request 执行 Gate → 开仓
             # ================================================================
+            # 2aa. 同步实际余额（每轮一次）
+            try:
+                bal = exchange.get_account_balance()
+                if bal and "USDT" in bal:
+                    positions.account_balance = float(bal["USDT"])
+                # 同步可用余额（开仓保证金用）
+                free_bal = exchange.get_available_balance()
+                _available_usdt = float(free_bal.get("USDT", 0)) if free_bal else 0
+            except Exception as exc:
+                log.warning("余额同步失败: %s", exc)
+                _available_usdt = 0
+
             if report.phase2_requests:
                 console.print(f"[bold]--- 自动交易评估 ({'LIVE' if not args.dry_run else 'DRY RUN'}) ---[/bold]")
-
-                # 2aa. 同步实际余额（每轮一次，不在循环内重复）
-                try:
-                    bal = exchange.get_account_balance()
-                    if bal and "USDT" in bal:
-                        positions.account_balance = float(bal["USDT"])
-                except Exception as exc:
-                    log.warning("余额同步失败: %s", exc)
 
                 for req in report.phase2_requests:
                     symbol = req.symbol
@@ -620,7 +637,10 @@ def main() -> int:
                             "%s: position-size %.1f%% capped to gate max_position_pct %.1f%%",
                             symbol, args.position_size * 100, config.execution_gate.max_position_pct,
                         )
-                    position_margin = positions.account_balance * effective_position_size
+                    position_margin = min(
+                        positions.account_balance * effective_position_size,
+                        _available_usdt,
+                    )
                     order_notional = position_margin * leverage
                     order_notional = min(order_notional, positions.account_balance)
                     order_qty = order_notional / entry_price if entry_price > 0 else 0.0
@@ -760,67 +780,6 @@ def main() -> int:
                 else:
                     console.print("[dim]本轮无开仓[/dim]")
 
-                # ---- DCA 检查: 亏损 >= 5% 触发阶梯加仓 ----
-                if not args.dry_run:
-                    try:
-                        for p in positions.get_active_positions():
-                            if p.dca_count >= 3:
-                                continue
-                            t = exchange.get_ticker(p.symbol)
-                            cur = float(t.get("last", 0)) or 0
-                            if cur <= 0:
-                                continue
-                            loss = (cur - p.entry_price) / p.entry_price if p.direction == "LONG" else (p.entry_price - cur) / p.entry_price
-                            if loss >= -0.05:
-                                continue
-                            # DCA 保护: 该仓位累计亏损超过账户 8% 则跳过 DCA
-                            total_cost = p.entry_price * p.quantity
-                            if p.direction == "LONG":
-                                total_unrealized = (cur - p.entry_price) * p.quantity
-                            else:
-                                total_unrealized = (p.entry_price - cur) * p.quantity
-                            loss_pct_of_account = abs(total_unrealized) / positions.account_balance
-                            if loss_pct_of_account > 0.08:
-                                log.warning(
-                                    "DCA SKIP %s: 累计亏损 %.2f USDT (%.1f%% 账户) 超过 8%% 阈值",
-                                    p.symbol, total_unrealized, loss_pct_of_account * 100,
-                                )
-                                console.print(f"  [red]DCA SKIP {p.symbol}: 累计亏损 {abs(total_unrealized):.2f} USDT ({loss_pct_of_account*100:.1f}% 账户)[/red]")
-                                continue
-                            # DCA 暴露率检查: 确保加仓后总暴露不超限
-                            current_exposure = positions.get_exposure()
-                            dca_mult = [1.25, 1.5, 1.75][min(p.dca_count, 2)]
-                            max_exposure = positions.max_exposure_pct  # 动态从 PositionTracker 读取
-                            # DCA 使用减半杠杆
-                            dca_leverage = max(1, args.max_leverage // 2)
-                            effective_position_size = min(
-                                args.position_size,
-                                config.execution_gate.max_position_pct / 100,
-                            )
-                            dca_notional = (positions.account_balance * effective_position_size) * dca_mult * dca_leverage
-                            post_dca_exposure = current_exposure + (dca_notional / positions.account_balance)
-                            if post_dca_exposure > max_exposure:
-                                log.warning(
-                                    "DCA SKIP %s: 加仓后暴露率 %.1f%% 超过上限 %.0f%% (当前 %.1f%%)",
-                                    p.symbol, post_dca_exposure * 100, max_exposure * 100, current_exposure * 100,
-                                )
-                                console.print(
-                                    f"  [yellow]DCA SKIP {p.symbol}: 暴露率 {post_dca_exposure*100:.1f}% > {max_exposure*100:.0f}%[/yellow]"
-                                )
-                                continue
-                            if dca_notional > positions.account_balance * 0.5:
-                                continue
-                            dca_qty = round(dca_notional / cur, 6)
-                            if dca_qty <= 0:
-                                continue
-                            if hasattr(exchange, "set_leverage"):
-                                exchange.set_leverage(p.symbol, leverage=max(1, args.max_leverage // 2))
-                            order = exchange.create_market_order(p.symbol, p.direction.lower(), dca_qty)
-                            log.info("DCA order: %s", order)
-                            positions.adjust_position(p.symbol, dca_qty, cur)
-                            console.print(f"  [cyan]DCA {p.symbol}: +{dca_qty:.4f} @ {cur:.4f} (亏损{loss*100:.1f}%)[/cyan]")
-                    except Exception as exc:
-                        log.warning("DCA check failed: %s", exc)
 
         except Exception as exc:
             log.exception("Cycle #%d failed: %s", cycle_count, exc)

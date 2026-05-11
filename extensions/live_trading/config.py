@@ -19,6 +19,22 @@ class FundingRateConfig:
 
 
 @dataclass
+class DeRiskConfig:
+    """NFI 风格分级减仓（De-risk）配置.
+
+    所有亏损阈值参照 first_entry_cost（首次入场成本），而非平均成本。
+    """
+
+    level1_loss_pct: float = 5.0  # 亏损 ≥ 5% → 触发 level 1
+    level1_sell_fraction: float = 0.15  # 卖出当前仓位的 15%
+    level2_loss_pct: float = 8.0
+    level2_sell_fraction: float = 0.30
+    level3_loss_pct: float = 12.0
+    level3_sell_fraction: float = 0.50
+    doom_loss_pct: float = 18.0  # 亏损 ≥ 18% → 全平
+
+
+@dataclass
 class ATRStopConfig:
     """ATR 动态止损配置."""
 
@@ -46,8 +62,26 @@ class ExecutionGateConfig:
     min_liquidity_usdt: float = 1_000_000  # 最小 24h 交易量
     max_orderbook_impact_pct: float = 0.5  # 最大盘口冲击
     min_risk_reward_ratio: float = 1.0  # 最低 R:R
-    max_position_pct: float = 5.0  # 单币仓位上限 (占资金比例 %)
+    max_position_pct: float = 20.0  # 单币仓位上限 (占资金比例 %)
     signal_cooldown_minutes: int = 30  # 重复信号冷却时间
+
+
+@dataclass
+class DCAConfig:
+    """DCA 阶梯加仓配置.
+
+    All loss thresholds reference ``first_entry_cost`` (not average entry_price),
+    consistent with de-risk, so that DCA triggers do not drift after the
+    first add.
+    """
+
+    enabled: bool = True
+    max_dca_count: int = 3
+    trigger_loss_pct: float = 5.0  # ≥ 5% 亏损触发首次 DCA
+    dca_multipliers: tuple = (1.25, 1.5, 1.75)  # 阶梯乘数
+    dca_leverage_halved: bool = True  # DCA 使用减半杠杆
+    max_account_loss_pct: float = 8.0  # 该仓位累计亏损超过此值则跳过 DCA
+    dca_min_notional_usdt: float = 20.0  # Binance 最小名义价值
 
 
 @dataclass
@@ -64,6 +98,8 @@ class LiveTradingConfig:
     atr_stop: ATRStopConfig = field(default_factory=ATRStopConfig)
     btc_conduction: BTCConductionConfig = field(default_factory=BTCConductionConfig)
     execution_gate: ExecutionGateConfig = field(default_factory=ExecutionGateConfig)
+    de_risk: DeRiskConfig = field(default_factory=DeRiskConfig)
+    dca: DCAConfig = field(default_factory=DCAConfig)
     scan_top_n: int = 20  # Phase 1 扫描数量
     scan_batch_size: int = 5  # 并发批次大小
     default_scan_interval_minutes: int = 15  # 闪电模式默认间隔
