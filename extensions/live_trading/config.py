@@ -102,7 +102,7 @@ class LiveTradingConfig:
     dca: DCAConfig = field(default_factory=DCAConfig)
     scan_top_n: int = 20  # Phase 1 扫描数量
     scan_batch_size: int = 5  # 并发批次大小
-    default_scan_interval_minutes: int = 15  # 闪电模式默认间隔
+    default_scan_interval_minutes: int = 5  # 闪电模式默认间隔
 
     @classmethod
     def aggressive(cls) -> LiveTradingConfig:
