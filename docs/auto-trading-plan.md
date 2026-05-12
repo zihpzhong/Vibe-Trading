@@ -28,7 +28,9 @@
 | Phase 2 分析 | 8 个独立 Skill 文件 | **Phase2Analyzer** (SkillsLoader + ChatLLM, 8 dim→skill 映射, JSON verdict 输出) |
 | Docker 权限 | `vibe` 非 root | `user: root` + `HOME=/home/vibe` |
 | 持仓持久化 | 直接写入 | `_persist()` 加 `try/except PermissionError`，不可写时降级内存 |
-| 稳定币过滤 | 无 | 14 种稳定币被过滤 |
+| 稳定币过滤 | 无 | 13 种稳定币被过滤 |
+| MEME 币黑名单 | 无 | BIO 等极端风险币种被过滤（`_MEMECOIN_BLACKLIST`）|
+| TradFi 协议商品 | 无 | XAG(白银)/XAU(黄金) 需签署 Binance TradFi-Perps 协议，自动跳过 |
 | 合约可用性 | 无 | `BINANCE_MARKET_TYPE` 默认 `future`，仅返回 `_valid_symbols` 中的合约币种 |
 | SSL 连接 | 裸 `requests.get()` | `requests.Session` + 连接池 (pool_maxsize=20) + urllib3 Retry |
 | 过滤可见性 | 静默 | INFO 日志记录稳定币过滤；合约过滤 DEBUG 级别 |
@@ -84,7 +86,7 @@ flowchart TD
     NEUTRAL --> SCAN
 
     subgraph PHASE1["Phase 1 扫描 (MarketScanner)"]
-        SCAN["MarketScanner.scan(top_n=20)"] --> TICKER["STEP 1a: 获取 Top20 ticker<br>过滤: 交易量<1M USDT<br>过滤: 13种稳定币"]
+        SCAN["MarketScanner.scan(top_n=20)"] --> TICKER["STEP 1a: 获取 Top20 ticker<br>过滤: 交易量<1M USDT<br>过滤: 13种稳定币<br>过滤: MEME币黑名单<br>过滤: TradFi协议商品(XAG/XAU)<br>过滤: 非futures合约币种"]
         TICKER --> KLINE["STEP 1b: 获取K线(每币种顺序)<br>1h x 200 + 15m x 20"]
         KLINE --> INDICATORS["计算 7 个指标<br>价格/24h涨跌/RSI(1h/15m)/<br>EMA200/BB%/成交量比"]
         INDICATORS --> SCORE["STEP 1c: 双向评分<br>LONG_Score vs SHORT_Score<br>满分各 10 分"]
@@ -242,6 +244,7 @@ flowchart TD
     classDef dec fill:#fff3e0,stroke:#e65100,color:#000
     classDef action fill:#f3e5f5,stroke:#6a1b9a,color:#000
     classDef close fill:#ffebee,stroke:#c62828,color:#c62828
+    classDef stale fill:#fff8e1,stroke:#f57f17,color:#f57f17
 
     LOOP(["每 5s 轮询"]) --> PRICE["批量获取所有持仓价格"]:::proc
     PRICE --> FOR["FOR EACH 活跃持仓"]:::dec
@@ -267,13 +270,19 @@ flowchart TD
 
     TP_EXEC --> NEXT
     DERISK["5. DeRisk 分级减仓"]:::dec
-    DERISK -->|≥5% 卖15%, ≥8% 卖30%<br>≥12% 卖50%, ≥18% 全平| DERISK_EXEC["部分平仓<br>level 只升不降"]:::close
-    DERISK -->|不触发| NEXT
+    DERISK -->|≥5% 卖15%, ≥8% 卖30%<br>≥12% 卖50%, ≥18% 全平| DERISK_EXEC["部分平仓<br>level 只升不降<br>de-risk后设4h延长冷却"]:::close
+    DERISK -->|不触发| STALE
 
-    DERISK_EXEC --> NEXT
+    DERISK_EXEC --> STALE
+    STALE["6. 僵尸仓位检测"]:::stale
+    STALE -->|≥24h 且 PnL 在±3%内| STALE_EXEC["标记为 STALE 平仓<br>释放保证金"]:::close
+    STALE -->|不触发| NEXT
+
+    STALE_EXEC --> NEXT
     NEXT["下一持仓"]:::dec -->|还有持仓| FOR
     NEXT -->|全部检查完| PERSIST["持久化 trailing_stops + peak_prices"]:::proc
-    PERSIST --> LOOP
+    PERSIST --> STATUS["定时状态日志 (每60s)<br>盈亏/SL距/trailing/DCA"]:::proc
+    STATUS --> LOOP
 ```
 
 ### 主循环末尾 (每轮)
@@ -303,8 +312,10 @@ flowchart TD
 
 | 阶段 | 函数/模块 | 类型 | 状态 |
 |------|----------|------|------|
-| BTC 联动 | `btc_conduction.check_btc_conduction()` | 代码 | ✅ |
+| BTC 传导 | `btc_conduction.check_btc_conduction()` | 代码 | ✅ |
 | BTC 1h 趋势 | `btc_conduction.check_btc_1h_trend()` | 代码 | ✅ |
+| MEME 币过滤 | `market_scanner._MEMECOIN_BLACKLIST` | 代码 | ✅ |
+| TradFi 协议过滤 | `market_scanner._TRADFI_REQUIRED` | 代码 | ✅ |
 | 行情获取 | `RealExchange.get_tickers/get_kline/get_funding_rate/get_orderbook` | 代码 | ✅ 直连 HTTP |
 | Phase 1 扫描 | `MarketScanner.scan()` (纯 Python, 7 指标+评分+排名, <1s) | 代码 | ✅ |
 | 分级决策 | `TradingScheduler.run_once()` → `ScheduleReport` + `Phase2Request` | 代码 | ✅ |
@@ -325,7 +336,7 @@ flowchart TD
 | TP/SL 监控 | `tpsl_monitor.TPSLMonitor` (Thread, 5s 轮询, 批量 ticker) | 代码 | ✅ |
 | 日亏损熔断 | `DailyRiskTracker` (内联在 run_live_trading.py) | 代码 | ✅ |
 | 主循环集成 | `run_live_trading.py` 主循环 → Phase2Analyzer → ATR → Gate → 下单 | 代码 | ✅ |
-| 启动 | `python extensions/run_live_trading.py --balance 50 --interval 15` | dry-run | ✅ 默认观察模式 |
+| 启动 | `python extensions/run_live_trading.py --balance 50 --interval 10` | dry-run | ✅ 默认观察模式 |
 | 实盘启动 | `python extensions/run_live_trading.py --live --confirm-live I_UNDERSTAND ...` | live | ✅ 显式确认 |
 
 ## 配置体系 (config.py)
@@ -365,7 +376,7 @@ class ATRStopConfig:
     multiplier_default: float = 2.0        # 2.0 × ATR(14)
     multiplier_conservative: float = 1.5   # 保守 1.5 × ATR(14)
     period: int = 14
-    min_stop_distance_pct: float = 3.0     # 止损距离下限，避免噪声止损
+    min_stop_distance_pct: float = 5.0     # 止损距离下限，避免低波动下止损过近
     max_stop_distance_pct: float = 8.0     # 止损距离上限，避免 TP 过远
 ```
 
@@ -471,14 +482,15 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 - 默认每 5 秒轮询，批量获取所有持仓当前价（单次 API 调用）
 - 纯代码逻辑，无 LLM，低延迟
 
-### 5 步联检 (每持仓每轮)
+### 6 步联检 (每持仓每轮)
 
 ```
 1. Trailing Stop  ← 浮盈 ≥ 3% → 追踪锁定利润 (1.5% 距离)
 2. 硬止损 SL      ← 价格触及 → 市价平仓；优先于 DCA
 3. DCA 检查       ← 亏损 ≥ 5% 且简化 Gate=PASS → 阶梯加仓
 4. 止盈 TP        ← 固定 TP 与时间衰减阈值取更近者
-5. DeRisk 减仓    ← 亏损扩大 → 分级减仓并记录已实现盈亏
+5. DeRisk 减仓    ← 亏损扩大 → 分级减仓并记录已实现盈亏；de-risk后设 4h 延长冷却
+6. 僵尸仓位检测    ← 持仓 ≥ 24h 且 PnL 在 ±3% 内 → 标记 STALE 平仓释放保证金
 ```
 
 ### 执行保障
@@ -488,15 +500,18 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 - **Dust 处理**：剩余量 < 最小交易单位时 tracker 内关闭
 - **事件回调**：`on_take_profit` / `on_stop_loss` / `on_error`
 - **Trailing stop 持久化**：重启恢复 trailing_stops + peak_prices
+- **僵尸仓位检测**：持仓超过 24h 且 PnL 在 ±3% 以内 → 自动平仓释放保证金
+- **DeRisk 延长冷却**：每次 de-risk/doom 平仓后设置 4h 延长冷却（`DE_RISK_EXTENDED_COOLDOWN_MINUTES=240`）
+- **定时状态日志**：每 60s 输出持仓盈亏/SL距离/trailing/DCA 状态
 
 ### 时间衰减止盈
 
 | 持仓时间 | TP 阈值 |
 |----------|---------|
-| < 30 min | +5% |
-| 30-60 min | +3% |
-| 60-120 min | +1% |
-| > 120 min | +0.1% (保本附近) |
+| < 30 min | +8%（快速止盈，短线保护）|
+| 30-60 min | +5% |
+| 60-120 min | +2% |
+| > 120 min | +0.5%（保本附近）|
 
 若持仓同时有固定 `take_profit`，系统取固定 TP 与时间衰减 TP 中**更近的盈利阈值**，避免高 R:R 目标过远导致盈利长期不落袋。
 
@@ -520,7 +535,7 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 ## 主循环完整流程 (run_live_trading.py)
 
 ```
-每 15 min (--interval 可配):
+每 10 min (--interval 可配, 默认 10):
   ├─ DailyRiskTracker.reset_if_new_day()         # 跨日重置
   ├─ DailyRiskTracker.is_blown?                  # -10%/日 → 熔断 4h
   │   熔断 → 空报告，跳过本轮
