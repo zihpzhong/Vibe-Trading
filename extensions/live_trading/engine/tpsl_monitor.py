@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 STALE_POSITION_HOURS = 24  # 持仓超过此时长且 PnL 在 ±3% 内视为僵尸仓位
 STALE_POSITION_PNL_PCT = 3.0  # 僵尸仓位 PnL 浮动范围
-DE_RISK_EXTENDED_COOLDOWN_MINUTES = 240  # de-risk 后延长冷却 4 小时
+DE_RISK_EXTENDED_COOLDOWN_MINUTES = 1440  # de-risk 后延长冷却 24 小时（原 4h，防止反复做空/做多同一币种）
 
 RETRY_BACKOFF = (1, 2, 4)
 MAX_RETRIES = 3
