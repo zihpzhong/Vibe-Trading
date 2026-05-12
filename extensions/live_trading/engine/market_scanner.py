@@ -35,6 +35,12 @@ _MEMECOIN_BLACKLIST: frozenset[str] = frozenset({
     "BIO",  # low-cap biotech meme, caused -$1.53 loss on 2026-05-11
 })
 
+# Price tiers for position sizing guidance
+# Coins below these thresholds get direction penalties to account for
+# thin liquidity, high slippage, and manipulation risk
+_LOW_PRICE_THRESHOLD = 1.0    # USDT: coins under this get -1 SHORT penalty
+_MICRO_PRICE_THRESHOLD = 0.1  # USDT: coins under this get max score capped
+
 # Commodity futures that require signing Binance TradFi-Perps agreement (-4411 error)
 # Keyed by base currency (symbol without USDT suffix)
 _TRADFI_REQUIRED: frozenset[str] = frozenset({
@@ -347,6 +353,19 @@ class MarketScanner:
             direction = "LONG" if long_score >= short_score else "SHORT"
             score = max(long_score, short_score)
             rsi_extremity = abs(indicators["rsi_1h"] - 50.0)
+            price = indicators["price"]
+
+            # Micro-price cap: coins < 0.1 USDT cannot fast-track
+            price_tier: str
+            if price < _MICRO_PRICE_THRESHOLD:
+                score = min(score, 6)
+                price_tier = "micro"
+            elif price < _LOW_PRICE_THRESHOLD:
+                price_tier = "low"
+            elif price < 10.0:
+                price_tier = "standard"
+            else:
+                price_tier = "premium"
 
             scored.append({
                 "symbol": sym,
@@ -354,7 +373,8 @@ class MarketScanner:
                 "score": score,
                 "long_score": long_score,
                 "short_score": short_score,
-                "entry_price": indicators["price"],
+                "entry_price": price,
+                "price_tier": price_tier,
                 "rsi_1h": indicators["rsi_1h"],
                 "rsi_15m": indicators["rsi_15m"],
                 "change_24h": indicators["change_24h"],
@@ -489,6 +509,10 @@ class MarketScanner:
         if price < ema200 and rsi_1h > 40:
             score = 0  # 下降趋势中非超卖 → 不做多
 
+        # Low-price penalty: thin liquidity amplifies crash risk for longs
+        if price < _LOW_PRICE_THRESHOLD:
+            score -= 1  # 低價币流动性差，做多暴跌风险大
+
         # Volume confirmation
         if vol_ratio > 1.5 and change_24h < 0:
             score += 1
@@ -543,12 +567,6 @@ class MarketScanner:
         if price_in_8h_pct > 0.8:
             score += 1
 
-        # Trend filter
-        if price < ema200:
-            score += 1
-        if price > ema200 and rsi_1h < 60:
-            score = 0  # 上升趋势中非超买 → 不做空
-
         # Volume confirmation
         if vol_ratio > 1.5 and change_24h > 0:
             score += 1
@@ -557,6 +575,23 @@ class MarketScanner:
         candle = ind.get("candlestick_1h", 0)
         if candle < 0:
             score += 1
+
+        # Downtrend bonus: shorting in downtrend gets extra confirmation
+        if price < ema200:
+            score += 1
+
+        # Trend momentum consistency: avoid shorting coins in uptrend with positive momentum
+        # Applied before zero-check so both constraints layer properly
+        if price > ema200 and change_24h > 0:
+            score -= 2  # 上升趋势 + 正动量 → 强做空惩罚
+
+        # Low-price penalty: thin liquidity amplifies pump risk for shorts
+        if price < _LOW_PRICE_THRESHOLD:
+            score -= 1  # 低價币流动性差，做空风险大
+
+        # Trend filter (final guard): zero out in uptrend without overbought confirmation
+        if price > ema200 and rsi_1h < 60:
+            score = 0  # 上升趋势中非超买 → 不做空
 
         return score
 
