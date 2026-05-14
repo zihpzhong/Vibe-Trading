@@ -360,6 +360,120 @@ class TestShortScoreVolume:
 
 
 # ---------------------------------------------------------------------------
+# Low-price penalty
+# ---------------------------------------------------------------------------
+
+class TestLongScoreLowPricePenalty:
+    """Low-price penalty for LONG."""
+
+    def test_low_price_sub_1_deducts_1(self) -> None:
+        ind = _base_indicators(price=0.5, rsi_1h=25.0, change_24h=-12.0)
+        ind_above = _base_indicators(price=100.0, rsi_1h=25.0, change_24h=-12.0)
+        assert MarketScanner.score_long(ind) == MarketScanner.score_long(ind_above) - 1
+
+
+class TestShortScoreLowPricePenalty:
+    """Low-price penalty for SHORT."""
+
+    def test_low_price_sub_1_deducts_1(self) -> None:
+        """price < $1 → -1 penalty applied to SHORT score."""
+        ind_low = _base_indicators(price=0.5, rsi_1h=75.0, change_24h=12.0, ema200=100.0)
+        ind_high = _base_indicators(price=2.0, rsi_1h=75.0, change_24h=12.0, ema200=100.0)
+        # Both in downtrend (price < ema200), same signals; only diff is low-price penalty
+        assert MarketScanner.score_short(ind_low) == MarketScanner.score_short(ind_high) - 1
+
+
+# ---------------------------------------------------------------------------
+# Momentum consistency caps
+# ---------------------------------------------------------------------------
+
+class TestLongScoreMomentumConsistency:
+    """Falling knife protection for LONG — score capped at 5."""
+
+    def test_falling_knife_caps_score_at_5(self) -> None:
+        """RSI < 30 AND 24h drop > 15% → score capped at 5."""
+        ind = _base_indicators(
+            rsi_1h=25.0, change_24h=-20.0,
+            rsi_15m=22.0, bb_pct=0.1, price_in_8h_pct=0.05,
+            price=110.0, ema200=100.0, vol_ratio=2.0,
+        )
+        assert 0 < MarketScanner.score_long(ind) <= 5
+
+    def test_no_cap_when_rsi_not_extreme(self) -> None:
+        """No cap when RSI >= 30 even with large drop."""
+        ind = _base_indicators(
+            rsi_1h=35.0, change_24h=-20.0,
+            rsi_15m=22.0, bb_pct=0.1, price_in_8h_pct=0.05,
+            price=110.0, ema200=100.0, vol_ratio=2.0,
+        )
+        assert MarketScanner.score_long(ind) > 5
+
+    def test_no_cap_when_drop_not_extreme(self) -> None:
+        """No cap when drop <= 15% even with low RSI."""
+        ind = _base_indicators(
+            rsi_1h=25.0, change_24h=-14.0,
+            rsi_15m=22.0, bb_pct=0.1, price_in_8h_pct=0.05,
+            price=110.0, ema200=100.0, vol_ratio=2.0,
+        )
+        assert MarketScanner.score_long(ind) > 5
+
+
+class TestShortScoreMomentumConsistency:
+    """Rocket fade protection for SHORT — score capped at 5."""
+
+    def test_rocket_fade_caps_score_at_5(self) -> None:
+        """RSI > 70 AND 24h pump > 15% → score capped at 5."""
+        ind = _base_indicators(
+            rsi_1h=75.0, change_24h=20.0,
+            rsi_15m=78.0, bb_pct=0.9, price_in_8h_pct=0.95,
+            price=90.0, ema200=100.0, vol_ratio=2.0,
+        )
+        assert 0 < MarketScanner.score_short(ind) <= 5
+
+    def test_no_cap_when_rsi_not_extreme(self) -> None:
+        """No cap when RSI <= 70 even with large pump."""
+        ind = _base_indicators(
+            rsi_1h=65.0, change_24h=20.0,
+            rsi_15m=78.0, bb_pct=0.9, price_in_8h_pct=0.95,
+            price=90.0, ema200=100.0, vol_ratio=2.0,
+        )
+        assert MarketScanner.score_short(ind) > 5
+
+    def test_no_cap_when_pump_not_extreme(self) -> None:
+        """No cap when pump <= 15% even with high RSI."""
+        ind = _base_indicators(
+            rsi_1h=75.0, change_24h=14.0,
+            rsi_15m=78.0, bb_pct=0.9, price_in_8h_pct=0.95,
+            price=90.0, ema200=100.0, vol_ratio=2.0,
+        )
+        assert MarketScanner.score_short(ind) > 5
+
+
+class TestShortScoreTrendConsistency:
+    """SHORT penalty for uptrend + positive momentum."""
+
+    def test_uptrend_positive_momentum_penalty(self) -> None:
+        """price > EMA200 AND change_24h > 0 → -2 penalty applied."""
+        ind = _base_indicators(
+            price=110.0, ema200=100.0, change_24h=3.0,
+            rsi_1h=65.0, rsi_15m=72.0, bb_pct=0.9,
+            price_in_8h_pct=0.95, vol_ratio=2.0,
+        )
+        ind_no_penalty = _base_indicators(
+            price=110.0, ema200=100.0, change_24h=0.0,
+            rsi_1h=65.0, rsi_15m=72.0, bb_pct=0.9,
+            price_in_8h_pct=0.95, vol_ratio=2.0,
+        )
+        assert MarketScanner.score_short(ind) < MarketScanner.score_short(ind_no_penalty)
+
+    def test_no_penalty_in_downtrend(self) -> None:
+        """No penalty when price < EMA200 even with positive change."""
+        ind = _base_indicators(price=90.0, ema200=100.0, change_24h=5.0)
+        ind_no_change = _base_indicators(price=90.0, ema200=100.0, change_24h=0.0)
+        assert MarketScanner.score_short(ind) == MarketScanner.score_short(ind_no_change)
+
+
+# ---------------------------------------------------------------------------
 # Max score & direction
 # ---------------------------------------------------------------------------
 

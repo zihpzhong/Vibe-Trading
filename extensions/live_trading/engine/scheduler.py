@@ -146,6 +146,7 @@ class TradingScheduler:
             entry_price=float(ranking.get("entry_price", 0) or 0),
             change_24h=float(ranking.get("change_24h", 0)),
             rsi_1h=float(ranking.get("rsi_1h", 50)),
+            price_tier=str(ranking.get("price_tier", "standard")),
         )
 
     # ------------------------------------------------------------------

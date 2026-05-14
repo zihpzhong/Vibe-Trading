@@ -283,8 +283,8 @@ class TPSLMonitor(Thread):
         The longer the position is held, the lower the TP threshold:
           < 30 min : +8%
           30-60 min : +5%
-          60-120 min: +2%
-          > 120 min : +0.5% (保本附近)
+          60-120 min: +3%
+          > 120 min : +2% (保本附近)
 
         If a fixed take_profit is set, uses the tighter of the two.
         """
@@ -296,9 +296,9 @@ class TPSLMonitor(Thread):
         elif elapsed_min < 60:
             tp_pct = 0.05
         elif elapsed_min < 120:
-            tp_pct = 0.02
+            tp_pct = 0.03
         else:
-            tp_pct = 0.005
+            tp_pct = 0.02
 
         thresholds = [tp_pct]
         if pos.take_profit is not None:

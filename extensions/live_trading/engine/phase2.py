@@ -136,10 +136,14 @@ Rules:
                 logger.info("Phase2: No skills loaded for %s, skipping", req.symbol)
                 return None
             loaded_count = len(skills)
-            if loaded_count < MIN_LOADED_DIMS_FOR_LLM:
+            # Require >= MIN_LOADED_DIMS_FOR_LLM AND >= 50% of needed dimensions
+            # Most enhanced-tier signals (8 dims) lack real data for 5+ dimensions,
+            # making LLM calls wasteful (returns all-NEUTRAL every time)
+            needed_threshold = max(MIN_LOADED_DIMS_FOR_LLM, len(needed) // 2)
+            if loaded_count < needed_threshold:
                 logger.info(
-                    "Phase2: %s only %d/%d dims have data (< %d), skipping LLM (NEUTRAL)",
-                    req.symbol, loaded_count, len(needed), MIN_LOADED_DIMS_FOR_LLM,
+                    "Phase2: %s only %d/%d dims have data (< %d needed), skipping LLM (NEUTRAL)",
+                    req.symbol, loaded_count, len(needed), needed_threshold,
                 )
                 return {"symbol": req.symbol, "consensus": "NEUTRAL", "summary": "insufficient dimension data", "dimensions": {}}
             prompt = self._build_prompt(req, ticker or {}, skills)

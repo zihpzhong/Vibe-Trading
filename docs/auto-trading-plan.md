@@ -29,7 +29,7 @@
 | Docker 权限 | `vibe` 非 root | `user: root` + `HOME=/home/vibe` |
 | 持仓持久化 | 直接写入 | `_persist()` 加 `try/except PermissionError`，不可写时降级内存 |
 | 稳定币过滤 | 无 | 13 种稳定币被过滤 |
-| MEME 币黑名单 | 无 | BIO 等极端风险币种被过滤（`_MEMECOIN_BLACKLIST`）|
+| MEME 币黑名单 | 无 | BIO/BILL 等极端风险币种被过滤（`_MEMECOIN_BLACKLIST`）|
 | TradFi 协议商品 | 无 | XAG(白银)/XAU(黄金) 需签署 Binance TradFi-Perps 协议，自动跳过 |
 | 合约可用性 | 无 | `BINANCE_MARKET_TYPE` 默认 `future`，仅返回 `_valid_symbols` 中的合约币种 |
 | SSL 连接 | 裸 `requests.get()` | `requests.Session` + 连接池 (pool_maxsize=20) + urllib3 Retry |
@@ -129,8 +129,15 @@ flowchart TD
 | price > EMA200 | +1 | price < EMA200 | +1 |
 | 放量下跌 | +1 | 放量上涨 | +1 |
 | K线看涨形态 | +1 | K线看跌形态 | +1 |
+| 低价惩罚 (<$1) | -1 | 低价惩罚 (<$1) | -1 |
+| 动量: RSI<30 + 24h跌>15% | cap=5 | 动量: RSI>70 + 24h涨>15% | cap=5 |
+| 微价 (<$0.1) | cap=6 | 微价 (<$0.1) | cap=6 |
 
 **趋势过滤清零**: LONG 时若 price < EMA200 且 RSI(1h) > 40 → score = 0（下降趋势中非超卖不做多）。SHORT 时若 price > EMA200 且 RSI(1h) < 60 → score = 0（上升趋势中非超买不做空）。
+
+**SHORT 额外惩罚**: price > EMA200 且 24h 涨>0 → -2（上升趋势+正动量 → 强做空惩罚）。
+
+**price_tier 仓位系数**: micro=50%, low=75%, standard/premium=100%（执行层据此缩减低价币仓位）。
 
 ### STEP 2 — 自动交易链路 (每信号顺序处理)
 
@@ -320,6 +327,7 @@ flowchart TD
 | Phase 1 扫描 | `MarketScanner.scan()` (纯 Python, 7 指标+评分+排名, <1s) | 代码 | ✅ |
 | 分级决策 | `TradingScheduler.run_once()` → `ScheduleReport` + `Phase2Request` | 代码 | ✅ |
 | Dim 1 技术面 | `Phase2Analyzer` → `SkillsLoader.get_content("technical-basic")` + `get_content("candlestick")` | LLM | ✅ |
+| | Phase 2 LLM 跳过条件: 有数据的维度 < max(3, len(needed)//2) 时跳过 LLM, 返回 NEUTRAL | 代码 | ✅ |
 | Dim 2 链上 | `get_content("onchain-analysis")` | LLM | ✅ |
 | Dim 3 合约 | `get_content("perp-funding-basis")` + `get_content("liquidation-heatmap")` | LLM | ✅ |
 | Dim 4 情绪 | `get_content("sentiment-analysis")` + `get_content("social-media-intelligence")` | LLM | ✅ |
@@ -501,7 +509,7 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 - **事件回调**：`on_take_profit` / `on_stop_loss` / `on_error`
 - **Trailing stop 持久化**：重启恢复 trailing_stops + peak_prices
 - **僵尸仓位检测**：持仓超过 24h 且 PnL 在 ±3% 以内 → 自动平仓释放保证金
-- **DeRisk 延长冷却**：每次 de-risk/doom 平仓后设置 4h 延长冷却（`DE_RISK_EXTENDED_COOLDOWN_MINUTES=240`）
+- **DeRisk 延长冷却**：每次 de-risk/doom 平仓后设置 24h 延长冷却（`DE_RISK_EXTENDED_COOLDOWN_MINUTES=1440`），防止同币种报复性交易
 - **定时状态日志**：每 60s 输出持仓盈亏/SL距离/trailing/DCA 状态
 
 ### 时间衰减止盈
@@ -510,8 +518,8 @@ JSON 持久化到 `~/.vibe-trading/positions.json`，权限不足时降级内存
 |----------|---------|
 | < 30 min | +8%（快速止盈，短线保护）|
 | 30-60 min | +5% |
-| 60-120 min | +2% |
-| > 120 min | +0.5%（保本附近）|
+| 60-120 min | +3% |
+| > 120 min | +2%（保本附近）|
 
 若持仓同时有固定 `take_profit`，系统取固定 TP 与时间衰减 TP 中**更近的盈利阈值**，避免高 R:R 目标过远导致盈利长期不落袋。
 
