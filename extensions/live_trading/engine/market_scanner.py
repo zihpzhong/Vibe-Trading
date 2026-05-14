@@ -32,7 +32,8 @@ _STABLECOINS: frozenset[str] = frozenset({
 # Low-quality meme/shitcoins with extreme volatility, thin liquidity, or pump-and-dump risk
 # Keyed by base currency (symbol without USDT suffix)
 _MEMECOIN_BLACKLIST: frozenset[str] = frozenset({
-    "BIO",  # low-cap biotech meme, caused -$1.53 loss on 2026-05-11
+    "BIO",   # low-cap biotech meme, caused -$1.53 loss on 2026-05-11
+    "BILL",  # low-cap micro-price token, 5 trades/3 de-risk losses on 2026-05-12/13
 })
 
 # Price tiers for position sizing guidance
@@ -522,6 +523,11 @@ class MarketScanner:
         if candle > 0:
             score += 1
 
+        # Momentum consistency: extreme oversold in free-fall = catching falling knife
+        # High-score reversal longs on coins dropping > 15%/24h underperform (historical data)
+        if rsi_1h < 30 and change_24h < -15:
+            score = min(score, 5)
+
         return score
 
     @staticmethod
@@ -588,6 +594,11 @@ class MarketScanner:
         # Low-price penalty: thin liquidity amplifies pump risk for shorts
         if price < _LOW_PRICE_THRESHOLD:
             score -= 1  # 低價币流动性差，做空风险大
+
+        # Momentum consistency: extreme overbought with parabolic rise = fading a rocket
+        # High-score reversal shorts on coins pumping > 15%/24h underperform (historical data)
+        if rsi_1h > 70 and change_24h > 15:
+            score = min(score, 5)
 
         # Trend filter (final guard): zero out in uptrend without overbought confirmation
         if price > ema200 and rsi_1h < 60:

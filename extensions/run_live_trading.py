@@ -721,8 +721,23 @@ def main() -> int:
                         leverage = max(1, max_lev // 2)
                     else:
                         leverage = 1
+
+                    # price_tier 调整: 低价/微价币缩减仓位
+                    price_tier = getattr(req, "price_tier", "standard")
+                    tier_factor = {
+                        "micro": 0.50,    # < $0.1 → 50% 标准仓位
+                        "low": 0.75,      # < $1   → 75%
+                        "standard": 1.0,
+                        "premium": 1.0,
+                    }.get(price_tier, 1.0)
+                    if tier_factor < 1.0:
+                        log.info(
+                            "%s: price_tier=%s, 仓位系数 %.0f%%",
+                            symbol, price_tier, tier_factor * 100,
+                        )
+
                     effective_position_size = min(
-                        args.position_size,
+                        args.position_size * tier_factor,
                         config.execution_gate.max_position_pct / 100,
                     )
                     if effective_position_size < args.position_size:
