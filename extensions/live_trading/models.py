@@ -124,6 +124,7 @@ class Phase2Request:
     entry_price: float = 0.0
     change_24h: float = 0.0
     rsi_1h: float = 50.0
+    price_tier: str = "standard"  # "micro" (<$0.1), "low" (<$1), "standard", "premium"
 
 
 @dataclass
