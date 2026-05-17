@@ -581,8 +581,22 @@ def main() -> int:
             try:
                 bal = exchange.get_account_balance()
                 if bal and "USDT" in bal:
-                    positions.account_balance = float(bal["USDT"])
+                    new_balance = float(bal["USDT"])
+                    old_balance = positions.account_balance
+                    # 突变保护：余额单周期暴跌超过 50% 时拒绝覆盖
+                    # 防止交易所 API 偶发错误值覆盖正确余额（历史事故: 53→3.37）
+                    if old_balance > 0 and new_balance < old_balance * 0.5:
+                        log.error(
+                            "余额暴跌检测: %.2f → %.2f (%.1f%%)，跳过同步以防 API 错误数据",
+                            old_balance, new_balance,
+                            (1 - new_balance / old_balance) * 100,
+                        )
+                    else:
+                        positions.account_balance = new_balance
                 # 同步可用余额（开仓保证金用）
+                # 说明：wallet balance（总权益）用作 exposure 计算分母，
+                #       available balance（可用余额）用作开仓金额上限。
+                #       两者从相同 API 读取不同字段，有持仓时可用 < 总权益，属正常现象。
                 free_bal = exchange.get_available_balance()
                 _available_usdt = float(free_bal.get("USDT", 0)) if free_bal else 0
             except Exception as exc:

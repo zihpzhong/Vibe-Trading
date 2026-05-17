@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,10 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PERSIST_DIR = Path.home() / ".vibe-trading"
+
+# 合法 symbol 格式：仅含 ASCII 字母/数字/连字符，长度 1-30
+# 用于过滤中文字符等无效 symbol（如历史上的 "币安人生USDT"）
+_VALID_SYMBOL_RE = re.compile(r"^[A-Za-z0-9-]{1,30}$")
 
 
 @dataclass
@@ -727,8 +732,12 @@ class PositionTracker:
         try:
             raw = json.loads(self._persist_path.read_text())
             for p in raw.get("positions", []):
+                sym = str(p.get("symbol", ""))
+                if not _VALID_SYMBOL_RE.match(sym):
+                    logger.warning("Skipping invalid symbol in positions: %r", sym)
+                    continue
                 pos = Position.from_dict(p)
-                self._positions[pos.symbol] = pos
+                self._positions[sym] = pos
             for c in raw.get("closed", []):
                 try:
                     self._closed.append(CloseRecord.from_dict(c))
