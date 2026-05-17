@@ -51,20 +51,30 @@ def load_baseline() -> Optional[dict]:
 
 
 def parse_trades_from_log(log_text: str) -> dict[str, Any]:
-    """Parse log text for trade events."""
+    """Parse log text for trade events, deduplicated."""
     lines = log_text.splitlines()
 
+    seen: set[tuple[str, str, float, float, str]] = set()
     trades: list[dict] = []
     for line in lines:
         m = RE_CLOSE.search(line)
         if m:
             reason = m.group("reason")
+            symbol = m.group("symbol")
+            direction = m.group("direction")
+            exit_price = float(m.group("exit_price"))
+            pnl_pct = float(m.group("pnl_pct"))
+            # 以 (symbol, direction, exit_price, pnl_pct, reason) 去重
+            key = (symbol, direction, exit_price, pnl_pct, reason)
+            if key in seen:
+                continue
+            seen.add(key)
             trades.append({
-                "symbol": m.group("symbol"),
-                "direction": m.group("direction"),
-                "exit_price": float(m.group("exit_price")),
+                "symbol": symbol,
+                "direction": direction,
+                "exit_price": exit_price,
                 "pnl_usdt": float(m.group("pnl")),
-                "pnl_pct": float(m.group("pnl_pct")),
+                "pnl_pct": pnl_pct,
                 "is_loss": float(m.group("pnl")) < 0,
                 "is_de_risk": bool(RE_DE_RISK.search(reason)),
                 "reason": reason,
