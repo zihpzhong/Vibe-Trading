@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from extensions.live_trading.config import LiveTradingConfig
+from extensions.live_trading.config import DeRiskConfig, LiveTradingConfig
 from extensions.live_trading.models import (
     ExecutionGateResult,
     GateStatus,
@@ -449,7 +449,8 @@ class TestDeRisk:
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "TEST", "last": 93.0},  # -7% → past level 1 (5%), below level 2 (8%)
         ])
-        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05,
+                              de_risk_config=DeRiskConfig(entry_grace_minutes=0))
         monitor._poll()
         pos = tracker.get_position("TEST")
         assert pos is not None
@@ -464,7 +465,8 @@ class TestDeRisk:
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "CASCADE", "last": 70.0},  # -30%
         ])
-        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05,
+                              de_risk_config=DeRiskConfig(entry_grace_minutes=0))
 
         # Level 1: sell 15% = 1.5, remaining = 8.5
         monitor._poll()
@@ -512,7 +514,8 @@ class TestDeRisk:
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "TEST", "last": 85.0},  # -15%，触发 L1+L2，但部分减持名义价值<20
         ])
-        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05,
+                              de_risk_config=DeRiskConfig(entry_grace_minutes=0))
         monitor._poll()
         # de-risk L1 部分减持 notional=0.3*0.15*85=$3.825 < $20
         # → fallback 全平 close_position(reason=DE_RISK_1)
@@ -569,7 +572,8 @@ class TestDeRisk:
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "TEST", "last": 85.0},  # loss from first_cost: -15%
         ])
-        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05,
+                              de_risk_config=DeRiskConfig(entry_grace_minutes=0))
         monitor._poll()
         pos = tracker.get_position("TEST")
         assert pos.de_risk_level == 1  # level 1 fired

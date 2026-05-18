@@ -86,6 +86,23 @@ class TPSLMonitor(Thread):
             (dr.level3_loss_pct, dr.level3_sell_fraction),  # 2 → level 3
         ]
         self._doom_loss_pct = dr.doom_loss_pct
+        self._de_risk_entry_grace = dr.entry_grace_minutes
+        # Track position entry timestamps: symbol → opened_at (UTC timestamp)
+        self._entry_times: dict[str, float] = {}
+        self._sync_entry_times()
+
+    def _sync_entry_times(self) -> None:
+        """Sync entry timestamps from all active positions."""
+        try:
+            positions = self._positions.get_active_positions()
+        except Exception:
+            return  # 测试环境可能没有完整初始化
+        for pos in positions:
+            try:
+                opened = datetime.fromisoformat(pos.opened_at)
+                self._entry_times[pos.symbol] = opened.timestamp()
+            except (ValueError, TypeError):
+                self._entry_times[pos.symbol] = time.time()
 
         # 从持久化状态恢复 trailing stop
         if hasattr(self._positions, "get_trailing_state"):
@@ -132,6 +149,15 @@ class TPSLMonitor(Thread):
         active = self._positions.get_active_positions()
         if not active:
             return
+
+        # Sync entry times for any newly opened positions
+        for pos in active:
+            if pos.symbol not in self._entry_times:
+                try:
+                    opened = datetime.fromisoformat(pos.opened_at)
+                    self._entry_times[pos.symbol] = opened.timestamp()
+                except (ValueError, TypeError):
+                    self._entry_times[pos.symbol] = time.time()
 
         # Batch fetch prices for all active symbols
         symbols = [p.symbol for p in active]
@@ -499,6 +525,17 @@ class TPSLMonitor(Thread):
 
         # 盈利时不触发 de-risk
         if loss_pct >= 0:
+            return False
+
+        # 入场保护期：新开仓在保护期内不触发 DE-RISK
+        # 防止入场即被 spike 打损（如 LABUSDT 0-1 分钟 DE_RISK）
+        now = time.time()
+        entry_ts = self._entry_times.get(pos.symbol, 0.0)
+        if entry_ts > 0 and (now - entry_ts) < self._de_risk_entry_grace * 60:
+            logger.debug(
+                "DE-RISK skipped for %s: entry grace %.1fmin (%.0fs since open)",
+                pos.symbol, self._de_risk_entry_grace, now - entry_ts,
+            )
             return False
 
         abs_loss = abs(loss_pct)

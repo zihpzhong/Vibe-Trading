@@ -32,6 +32,7 @@ class DeRiskConfig:
     level3_loss_pct: float = 12.0
     level3_sell_fraction: float = 0.50
     doom_loss_pct: float = 18.0  # 亏损 ≥ 18% → 全平
+    entry_grace_minutes: float = 5.0  # 新开仓保护期（分钟），期内不触发 DE-RISK
 
 
 @dataclass

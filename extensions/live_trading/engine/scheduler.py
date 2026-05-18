@@ -36,6 +36,8 @@ class TradingScheduler:
             print(req.symbol, req.tier, req.dims)
     """
 
+    _IDLE_ALERT_THRESHOLD = 12  # 连续 N 次无开仓后告警（5min 间隔 ≈ 1 小时）
+
     def __init__(
         self,
         exchange: ExchangeBase,
@@ -46,6 +48,7 @@ class TradingScheduler:
         self._positions = positions or PositionTracker()
         self._trading_enabled = trading_enabled
         self._scanner = MarketScanner(exchange)
+        self._consecutive_idle_scans = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,6 +99,25 @@ class TradingScheduler:
         if btc_1h_trend in ("WEAKNESS", "STRENGTH"):
             capped = 0
             for r in scan_result.rankings:
+                # 极端行情例外：深度超卖 + 成交量确认 → 允许对抗 BTC 弱势
+                rsi = r.get("rsi_1h", 50)
+                vol = r.get("vol_ratio", 1.0)
+                is_extreme_long_exception = (
+                    btc_1h_trend == "WEAKNESS"
+                    and r["direction"] == "LONG"
+                    and rsi < 15 and vol >= 2.0
+                )
+                is_extreme_short_exception = (
+                    btc_1h_trend == "STRENGTH"
+                    and r["direction"] == "SHORT"
+                    and rsi > 85 and vol >= 2.0
+                )
+                if is_extreme_long_exception or is_extreme_short_exception:
+                    logger.info(
+                        "BTC %s exception for %s: RSI=%.1f vol_ratio=%.1f → score preserved",
+                        btc_1h_trend, r["symbol"], rsi, vol,
+                    )
+                    continue
                 if btc_1h_trend == "WEAKNESS" and r["direction"] == "LONG" and r["score"] >= 6:
                     r["score"] = 5
                     capped += 1
@@ -115,6 +137,21 @@ class TradingScheduler:
                     phase2_requests.append(req)
             # Watchlist (score 3-4) — no Phase2Request
             # but included in report for Agent awareness
+
+        # 闲置扫描告警：连续 N 次无开仓 & 无持仓 → 系统可能处于死锁状态
+        has_openings = len(phase2_requests) > 0
+        has_positions = self._positions.active_count > 0
+        if has_openings or has_positions:
+            self._consecutive_idle_scans = 0
+        else:
+            self._consecutive_idle_scans += 1
+            if self._consecutive_idle_scans >= self._IDLE_ALERT_THRESHOLD:
+                logger.warning(
+                    "IDLE ALERT: %d consecutive scans with no openings and no positions "
+                    "(BTC trend=%s, btc_status=%s, rankings=%d)",
+                    self._consecutive_idle_scans,
+                    btc_1h_trend, btc_status, len(scan_result.rankings or []),
+                )
 
         return ScheduleReport(
             rankings=scan_result.rankings,
