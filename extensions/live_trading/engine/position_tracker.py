@@ -668,6 +668,16 @@ class PositionTracker:
     @account_balance.setter
     def account_balance(self, value: float) -> None:
         with self._lock:
+            delta = value - self._account_balance
+            if abs(delta) > 0.01:  # 忽略微小舍入差异
+                if hasattr(self, "_last_balance_log"):
+                    logger.info(
+                        "Balance changed: %.2f → %.2f (Δ%+.2f USDT)",
+                        self._account_balance, value, delta,
+                    )
+                else:
+                    logger.info("Balance initialized: %.2f USDT", value)
+                self._last_balance_log = True
             self._account_balance = value
 
     @property
