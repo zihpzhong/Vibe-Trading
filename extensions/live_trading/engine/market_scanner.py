@@ -35,6 +35,8 @@ _MEMECOIN_BLACKLIST: frozenset[str] = frozenset({
     "BIO",   # low-cap biotech meme, caused -$1.53 loss on 2026-05-11
     "BILL",  # low-cap micro-price token, 5 trades/3 de-risk losses on 2026-05-12/13
     "LAB",   # low-cap, 5 trades/40% win rate, -2.18% avg return on 2026-05-10/18
+    "XAG",   # Silver — TradFi perp, not tradeable, was never executed
+    "XAU",   # Gold — TradFi perp, not tradeable, was never executed
 })
 
 # Price tiers for position sizing guidance
