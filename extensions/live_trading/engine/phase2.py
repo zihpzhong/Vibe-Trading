@@ -34,13 +34,15 @@ logger = logging.getLogger(__name__)
 # Dimension → skill mapping (per auto-trading-plan.md)
 DIM_SKILL_MAP: dict[str, list[str]] = {
     "dim1": ["technical-basic", "candlestick"],
-    "dim2": ["onchain-analysis"],
+    "dim2": ["onchain-analysis", "stablecoin-flow"],  # fallback: stablecoin flow data often available
     "dim3": ["perp-funding-basis", "liquidation-heatmap"],
     "dim4": ["sentiment-analysis", "social-media-intelligence"],
     "dim5": ["volatility"],
     "dim6": ["stablecoin-flow", "market-microstructure"],
     "dim7": ["risk-analysis"],
     "dim8": ["correlation-analysis", "sector-rotation"],
+    "dim9": ["global-macro", "etf-analysis"],          # NEW: macro context, ETF flow
+    "dim10": ["behavioral-finance", "regulatory-knowledge"],  # NEW: crowd psych, regulatory events
 }
 
 MIN_LOADED_DIMS_FOR_LLM = 3  # 至少 3 个维度有 skill 数据才发起 LLM 调用
@@ -54,6 +56,8 @@ DIM_LABELS: dict[str, str] = {
     "dim6": "稳定币",
     "dim7": "风险评估",
     "dim8": "相关性",
+    "dim9": "宏观/ETF",    # NEW
+    "dim10": "行为/监管",  # NEW
 }
 
 class Phase2Analyzer:

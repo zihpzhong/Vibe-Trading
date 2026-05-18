@@ -59,6 +59,7 @@ def _base_indicators(**overrides: float) -> dict:
         "vol_ratio": 1.0,
         "price_in_8h_pct": 0.5,
         "volume_24h": 10_000_000.0,
+        "alpha_signal": 0.0,
     }
     defaults.update(overrides)
     return defaults
