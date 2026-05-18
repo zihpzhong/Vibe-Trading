@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from extensions.live_trading.config import DeRiskConfig
 from extensions.live_trading.engine.position_tracker import PositionTracker
 from extensions.live_trading.engine.tpsl_monitor import TPSLMonitor
 from extensions.live_trading.engine.exchange import MockExchange
@@ -236,7 +237,8 @@ class TestDeRisk:
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "SMALL", "last": 85.0},  # -15%
         ])
-        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05,
+                              de_risk_config=DeRiskConfig(entry_grace_minutes=0))
         monitor._poll()
         pos = tracker.get_position("SMALL")
         assert pos is None
@@ -254,7 +256,8 @@ class TestDeRisk:
         exchange.get_tickers = MagicMock(return_value=[
             {"symbol": "BIG", "last": 93.0},  # -7% → de-risk L1
         ])
-        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05)
+        monitor = TPSLMonitor(exchange, tracker, poll_interval=0.05,
+                              de_risk_config=DeRiskConfig(entry_grace_minutes=0))
         monitor._poll()
         pos = tracker.get_position("BIG")
         assert pos is not None
