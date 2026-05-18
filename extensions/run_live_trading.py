@@ -271,6 +271,9 @@ def main() -> int:
     # 确保 _load() 不覆盖构造函数传入的交易所真实余额
     if actual_usdt_balance is not None:
         positions.account_balance = actual_usdt_balance
+        # 同步 initial_balance，避免 _load() 留下的旧 JSON 值
+        # 影响绩效指标准确性
+        positions._initial_balance = actual_usdt_balance
 
     # ---- Phase 2 分析引擎 ----
     phase2_analyzer = Phase2Analyzer() if not args.no_phase2 else None
