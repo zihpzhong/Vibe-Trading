@@ -759,8 +759,11 @@ class PositionTracker:
             self._peak_prices = raw.get("peak_prices", {})
             if "account_balance" in raw:
                 self._account_balance = float(raw["account_balance"])
-            if "initial_balance" in raw:
-                self._initial_balance = float(raw["initial_balance"])
+            # NOTE: _initial_balance deliberately NOT restored from JSON.
+            # The constructor value is authoritative — it reflects the balance
+            # at the time of this process start (which may be synced from the
+            # exchange in run_live_trading.py). Restoring a stale value from
+            # disk would skew total_return / max_drawdown metrics.
             if "equity_history" in raw:
                 self._equity_history = list(raw["equity_history"])
             logger.info(
