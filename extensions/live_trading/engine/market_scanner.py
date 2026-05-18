@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from .exchange import ExchangeBase
+from .alpha_factors import aggregate_signal, compute_all as compute_alpha_factors
 
 logger = logging.getLogger(__name__)
 
@@ -444,6 +445,15 @@ class MarketScanner:
         else:
             price_in_8h_pct = 0.5
 
+        # Alpha factor computation
+        alpha_factors = compute_alpha_factors(
+            close=close_1h,
+            high=kline_1h["high"].astype(float),
+            low=kline_1h["low"].astype(float),
+            volume=volume_1h,
+        )
+        alpha_signal = aggregate_signal(alpha_factors)
+
         return {
             "symbol": ticker.get("symbol", ""),
             "price": price,
@@ -458,6 +468,8 @@ class MarketScanner:
             "candlestick_1h": _aggregate_candlestick_signal(
                 kline_1h["open"], kline_1h["high"], kline_1h["low"], kline_1h["close"],
             ),
+            "alpha_signal": alpha_signal,
+            **{f"alpha_{k}": v for k, v in alpha_factors.items()},
         }
 
     # ------------------------------------------------------------------
@@ -526,6 +538,13 @@ class MarketScanner:
         if candle > 0:
             score += 1
 
+        # Alpha factor signal: aggregate of 12 curated zoo-derived factors
+        alpha_signal = ind.get("alpha_signal", 0.0)
+        if alpha_signal > 0.4:
+            score += 1  # strong bullish alignment
+        elif alpha_signal < -0.3:
+            score -= 1  # bearish divergence
+
         # Momentum consistency: extreme oversold in free-fall = catching falling knife
         # High-score reversal longs on coins dropping > 15%/24h underperform (historical data)
         if rsi_1h < 30 and change_24h < -15:
@@ -592,6 +611,13 @@ class MarketScanner:
         candle = ind.get("candlestick_1h", 0)
         if candle < 0:
             score += 1
+
+        # Alpha factor signal: aggregate of 12 curated zoo-derived factors
+        alpha_signal = ind.get("alpha_signal", 0.0)
+        if alpha_signal < -0.4:
+            score += 1  # strong bearish alignment
+        elif alpha_signal > 0.3:
+            score -= 1  # bullish divergence
 
         # Downtrend bonus: shorting in downtrend gets extra confirmation
         if price < ema200:

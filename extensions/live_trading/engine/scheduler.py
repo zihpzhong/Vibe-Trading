@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 FAST_TRACK_DIMS = ["dim1", "dim3", "dim5", "dim6", "dim7"]
 """High-score checks: technical, derivatives, volatility, microstructure, risk."""
 
-ENHANCED_DIMS = ["dim1", "dim2", "dim3", "dim4", "dim5", "dim6", "dim7", "dim8"]
-"""Medium-score checks: full skill coverage, including deterministic risk dimensions."""
+ENHANCED_DIMS = ["dim1", "dim2", "dim3", "dim4", "dim5", "dim6", "dim7", "dim8", "dim9", "dim10"]
+"""Medium-score checks: full skill coverage, including deterministic risk dimensions, macro, and behavioral."""
 
 
 class TradingScheduler:
