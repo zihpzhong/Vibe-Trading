@@ -11,6 +11,7 @@ from extensions.live_trading.engine.atr_stop import calculate_atr, calculate_atr
 from extensions.live_trading.engine.exchange import ExchangeBase, MockExchange, create_exchange
 from extensions.live_trading.engine.market_scanner import MarketScanner, ScanResult
 from extensions.live_trading.engine.position_tracker import Position, PositionTracker
+from extensions.live_trading.engine.migration import migrate_from_json
 from extensions.live_trading.engine.tpsl_monitor import TPSLMonitor
 from extensions.live_trading.engine.scheduler import TradingScheduler
 
@@ -27,6 +28,7 @@ __all__ = [
     "ScanResult",
     "Position",
     "PositionTracker",
+    "migrate_from_json",
     "TPSLMonitor",
     "TradingScheduler",
 ]

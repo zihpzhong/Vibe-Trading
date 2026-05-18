@@ -1,7 +1,7 @@
 """Position Tracker —持仓生命周期管理与风控.
 
 Manages position state, exposure calculation, cooldown tracking,
-and JSON persistence. All mutable state is protected by threading.RLock.
+and SQLite persistence. All mutable state is protected by threading.RLock.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -197,17 +198,100 @@ class PositionTracker:
         self._max_exposure_pct = max_exposure_pct
         self._max_positions = max_positions
         self._cooldown_minutes = cooldown_minutes
-        self._persist_path = (Path(persist_dir) if persist_dir else _DEFAULT_PERSIST_DIR) / "positions.json"
+        base_dir = Path(persist_dir) if persist_dir else _DEFAULT_PERSIST_DIR
+        self._db_path = base_dir / "trading.db"
         self._lock = RLock()
         self._positions: dict[str, Position] = {}
-        self._closed: list[CloseRecord] = []  # 已平仓历史（最多保留最近 50 条）
+        self._closed: list[CloseRecord] = []  # 已平仓历史
         self._cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → timestamp
-        self._extended_cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → expiry_timestamp (de-risk long cooldown)
+        self._extended_cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → expiry_timestamp
         self._trailing_stops: dict[str, float] = {}
         self._peak_prices: dict[str, float] = {}
         self._equity_history: list[dict[str, Any]] = []  # 权益曲线快照
         self._initial_balance: float = account_balance
+        self._synced_closed_count: int = 0
+        self._synced_equity_count: int = 0
+        self._conn: Optional[sqlite3.Connection] = None
+        # 尝试自动迁移旧 JSON
+        self._maybe_migrate(base_dir)
+        self._init_db()
         self._load()
+
+    def _maybe_migrate(self, base_dir: Path) -> None:
+        """从旧的 positions.json 自动迁移到 trading.db."""
+        json_path = base_dir / "positions.json"
+        if not json_path.exists():
+            return
+        if self._db_path.exists():
+            return  # DB 已存在，不做迁移
+        try:
+            from extensions.live_trading.engine.migration import migrate_from_json
+            logger.info("Auto-migrating from %s to %s ...", json_path, self._db_path)
+            migrate_from_json(str(base_dir))
+            logger.info("Auto-migration complete")
+        except Exception as exc:
+            logger.warning("Auto-migration failed (will continue with fresh DB): %s", exc)
+
+    def _init_db(self) -> None:
+        """Initialize SQLite database: create tables, set pragmas."""
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+
+            CREATE TABLE IF NOT EXISTS positions (
+                symbol TEXT PRIMARY KEY, direction TEXT NOT NULL,
+                entry_price REAL NOT NULL, quantity REAL NOT NULL,
+                stop_loss REAL NOT NULL, take_profit REAL,
+                opened_at TEXT NOT NULL, dca_count INTEGER DEFAULT 0,
+                leverage INTEGER DEFAULT 1, entry_score INTEGER DEFAULT -1,
+                first_entry_cost REAL DEFAULT 0.0,
+                first_entry_quantity REAL DEFAULT 0.0,
+                de_risk_level INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS closed_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL, direction TEXT NOT NULL,
+                entry_price REAL NOT NULL, exit_price REAL NOT NULL,
+                quantity REAL NOT NULL, pnl_usdt REAL NOT NULL,
+                pnl_pct REAL NOT NULL, reason TEXT NOT NULL,
+                opened_at TEXT DEFAULT '', closed_at TEXT DEFAULT '',
+                dca_count INTEGER DEFAULT 0, leverage INTEGER DEFAULT 1,
+                entry_score INTEGER DEFAULT -1
+            );
+            CREATE INDEX IF NOT EXISTS idx_closed_at ON closed_trades(closed_at);
+            CREATE INDEX IF NOT EXISTS idx_entry_score ON closed_trades(entry_score);
+
+            CREATE TABLE IF NOT EXISTS equity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL, balance REAL NOT NULL,
+                equity REAL NOT NULL,
+                active_positions INTEGER DEFAULT 0,
+                total_realized_pnl REAL DEFAULT 0.0
+            );
+            CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_history(timestamp);
+
+            CREATE TABLE IF NOT EXISTS cooldowns (
+                key TEXT PRIMARY KEY, expires_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS extended_cooldowns (
+                key TEXT PRIMARY KEY, expires_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS trailing_state (
+                symbol TEXT PRIMARY KEY,
+                trailing_stop REAL NOT NULL,
+                peak_price REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL
+            );
+        """)
 
     # ------------------------------------------------------------------
     # Position lifecycle
@@ -709,69 +793,176 @@ class PositionTracker:
             self._peak_prices = peak_prices or {}
             self._persist()
     def _persist(self) -> None:
-        """Write positions and cooldowns to JSON file.
+        """Write in-memory state to SQLite. Caller holds _lock.
 
-        If the filesystem is not writable (e.g. Docker volume permissions), state
-        is kept in-memory and a warning is logged — the system continues running.
+        Append-only tables (closed_trades, equity_history) use incremental
+        inserts tracked by _synced_* counters. Small tables (positions,
+        cooldowns, trailing_state) use full replace.
         """
-        # _lock must already be held
-        self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-        data: dict[str, Any] = {
-            "positions": [p.to_dict() for p in self._positions.values()],
-            "closed": [c.to_dict() for c in self._closed],
-            "cooldowns": {k: v for k, v in self._cooldowns.items()},
-            "extended_cooldowns": {k: v for k, v in self._extended_cooldowns.items()},
-            "trailing_stops": getattr(self, "_trailing_stops", {}),
-            "peak_prices": getattr(self, "_peak_prices", {}),
-            "account_balance": self._account_balance,
-            "initial_balance": self._initial_balance,
-            "equity_history": getattr(self, "_equity_history", []),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            tmp = self._persist_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-            tmp.replace(self._persist_path)
-        except (PermissionError, OSError) as exc:
-            logger.warning("Position persistence unavailable (in-memory only): %s", exc)
-
-    def _load(self) -> None:
-        """Restore positions and cooldowns from JSON file."""
-        if not self._persist_path.exists():
+        if self._conn is None:
             return
         try:
-            raw = json.loads(self._persist_path.read_text())
-            for p in raw.get("positions", []):
-                sym = str(p.get("symbol", ""))
+            # Positions: small table, full replace
+            self._conn.execute("DELETE FROM positions")
+            for pos in self._positions.values():
+                self._conn.execute(
+                    """INSERT INTO positions
+                       (symbol, direction, entry_price, quantity, stop_loss,
+                        take_profit, opened_at, dca_count, leverage, entry_score,
+                        first_entry_cost, first_entry_quantity, de_risk_level)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (pos.symbol, pos.direction, pos.entry_price, pos.quantity,
+                     pos.stop_loss, pos.take_profit, pos.opened_at, pos.dca_count,
+                     pos.leverage, pos.entry_score, pos.first_entry_cost,
+                     pos.first_entry_quantity, pos.de_risk_level),
+                )
+
+            # Closed trades: incremental append
+            if len(self._closed) > self._synced_closed_count:
+                new_closed = self._closed[self._synced_closed_count:]
+                self._conn.executemany(
+                    """INSERT INTO closed_trades
+                       (symbol, direction, entry_price, exit_price, quantity,
+                        pnl_usdt, pnl_pct, reason, opened_at, closed_at,
+                        dca_count, leverage, entry_score)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    [(c.symbol, c.direction, c.entry_price, c.exit_price,
+                      c.quantity, c.pnl_usdt, c.pnl_pct, c.reason,
+                      c.opened_at, c.closed_at, c.dca_count, c.leverage,
+                      c.entry_score) for c in new_closed],
+                )
+                self._synced_closed_count = len(self._closed)
+
+            # Equity history: incremental append
+            if len(self._equity_history) > self._synced_equity_count:
+                new_equity = self._equity_history[self._synced_equity_count:]
+                self._conn.executemany(
+                    """INSERT INTO equity_history
+                       (timestamp, balance, equity, active_positions, total_realized_pnl)
+                       VALUES (?,?,?,?,?)""",
+                    [(e["timestamp"], e["balance"], e["equity"],
+                      e["active_positions"], e["total_realized_pnl"])
+                     for e in new_equity],
+                )
+                self._synced_equity_count = len(self._equity_history)
+
+            # Cooldowns: full replace
+            self._conn.execute("DELETE FROM cooldowns")
+            if self._cooldowns:
+                self._conn.executemany(
+                    "INSERT INTO cooldowns (key, expires_at) VALUES (?,?)",
+                    list(self._cooldowns.items()),
+                )
+
+            # Extended cooldowns: full replace
+            self._conn.execute("DELETE FROM extended_cooldowns")
+            if self._extended_cooldowns:
+                self._conn.executemany(
+                    "INSERT INTO extended_cooldowns (key, expires_at) VALUES (?,?)",
+                    list(self._extended_cooldowns.items()),
+                )
+
+            # Trailing state: full replace
+            self._conn.execute("DELETE FROM trailing_state")
+            if self._trailing_stops:
+                self._conn.executemany(
+                    """INSERT INTO trailing_state
+                       (symbol, trailing_stop, peak_price) VALUES (?,?,?)""",
+                    [(sym, self._trailing_stops[sym], self._peak_prices.get(sym, 0.0))
+                     for sym in self._trailing_stops],
+                )
+
+            # Metadata
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('account_balance', ?)",
+                (str(self._account_balance),),
+            )
+
+            self._conn.commit()
+        except Exception as exc:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            logger.warning("SQLite persistence unavailable (in-memory only): %s", exc)
+
+    def _load(self) -> None:
+        """Restore in-memory state from SQLite database."""
+        if not self._db_path.exists() or self._conn is None:
+            return
+        try:
+            # Positions
+            cursor = self._conn.execute("SELECT * FROM positions")
+            for row in cursor.fetchall():
+                sym = str(row["symbol"])
                 if not _VALID_SYMBOL_RE.match(sym):
                     logger.warning("Skipping invalid symbol in positions: %r", sym)
                     continue
-                pos = Position.from_dict(p)
-                self._positions[sym] = pos
-            for c in raw.get("closed", []):
-                try:
-                    self._closed.append(CloseRecord.from_dict(c))
-                except (KeyError, ValueError) as exc:
-                    logger.warning("Skipping invalid close record: %s", exc)
-            self._cooldowns = {k: float(v) for k, v in raw.get("cooldowns", {}).items()}
-            self._extended_cooldowns = {k: float(v) for k, v in raw.get("extended_cooldowns", {}).items()}
-            self._trailing_stops = raw.get("trailing_stops", {})
-            self._peak_prices = raw.get("peak_prices", {})
-            if "account_balance" in raw:
-                self._account_balance = float(raw["account_balance"])
-            # NOTE: _initial_balance deliberately NOT restored from JSON.
-            # The constructor value is authoritative — it reflects the balance
-            # at the time of this process start (which may be synced from the
-            # exchange in run_live_trading.py). Restoring a stale value from
-            # disk would skew total_return / max_drawdown metrics.
-            if "equity_history" in raw:
-                self._equity_history = list(raw["equity_history"])
+                self._positions[sym] = Position(
+                    symbol=row["symbol"], direction=row["direction"],
+                    entry_price=row["entry_price"], quantity=row["quantity"],
+                    stop_loss=row["stop_loss"], take_profit=row["take_profit"],
+                    opened_at=row["opened_at"], dca_count=row["dca_count"],
+                    leverage=row["leverage"], entry_score=row["entry_score"],
+                    first_entry_cost=row["first_entry_cost"],
+                    first_entry_quantity=row["first_entry_quantity"],
+                    de_risk_level=row["de_risk_level"],
+                )
+
+            # Closed trades
+            cursor = self._conn.execute("SELECT * FROM closed_trades ORDER BY id ASC")
+            for row in cursor.fetchall():
+                self._closed.append(CloseRecord(
+                    symbol=row["symbol"], direction=row["direction"],
+                    entry_price=row["entry_price"], exit_price=row["exit_price"],
+                    quantity=row["quantity"], pnl_usdt=row["pnl_usdt"],
+                    pnl_pct=row["pnl_pct"], reason=row["reason"],
+                    opened_at=row["opened_at"], closed_at=row["closed_at"],
+                    dca_count=row["dca_count"], leverage=row["leverage"],
+                    entry_score=row["entry_score"],
+                ))
+            self._synced_closed_count = len(self._closed)
+
+            # Equity history
+            cursor = self._conn.execute("SELECT * FROM equity_history ORDER BY id ASC")
+            for row in cursor.fetchall():
+                self._equity_history.append({
+                    "timestamp": row["timestamp"],
+                    "balance": row["balance"],
+                    "equity": row["equity"],
+                    "active_positions": row["active_positions"],
+                    "total_realized_pnl": row["total_realized_pnl"],
+                })
+            self._synced_equity_count = len(self._equity_history)
+
+            # Cooldowns
+            cursor = self._conn.execute("SELECT * FROM cooldowns")
+            self._cooldowns = {row["key"]: row["expires_at"] for row in cursor.fetchall()}
+
+            # Extended cooldowns
+            cursor = self._conn.execute("SELECT * FROM extended_cooldowns")
+            self._extended_cooldowns = {row["key"]: row["expires_at"] for row in cursor.fetchall()}
+
+            # Trailing state
+            cursor = self._conn.execute("SELECT * FROM trailing_state")
+            for row in cursor.fetchall():
+                self._trailing_stops[row["symbol"]] = row["trailing_stop"]
+                self._peak_prices[row["symbol"]] = row["peak_price"]
+
+            # Account balance from metadata (initial_balance is NOT restored)
+            cursor = self._conn.execute(
+                "SELECT value FROM metadata WHERE key='account_balance'"
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                self._account_balance = float(row["value"])
+
             logger.info(
                 "Loaded %d positions, %d closed records, %d equity snapshots from %s",
-                len(self._positions), len(self._closed), len(self._equity_history), self._persist_path,
+                len(self._positions), len(self._closed), len(self._equity_history), self._db_path,
             )
-        except (json.JSONDecodeError, KeyError, ValueError) as exc:
-            logger.warning("Failed to load positions from %s: %s", self._persist_path, exc)
+        except Exception as exc:
+            logger.warning("Failed to load state from %s: %s", self._db_path, exc)
 
     def clear(self) -> None:
         """Remove all positions and clear persistence (useful for testing)."""
@@ -781,5 +972,9 @@ class PositionTracker:
             self._cooldowns.clear()
             self._extended_cooldowns.clear()
             self._equity_history.clear()
-            if self._persist_path.exists():
-                self._persist_path.unlink()
+            self._trailing_stops.clear()
+            self._peak_prices.clear()
+            self._synced_closed_count = 0
+            self._synced_equity_count = 0
+            if self._db_path.exists():
+                self._db_path.unlink()
