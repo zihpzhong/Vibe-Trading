@@ -144,9 +144,10 @@ def ts_argmax_decay(high: pd.Series, period: int = 10) -> float:
     if len(high) < period:
         return 0.5
     window = high.iloc[-period:]
-    idx_max = int(window.idxmax() if hasattr(window, 'idxmax') else np.argmax(window.to_numpy()))
+    # np.argmax gives positional index (0 = oldest in window), always works with any index type
+    idx_max = int(np.argmax(window.to_numpy()))
     # Convert to age: position from end (0 = most recent, period-1 = oldest)
-    age = len(window) - 1 - (window.index.get_loc(idx_max) if hasattr(window.index, 'get_loc') else list(window.index).index(idx_max))
+    age = len(window) - 1 - idx_max
     # Normalize: 1.0 = fresh high, 0.0 = long ago
     return float(1.0 - age / max(period - 1, 1))
 
@@ -159,8 +160,9 @@ def ts_argmin_decay(low: pd.Series, period: int = 10) -> float:
     if len(low) < period:
         return 0.5
     window = low.iloc[-period:]
-    idx_min = int(window.idxmin() if hasattr(window, 'idxmin') else np.argmin(window.to_numpy()))
-    age = len(window) - 1 - (window.index.get_loc(idx_min) if hasattr(window.index, 'get_loc') else list(window.index).index(idx_min))
+    # np.argmin gives positional index (0 = oldest in window), always works with any index type
+    idx_min = int(np.argmin(window.to_numpy()))
+    age = len(window) - 1 - idx_min
     return float(1.0 - age / max(period - 1, 1))
 
 
