@@ -241,7 +241,7 @@ class TestPersistence:
 
     def test_positions_persisted_to_file(self, tracker: PositionTracker) -> None:
         tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
-        assert tracker._persist_path.exists()
+        assert tracker._db_path.exists()
 
     def test_positions_restored_on_load(self) -> None:
         import shutil
@@ -250,7 +250,7 @@ class TestPersistence:
         t1 = PositionTracker(account_balance=10000.0, persist_dir=tmp)
         t1.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0, 67000.0)
 
-        # Create new tracker that loads from same file
+        # Create new tracker that loads from same database
         t2 = PositionTracker(account_balance=10000.0, persist_dir=tmp)
         assert t2.active_count == 1
         pos = t2.get_position("BTCUSDT")
@@ -274,22 +274,20 @@ class TestPersistence:
         t1.clear()
         shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_clear_removes_persist_file(self, tracker: PositionTracker) -> None:
+    def test_clear_removes_db_file(self, tracker: PositionTracker) -> None:
         tracker.open_position("X", "LONG", 100.0, 1.0, 90.0)
-        assert tracker._persist_path.exists()
+        assert tracker._db_path.exists()
         tracker.clear()
-        assert not tracker._persist_path.exists()
+        assert not tracker._db_path.exists()
         assert tracker.active_count == 0
 
-    def test_load_corrupt_file_handled(self) -> None:
-        import shutil
+    def test_load_non_existent_db_handled(self) -> None:
         import tempfile
         tmp = tempfile.mkdtemp()
-        persist_path = Path(tmp) / "positions.json"
-        persist_path.write_text("not json")
         t = PositionTracker(account_balance=10000.0, persist_dir=tmp)
         assert t.active_count == 0  # gracefully handled
         t.clear()
+        import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -431,9 +429,147 @@ class TestEntryScore:
         # Re-create tracker to trigger deserialization
         import tempfile
         import shutil
-        persist_dir = tracker._persist_path.parent
+        persist_dir = tracker._db_path.parent
         t2 = PositionTracker(account_balance=10000.0, persist_dir=str(persist_dir))
         closed = t2.get_recent_closed(10)
         assert len(closed) >= 1
         assert closed[-1].entry_score == 8
+        t2.clear()
+
+
+# ---------------------------------------------------------------------------
+# SQLite-specific tests
+# ---------------------------------------------------------------------------
+
+class TestSQLite:
+    """SQLite persistence specifics: WAL mode, incremental sync, migration."""
+
+    def test_wal_mode_active(self, tracker: PositionTracker) -> None:
+        """Database should be in WAL journal mode."""
+        cursor = tracker._conn.execute("PRAGMA journal_mode")
+        assert cursor.fetchone()[0].lower() == "wal"
+
+    def test_sqlite_roundtrip(self) -> None:
+        """Open trade -> close -> verify data via direct SQL."""
+        import shutil
+        import tempfile
+        import sqlite3
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        t.open_position("ETHUSDT", "SHORT", 3200.0, 0.5, 3300.0, 3100.0, entry_score=7)
+        t.close_position("ETHUSDT", exit_price=3100.0, reason="TP")
+
+        # Verify directly via SQLite
+        conn = sqlite3.connect(str(Path(tmp) / "trading.db"))
+        row = conn.execute(
+            "SELECT pnl_usdt, pnl_pct, reason, entry_score FROM closed_trades"
+        ).fetchone()
+        assert row is not None
+        assert row[2] == "TP"
+        assert row[3] == 7  # entry_score
+        conn.close()
+        t.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_equity_incremental_sync(self) -> None:
+        """Verify only new equity rows are appended on each _persist()."""
+        import shutil
+        import tempfile
+        import sqlite3
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        # Open 3 positions — each triggers _persist() with equity snapshot
+        t.open_position("A", "LONG", 100.0, 1.0, 90.0)
+        t.open_position("B", "LONG", 200.0, 1.0, 180.0)
+        t.open_position("C", "LONG", 300.0, 1.0, 270.0)
+
+        conn = sqlite3.connect(str(Path(tmp) / "trading.db"))
+        count = conn.execute("SELECT COUNT(*) FROM equity_history").fetchone()[0]
+        conn.close()
+        assert count >= 3  # at least 3 snapshots (one per open)
+        assert t._synced_equity_count == count  # sync counter matches DB
+
+        t.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_migrate_from_json(self) -> None:
+        """Migrate old positions.json to trading.db."""
+        import shutil
+        import tempfile
+        import json
+        import sqlite3
+        tmp = Path(tempfile.mkdtemp())
+
+        # Create mock positions.json
+        mock_data = {
+            "positions": [{
+                "symbol": "BTCUSDT", "direction": "LONG",
+                "entry_price": 77150.0, "quantity": 0.001,
+                "stop_loss": 73292.5, "take_profit": 88722.5,
+                "opened_at": "2026-05-17T23:41:21Z",
+                "dca_count": 0, "leverage": 5, "entry_score": 7,
+                "first_entry_cost": 77150.0, "first_entry_quantity": 0.001,
+                "de_risk_level": 0,
+            }],
+            "closed": [{
+                "symbol": "ETHUSDT", "direction": "SHORT",
+                "entry_price": 3200.0, "exit_price": 3100.0,
+                "quantity": 0.5, "pnl_usdt": 50.0, "pnl_pct": 3.12,
+                "reason": "TP", "opened_at": "2026-05-17T22:00:00Z",
+                "closed_at": "2026-05-17T23:00:00Z",
+                "dca_count": 0, "leverage": 1, "entry_score": 8,
+            }],
+            "cooldowns": {"BTCUSDT:LONG": 1000.0},
+            "account_balance": 207.63,
+        }
+        json_path = tmp / "positions.json"
+        json_path.write_text(json.dumps(mock_data))
+
+        # Run migration
+        from extensions.live_trading.engine.migration import migrate_from_json
+        result = migrate_from_json(str(tmp))
+        assert result is True
+
+        # Verify migrated data
+        conn = sqlite3.connect(str(tmp / "trading.db"))
+        assert conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM closed_trades").fetchone()[0] == 1
+        row = conn.execute("SELECT value FROM metadata WHERE key='account_balance'").fetchone()
+        assert float(row[0]) == pytest.approx(207.63)
+        conn.close()
+
+        # Old file should be renamed to .bak
+        assert not (tmp / "positions.json").exists()
+        assert (tmp / "positions.json.bak").exists()
+
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_migrate_idempotent(self) -> None:
+        """Second migration call should be a no-op."""
+        import shutil
+        import tempfile
+        import json
+        tmp = Path(tempfile.mkdtemp())
+
+        mock_data = {"positions": [], "closed": []}
+        (tmp / "positions.json").write_text(json.dumps(mock_data))
+
+        from extensions.live_trading.engine.migration import migrate_from_json
+        assert migrate_from_json(str(tmp)) is True  # first run
+        assert migrate_from_json(str(tmp)) is False  # second run skipped
+
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_trailing_state_roundtrip(self, tracker: PositionTracker) -> None:
+        """Trailing stop state survives restart."""
+        import sqlite3
+        import shutil
+
+        tracker.set_trailing_state({"BTCUSDT": 76000.0}, {"BTCUSDT": 78000.0})
+
+        persist_dir = tracker._db_path.parent
+        t2 = PositionTracker(account_balance=10000.0, persist_dir=str(persist_dir))
+        state = t2.get_trailing_state()
+        assert state["trailing_stops"].get("BTCUSDT") == 76000.0
+        assert state["peak_prices"].get("BTCUSDT") == 78000.0
         t2.clear()
