@@ -34,6 +34,7 @@ _STABLECOINS: frozenset[str] = frozenset({
 _MEMECOIN_BLACKLIST: frozenset[str] = frozenset({
     "BIO",   # low-cap biotech meme, caused -$1.53 loss on 2026-05-11
     "BILL",  # low-cap micro-price token, 5 trades/3 de-risk losses on 2026-05-12/13
+    "LAB",   # low-cap, 5 trades/40% win rate, -2.18% avg return on 2026-05-10/18
 })
 
 # Price tiers for position sizing guidance
@@ -528,6 +529,14 @@ class MarketScanner:
         if rsi_1h < 30 and change_24h < -15:
             score = min(score, 5)
 
+        # Extreme RSI < 18: deep-trending selloff, not a reversal signal
+        if rsi_1h < 18:
+            score = min(score, 5)
+
+        # Volume confirmation requirement for high-score signals
+        if score >= 6 and ind.get("vol_ratio", 1.0) < 1.5:
+            score = min(score, 5)
+
         return score
 
     @staticmethod
@@ -603,6 +612,14 @@ class MarketScanner:
         # Trend filter (final guard): zero out in uptrend without overbought confirmation
         if price > ema200 and rsi_1h < 60:
             score = 0  # 上升趋势中非超买 → 不做空
+
+        # Extreme RSI > 82: deep-trending rally, not a reversal signal
+        if rsi_1h > 82:
+            score = min(score, 5)
+
+        # Volume confirmation requirement for high-score signals
+        if score >= 6 and ind.get("vol_ratio", 1.0) < 1.5:
+            score = min(score, 5)
 
         return score
 

@@ -91,6 +91,20 @@ class TradingScheduler:
         # Step 2: Phase 1 scan
         scan_result = self._scanner.scan(top_n=top_n, whitelist=whitelist)
 
+        # Step 2b: Align scores with BTC 1h trend to prevent contradictory signals
+        # WEAKNESS → cap LONG scores; STRENGTH → cap SHORT scores
+        if btc_1h_trend in ("WEAKNESS", "STRENGTH"):
+            capped = 0
+            for r in scan_result.rankings:
+                if btc_1h_trend == "WEAKNESS" and r["direction"] == "LONG" and r["score"] >= 6:
+                    r["score"] = 5
+                    capped += 1
+                elif btc_1h_trend == "STRENGTH" and r["direction"] == "SHORT" and r["score"] >= 6:
+                    r["score"] = 5
+                    capped += 1
+            if capped:
+                logger.info("BTC %s → capped %d directional scores to 5", btc_1h_trend, capped)
+
         # Step 3: Tiered decisions
         phase2_requests: list[Phase2Request] = []
         if self._trading_enabled:
