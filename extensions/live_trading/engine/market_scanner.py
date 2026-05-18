@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 MIN_VOLUME_24H_USDT = 1_000_000  # 100 万 USDT
 MIN_SCORE = 3
+_VOL_RATIO_HIGH_SCORE_THRESHOLD = 1.5  # 高分信号所需的最低成交量比（趋势市可调低至 1.2）
 
 # Stablecoins that should never generate trading signals
 _STABLECOINS: frozenset[str] = frozenset({
@@ -530,7 +531,7 @@ class MarketScanner:
             score -= 1  # 低價币流动性差，做多暴跌风险大
 
         # Volume confirmation
-        if vol_ratio > 1.5 and change_24h < 0:
+        if vol_ratio > _VOL_RATIO_HIGH_SCORE_THRESHOLD and change_24h < 0:
             score += 1
 
         # K线形态确认: 看涨形态加分, 看跌形态不额外扣分
@@ -550,12 +551,14 @@ class MarketScanner:
         if rsi_1h < 30 and change_24h < -15:
             score = min(score, 5)
 
-        # Extreme RSI < 18: deep-trending selloff, not a reversal signal
-        if rsi_1h < 18:
+        # Extreme RSI < 18: deep-trending selloff, not a reversal signal.
+        # Exception: if vol_ratio >= 2.0, this is capitulation with volume
+        # confirmation → statistically significant bounce setup.
+        if rsi_1h < 18 and not (ind.get("vol_ratio", 1.0) >= 2.0):
             score = min(score, 5)
 
         # Volume confirmation requirement for high-score signals
-        if score >= 6 and ind.get("vol_ratio", 1.0) < 1.5:
+        if score >= 6 and ind.get("vol_ratio", 1.0) < _VOL_RATIO_HIGH_SCORE_THRESHOLD:
             score = min(score, 5)
 
         return score
@@ -604,7 +607,7 @@ class MarketScanner:
             score += 1
 
         # Volume confirmation
-        if vol_ratio > 1.5 and change_24h > 0:
+        if vol_ratio > _VOL_RATIO_HIGH_SCORE_THRESHOLD and change_24h > 0:
             score += 1
 
         # K线形态确认: 看跌形态加分, 看涨形态不额外扣分
@@ -641,12 +644,13 @@ class MarketScanner:
         if price > ema200 and rsi_1h < 60:
             score = 0  # 上升趋势中非超买 → 不做空
 
-        # Extreme RSI > 82: deep-trending rally, not a reversal signal
-        if rsi_1h > 82:
+        # Extreme RSI > 82: deep-trending rally, not a reversal signal.
+        # Exception: vol_ratio >= 2.0 confirms climax top with volume.
+        if rsi_1h > 82 and not (ind.get("vol_ratio", 1.0) >= 2.0):
             score = min(score, 5)
 
         # Volume confirmation requirement for high-score signals
-        if score >= 6 and ind.get("vol_ratio", 1.0) < 1.5:
+        if score >= 6 and ind.get("vol_ratio", 1.0) < _VOL_RATIO_HIGH_SCORE_THRESHOLD:
             score = min(score, 5)
 
         return score
