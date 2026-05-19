@@ -99,6 +99,12 @@ LIVE_CONFIRM_PHRASE = "I_UNDERSTAND"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Vibe Trading 全流程实盘自动交易系统")
+    parser.add_argument(
+        "--market",
+        choices=["crypto", "astock"],
+        default="crypto",
+        help="市场类型: crypto=加密永续 (默认), astock=A股",
+    )
     parser.add_argument("--mock", action="store_true", help="使用模拟交易所（测试用）")
     parser.add_argument("--dry-run", action="store_true", help="扫描但不交易")
     parser.add_argument("--live", action="store_true", help="显式启用真实下单")
@@ -183,6 +189,10 @@ def build_status_table(
 
 def main() -> int:
     args = parse_args()
+    if args.market == "astock":
+        from extensions import run_astock_trading
+
+        return run_astock_trading.main()
     live_mode_error = validate_live_mode(args)
     if live_mode_error:
         log.error(live_mode_error)
