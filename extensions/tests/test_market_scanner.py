@@ -55,6 +55,8 @@ def _base_indicators(**overrides: float) -> dict:
         "rsi_1h": 50.0,
         "rsi_15m": 50.0,
         "ema200": 100.0,
+        "ema12": 100.0,
+        "ema26": 100.0,
         "bb_pct": 0.5,
         "vol_ratio": 1.0,
         "price_in_8h_pct": 0.5,
@@ -330,7 +332,8 @@ class TestShortScoreTrendFilter:
     """Trend filter rules for SHORT."""
 
     def test_price_below_ema200_adds_1(self) -> None:
-        ind = _base_indicators(price=90.0, ema200=100.0)
+        """price < EMA200 with bearish EMA cross → +1."""
+        ind = _base_indicators(price=90.0, ema200=100.0, ema12=85.0, ema26=95.0)
         ind_base = _base_indicators(price=100.0, ema200=100.0)
         assert MarketScanner.score_short(ind) > MarketScanner.score_short(ind_base)
 
@@ -432,20 +435,22 @@ class TestShortScoreMomentumConsistency:
         assert 0 < MarketScanner.score_short(ind) <= 5
 
     def test_no_cap_when_rsi_not_extreme(self) -> None:
-        """No cap when RSI <= 70 even with large pump."""
+        """No cap when RSI <= 70 even with large pump, IF in confirmed downtrend (EMA12 < EMA26)."""
         ind = _base_indicators(
             rsi_1h=65.0, change_24h=20.0,
             rsi_15m=78.0, bb_pct=0.9, price_in_8h_pct=0.95,
             price=90.0, ema200=100.0, vol_ratio=2.0,
+            ema12=85.0, ema26=95.0,
         )
         assert MarketScanner.score_short(ind) > 5
 
     def test_no_cap_when_pump_not_extreme(self) -> None:
-        """No cap when pump <= 15% even with high RSI."""
+        """No cap when pump <= 15% even with high RSI, IF in confirmed downtrend."""
         ind = _base_indicators(
             rsi_1h=75.0, change_24h=14.0,
             rsi_15m=78.0, bb_pct=0.9, price_in_8h_pct=0.95,
             price=90.0, ema200=100.0, vol_ratio=2.0,
+            ema12=85.0, ema26=95.0,
         )
         assert MarketScanner.score_short(ind) > 5
 
@@ -491,11 +496,12 @@ class TestMaxScore:
         assert MarketScanner.score_long(ind) == 10  # max: 2+1+1+2+1+1+1+1
 
     def test_short_max_score_is_10(self) -> None:
-        """SHORT max score = 10 (all conditions met simultaneously)."""
+        """SHORT max score = 10 (all conditions met simultaneously, confirmed downtrend)."""
         ind = _base_indicators(
             rsi_1h=75.0, rsi_15m=78.0,
             change_24h=12.0, bb_pct=0.9, price_in_8h_pct=0.95,
             price=90.0, ema200=100.0, vol_ratio=2.0,
+            ema12=85.0, ema26=95.0,
         )
         assert MarketScanner.score_short(ind) == 10  # max: 2+1+1+2+1+1+1+1
 
