@@ -164,7 +164,7 @@ Rules:
             )
             return self._parse_response(response.content, req.symbol)
         except Exception as exc:
-            logger.warning("Phase2 analysis failed for %s: %s", req.symbol, exc)
+            logger.warning("Phase2 analysis failed for %s: %s", req.symbol, exc, exc_info=True)
             return None
 
     def _build_prompt(
@@ -194,8 +194,8 @@ Rules:
             if bids and asks:
                 best_bid = bids[0][0] if len(bids) > 0 else "?"
                 best_ask = asks[0][0] if len(asks) > 0 else "?"
-                bid_vol = sum(b[1] for b in bids[:5]) if len(bids) > 0 else 0
-                ask_vol = sum(a[1] for a in asks[:5]) if len(asks) > 0 else 0
+                bid_vol = sum(float(b[1]) for b in bids[:5]) if len(bids) > 0 else 0
+                ask_vol = sum(float(a[1]) for a in asks[:5]) if len(asks) > 0 else 0
                 spread = float(best_ask) - float(best_bid) if best_ask != "?" and best_bid != "?" else 0
                 imbalance = "buy-side" if bid_vol > ask_vol * 1.2 else ("sell-side" if ask_vol > bid_vol * 1.2 else "neutral")
                 ob_summary = (f"- Orderbook: spread={spread:.4f}, top5 bid_vol={bid_vol:.2f}, "
