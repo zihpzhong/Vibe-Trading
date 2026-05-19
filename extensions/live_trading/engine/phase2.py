@@ -127,6 +127,9 @@ Rules:
         self,
         req: Phase2Request,
         ticker: Optional[dict] = None,
+        funding_rate: Optional[float] = None,
+        orderbook: Optional[dict] = None,
+        btc_1h_trend: str = "NEUTRAL",
     ) -> Optional[dict]:
         """Run Phase 2 on one signal. Returns verdict dict or None on failure."""
         needed = [d for d in req.dims if d in DIM_SKILL_MAP]
@@ -150,7 +153,7 @@ Rules:
                     req.symbol, loaded_count, len(needed), needed_threshold,
                 )
                 return {"symbol": req.symbol, "consensus": "NEUTRAL", "summary": "insufficient dimension data", "dimensions": {}}
-            prompt = self._build_prompt(req, ticker or {}, skills)
+            prompt = self._build_prompt(req, ticker or {}, skills, funding_rate, orderbook, btc_1h_trend)
             llm = self._get_llm()
             response = llm.chat(
                 messages=[
@@ -164,13 +167,39 @@ Rules:
             logger.warning("Phase2 analysis failed for %s: %s", req.symbol, exc)
             return None
 
-    def _build_prompt(self, req: Phase2Request, ticker: dict, skills: dict[str, str]) -> str:
+    def _build_prompt(
+        self,
+        req: Phase2Request,
+        ticker: dict,
+        skills: dict[str, str],
+        funding_rate: Optional[float] = None,
+        orderbook: Optional[dict] = None,
+        btc_1h_trend: str = "NEUTRAL",
+    ) -> str:
         dim_list = "\n".join(f"  - {d} ({DIM_LABELS.get(d, d)})" for d in skills.keys())
 
         skills_block = ""
         for dim, content in skills.items():
             label = DIM_LABELS.get(dim, dim)
             skills_block += f"\n===== {label} ({dim}) =====\n{content}\n"
+
+        # Live market context — data already fetched by the main loop
+        fr_line = f"- Funding Rate: {funding_rate:.6f}" if funding_rate is not None else "- Funding Rate: N/A"
+        btc_line = f"- BTC 1h Trend: {btc_1h_trend}"
+
+        ob_summary = "- Orderbook: N/A"
+        if orderbook:
+            bids = orderbook.get("bids", [])
+            asks = orderbook.get("asks", [])
+            if bids and asks:
+                best_bid = bids[0][0] if len(bids) > 0 else "?"
+                best_ask = asks[0][0] if len(asks) > 0 else "?"
+                bid_vol = sum(b[1] for b in bids[:5]) if len(bids) > 0 else 0
+                ask_vol = sum(a[1] for a in asks[:5]) if len(asks) > 0 else 0
+                spread = float(best_ask) - float(best_bid) if best_ask != "?" and best_bid != "?" else 0
+                imbalance = "buy-side" if bid_vol > ask_vol * 1.2 else ("sell-side" if ask_vol > bid_vol * 1.2 else "neutral")
+                ob_summary = (f"- Orderbook: spread={spread:.4f}, top5 bid_vol={bid_vol:.2f}, "
+                              f"top5 ask_vol={ask_vol:.2f}, imbalance={imbalance}")
 
         return f"""Analyze this trading signal.
 
@@ -184,6 +213,11 @@ Rules:
 - RSI(1h): {req.rsi_1h:.1f}
 - Current Price: ${ticker.get("last", "N/A")}
 - 24h Volume: ${ticker.get("volume24h", ticker.get("volume", "N/A"))}
+
+## Live Market Context
+{fr_line}
+{btc_line}
+{ob_summary}
 
 ## Required Dimensions (load_skill per dim)
 {dim_list}

@@ -429,6 +429,8 @@ class MarketScanner:
         rsi_1h = _rsi(close_1h, 14)
         rsi_15m = _rsi(close_15m, 14)
         ema200 = _ema(close_1h, 200)
+        ema12 = _ema(close_1h, 12)
+        ema26 = _ema(close_1h, 26)
         bb_pct = _bb_pct(close_1h, 20, 2.0)
 
         # Volume ratio: latest bar volume / average of last 24 bars
@@ -462,6 +464,8 @@ class MarketScanner:
             "rsi_1h": rsi_1h,
             "rsi_15m": rsi_15m,
             "ema200": ema200,
+            "ema12": ema12,
+            "ema26": ema26,
             "bb_pct": bb_pct,
             "vol_ratio": vol_ratio,
             "price_in_8h_pct": price_in_8h_pct,
@@ -622,14 +626,30 @@ class MarketScanner:
         elif alpha_signal > 0.3:
             score -= 1  # bullish divergence
 
-        # Downtrend bonus: shorting in downtrend gets extra confirmation
-        if price < ema200:
-            score += 1
+        # Downtrend bonus: shorting in downtrend gets extra confirmation.
+        # Only applies when bearish EMA crossover confirms active downtrend
+        # (prevents false SHORT signals on bouncing/consolidating coins below EMA200).
+        ema12 = ind.get("ema12", price)
+        ema26 = ind.get("ema26", price)
+        if price < ema200 and ema12 < ema26:
+            score += 1  # 下降趋势确认 (EMA12 < EMA26) → 做空加分
 
         # Trend momentum consistency: avoid shorting coins in uptrend with positive momentum
         # Applied before zero-check so both constraints layer properly
         if price > ema200 and change_24h > 0:
             score -= 2  # 上升趋势 + 正动量 → 强做空惩罚
+
+        # Bounce/consolidate guard: if price is in upper 8h range AND RSI > 50
+        # AND 24h positive (actively rising), the asset is not in a trending
+        # downtrend — cap SHORT score below Phase 2 entry.
+        # Does NOT apply when EMA12 < EMA26 (confirmed downtrend) — there,
+        # an overbought bounce is a legitimate counter-trend SHORT setup.
+        # Prevents counter-trend SHORT signals that Phase 2 would reject anyway.
+        price_in_8h_pct = ind.get("price_in_8h_pct", 0.5)
+        ema12 = ind.get("ema12", price)
+        ema26 = ind.get("ema26", price)
+        if price_in_8h_pct > 0.6 and rsi_1h > 50 and change_24h > 0 and not (ema12 < ema26) and score >= 5:
+            score = min(score, 4)  # 反弹/盘整中，降级到 watchlist
 
         # Low-price penalty: thin liquidity amplifies pump risk for shorts
         if price < _LOW_PRICE_THRESHOLD:

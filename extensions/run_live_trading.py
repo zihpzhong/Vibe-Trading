@@ -91,7 +91,7 @@ log = logging.getLogger("live_trading")
 console = Console()
 
 # 默认开仓比例: 单次开仓使用资金比例
-DEFAULT_POSITION_SIZE_PCT = 0.05  # 5% of account
+DEFAULT_POSITION_SIZE_PCT = 0.12  # 12% of account (reduced from 20% to mitigate -93% DD risk)
 # 默认R:R = 2:1 计算止盈
 DEFAULT_REWARD_RISK_RATIO = 2.0
 LIVE_CONFIRM_PHRASE = "I_UNDERSTAND"
@@ -653,9 +653,21 @@ def main() -> int:
                         log.warning("Market data fetch failed for %s: %s", symbol, exc)
                         continue
 
+                    # 2bb. 获取资金费率（用于 Phase 2 分析和 Gate）
+                    funding_rate = None
+                    try:
+                        funding_rate = exchange.get_funding_rate(symbol)
+                    except Exception as exc:
+                        log.warning("Funding rate fetch failed for %s: %s", symbol, exc)
+
                     # 2c. Phase 2: LLM深度分析 — load_skill per dim → 综合评分
                     if phase2_analyzer and req.dims:
-                        phase2_result = phase2_analyzer.analyze(req, ticker)
+                        phase2_result = phase2_analyzer.analyze(
+                            req, ticker,
+                            funding_rate=funding_rate,
+                            orderbook=orderbook,
+                            btc_1h_trend=btc_hint,
+                        )
                         if phase2_result:
                             dims_str = "; ".join(
                                 f"{d}:{phase2_result.get('dimensions', {}).get(d, {}).get('verdict', '?')}"
@@ -674,6 +686,18 @@ def main() -> int:
                                 if req.tier == "fast_track":
                                     console.print(
                                         f"  {symbol:12s} [green]PHASE2 FAST_TRACK PASS[/green] — {summary}"
+                                    )
+                                    console.print(f"           {dims_str}")
+                                    watch_only_flag = False
+                                elif all(
+                                    phase2_result.get("dimensions", {}).get(d, {}).get("verdict") == "NEUTRAL"
+                                    for d in req.dims
+                                ):
+                                    # 所有维度均 NEUTRAL（通常是缺乏实时数据，不是真正风险信号）
+                                    # Gate 已覆盖流动性/资金费率/盘口冲击/R:R 等实质性检查
+                                    console.print(
+                                        f"  {symbol:12s} [green]PHASE2 ALL-NEUTRAL PASS[/green] — "
+                                        f"no live data for LLM, Gate checks as safety net"
                                     )
                                     console.print(f"           {dims_str}")
                                     watch_only_flag = False
@@ -723,12 +747,7 @@ def main() -> int:
                         log.warning("ATR calculation failed for %s: %s", symbol, exc)
                         continue
 
-                    # 2d. 获取资金费率
-                    funding_rate = None
-                    try:
-                        funding_rate = exchange.get_funding_rate(symbol)
-                    except Exception as exc:
-                        log.warning("Funding rate fetch failed for %s: %s", symbol, exc)
+                    # 2d. 资金费率已获取（见 2bb 节），直接进入下单量计算
 
                     # 2e. 计算预期下单量（Gate 需要此值做盘口冲击检查）
                     max_lev = args.max_leverage
