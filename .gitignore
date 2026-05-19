@@ -12,6 +12,7 @@ agent/.env
 CLAUDE.md
 .DS_Store
 .vscode/
+.idea/
 learn-claude-code-main/
 agent/sessions/
 agent/runs/
