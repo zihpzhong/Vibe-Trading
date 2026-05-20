@@ -814,6 +814,7 @@ def main() -> int:
                         order_qty=order_qty,
                         account_balance=positions.account_balance,
                         order_margin=position_margin,
+                        whitelist=config.pair_whitelist or None,
                     )
 
                     # Phase 2 NEUTRAL 降级: 即使 Gate PASS 也降为 WATCH_ONLY
