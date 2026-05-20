@@ -94,6 +94,12 @@ console = Console()
 DEFAULT_POSITION_SIZE_PCT = 0.12  # 12% of account (reduced from 20% to mitigate -93% DD risk)
 # 默认R:R = 2:1 计算止盈
 DEFAULT_REWARD_RISK_RATIO = 2.0
+DEFAULT_MAX_POSITIONS = 3
+DEFAULT_MAX_SAME_DIRECTION = 2
+DEFAULT_MIN_ENTRY_SCORE = 5
+SCORE_TIER_HALF_SIZE = 5  # score==5 → 50% position size
+DEFAULT_MAX_DAILY_LOSS_PCT = 0.05  # 5% realized daily loss circuit breaker
+DEFAULT_MAX_ROLLING_DRAWDOWN_PCT = 0.05  # 5% peak-to-trough over 24h
 LIVE_CONFIRM_PHRASE = "I_UNDERSTAND"
 
 
@@ -207,6 +213,7 @@ def main() -> int:
     from extensions.live_trading.engine.atr_stop import calculate_atr_stop
     from extensions.live_trading.engine.execution_gate import ExecGateEngine
     from extensions.live_trading.engine.phase2 import Phase2Analyzer
+    from extensions.live_trading.engine.reconcile import reconcile_positions
     from extensions.live_trading.config import LiveTradingConfig
     from extensions.live_trading.models import GateStatus, LiveSignal, ScheduleReport, SignalDirection
 
@@ -293,8 +300,9 @@ def main() -> int:
     effective_balance = actual_usdt_balance if actual_usdt_balance is not None else args.balance
     positions = PositionTracker(
         account_balance=effective_balance,
-        max_positions=5,
-        max_exposure_pct=5.0,  # 总敞口上限 500%（含杠杆名义价值, 5 仓 × 100%/仓）
+        max_positions=DEFAULT_MAX_POSITIONS,
+        max_same_direction=DEFAULT_MAX_SAME_DIRECTION,
+        max_exposure_pct=3.0,  # 总敞口上限 300%（3 仓 × ~100%/仓 名义）
     )
     # 确保 _load() 不覆盖构造函数传入的交易所真实余额
     if actual_usdt_balance is not None:
@@ -340,13 +348,20 @@ def main() -> int:
         仅在持仓平仓时记录已实现盈亏，不受浮动盈亏波动影响。
         熔断后进入冷却期（默认4小时），冷却结束后可恢复交易。
         """
-        def __init__(self, max_daily_loss_pct: float = 0.10, cooldown_hours: float = 4.0):
+        def __init__(
+            self,
+            max_daily_loss_pct: float = DEFAULT_MAX_DAILY_LOSS_PCT,
+            max_rolling_drawdown_pct: float = DEFAULT_MAX_ROLLING_DRAWDOWN_PCT,
+            cooldown_hours: float = 4.0,
+        ):
             self.max_daily_loss_pct = max_daily_loss_pct
+            self.max_rolling_drawdown_pct = max_rolling_drawdown_pct
             self.cooldown_hours = cooldown_hours
             self._day_key = ""
             self._realized_pnl: float = 0.0  # 当日已实现盈亏
             self._last_closed_count: int = 0  # 已处理的平仓记录数
             self._suspended_until: float = 0.0  # 熔断解除时间戳
+            self._rolling_tripped: bool = False
 
         def reset_if_new_day(self) -> None:
             """跨日自动重置。"""
@@ -361,11 +376,15 @@ def main() -> int:
                 self._day_key = today
                 self._realized_pnl = 0.0
                 self._last_closed_count = 0
+                self._rolling_tripped = False
                 # 新交易日解除熔断
                 if self._suspended_until > 0:
                     log.info("DailyRiskTracker: 新交易日, 解除熔断")
                     self._suspended_until = 0.0
-                log.info("DailyRiskTracker reset for %s (threshold %.0f%%)", today, self.max_daily_loss_pct * 100)
+                log.info(
+                    "DailyRiskTracker reset for %s (daily %.0f%%, rolling %.0f%%)",
+                    today, self.max_daily_loss_pct * 100, self.max_rolling_drawdown_pct * 100,
+                )
 
         def sync_from_closed(self, closed_positions: list) -> int:
             """从已平仓记录同步当日已实现盈亏。
@@ -398,13 +417,31 @@ def main() -> int:
                 )
             return new_count
 
+        def check_rolling_drawdown(self) -> bool:
+            """Trip circuit breaker if 24h peak-to-current balance drawdown exceeds limit."""
+            if positions.account_balance <= 0:
+                return False
+            dd = positions.get_rolling_drawdown_pct(hours=24)
+            if dd >= self.max_rolling_drawdown_pct:
+                now = time.time()
+                if self._suspended_until <= now:
+                    self._suspended_until = now + self.cooldown_hours * 3600
+                    log.warning(
+                        "⚠️ 24h 滚动回撤熔断: 回撤 %.1f%% (阈值 %.0f%%), 冷却 %.0f 小时",
+                        dd * 100, self.max_rolling_drawdown_pct * 100, self.cooldown_hours,
+                    )
+                self._rolling_tripped = True
+                return True
+            return False
+
         @property
         def is_blown(self) -> bool:
             """是否触发熔断。
 
             熔断条件：
             1. 当日已实现亏损超过 max_daily_loss_pct * account_balance
-            2. 且冷却时间尚未结束
+            2. 或 24h 滚动峰值回撤超过 max_rolling_drawdown_pct
+            3. 且冷却时间尚未结束
             """
             now = time.time()
             if self._suspended_until > now:
@@ -424,6 +461,8 @@ def main() -> int:
                     datetime.fromtimestamp(self._suspended_until, tz=timezone.utc).isoformat(),
                 )
                 return True
+            if self.check_rolling_drawdown():
+                return True
             return False
 
         @property
@@ -440,7 +479,11 @@ def main() -> int:
         def day_pnl(self) -> float:
             return self._realized_pnl
 
-    daily_risk = DailyRiskTracker(max_daily_loss_pct=0.10, cooldown_hours=4.0)
+    daily_risk = DailyRiskTracker(
+        max_daily_loss_pct=DEFAULT_MAX_DAILY_LOSS_PCT,
+        max_rolling_drawdown_pct=DEFAULT_MAX_ROLLING_DRAWDOWN_PCT,
+        cooldown_hours=4.0,
+    )
 
     max_initial_notional = estimate_max_order_notional(
         balance=positions.account_balance,
@@ -592,6 +635,10 @@ def main() -> int:
                         f"PnL={pnl_str}USDT ({c.pnl_pct:+.2f}%) "
                         f"{c.reason}[/]"
                     )
+                    log.info(
+                        "CLOSE %s %s exit=%.4f PnL=%s USDT (%.2f%%) %s",
+                        c.symbol, c.direction, c.exit_price, pnl_str, c.pnl_pct, c.reason,
+                    )
 
             if report.rankings:
                 top = report.rankings[:5]
@@ -634,6 +681,26 @@ def main() -> int:
                 log.warning("余额同步失败: %s", exc)
                 _available_usdt = 0
 
+            # 2aab. 交易所持仓对账（仅实盘 + 有 get_positions）
+            if not args.mock and not args.dry_run and hasattr(exchange, "get_positions"):
+                try:
+                    exch_pos = exchange.get_positions()
+
+                    def _mark_price(sym: str) -> float:
+                        try:
+                            return float(exchange.get_ticker(sym).get("last", 0))
+                        except Exception:
+                            return 0.0
+
+                    summary = reconcile_positions(positions, exch_pos, price_lookup=_mark_price)
+                    if summary.get("removed") or summary.get("adopted"):
+                        console.print(
+                            f"[yellow]持仓对账: 移除幽灵 {summary.get('removed')} "
+                            f"采纳交易所 {summary.get('adopted')}[/yellow]"
+                        )
+                except Exception as exc:
+                    log.warning("持仓对账失败: %s", exc)
+
             if report.phase2_requests:
                 console.print(f"[bold]--- 自动交易评估 ({'LIVE' if not args.dry_run else 'DRY RUN'}) ---[/bold]")
 
@@ -643,9 +710,20 @@ def main() -> int:
                     score = req.score
                     entry_price = req.entry_price
 
-                    # 2a. 检查是否可以开新仓
-                    ok, reason = positions.can_open_new(symbol)
+                    # 2a. 评分门槛
+                    if score < DEFAULT_MIN_ENTRY_SCORE:
+                        log.info("%s SKIP score=%d < min %d", symbol, score, DEFAULT_MIN_ENTRY_SCORE)
+                        console.print(
+                            f"  {symbol} [yellow]SKIP[/yellow] 评分 {score} < 最低 {DEFAULT_MIN_ENTRY_SCORE}"
+                        )
+                        continue
+
+                    # 2a2. 检查是否可以开新仓（含同向仓位上限）
+                    ok, reason = positions.can_open_new(
+                        symbol, direction=req.direction,
+                    )
                     if not ok:
+                        log.info("%s SKIP can_open_new: %s", symbol, reason)
                         console.print(f"  {symbol} [yellow]SKIP[/yellow] {reason}")
                         continue
                     if positions.is_in_cooldown(symbol, req.direction):
@@ -794,6 +872,9 @@ def main() -> int:
                         "standard": 1.0,
                         "premium": 1.0,
                     }.get(price_tier, 1.0)
+                    if score == SCORE_TIER_HALF_SIZE:
+                        tier_factor *= 0.5
+                        log.info("%s: score=%d → 仓位系数 50%%", symbol, score)
                     if tier_factor < 1.0:
                         log.info(
                             "%s: price_tier=%s, 仓位系数 %.0f%%",
@@ -858,6 +939,11 @@ def main() -> int:
                         f"TP={tp_price:.2f}"
                     )
                     console.print(f"           {detail}")
+                    log.info(
+                        "Gate %s %s %s score=%d entry=%.2f SL=%.2f TP=%.2f | %s",
+                        gate_result.status.value, symbol, direction.value, score,
+                        entry_price, stop_price, tp_price, detail,
+                    )
 
                     # 2g. Gate PASS → 开仓
                     if gate_result.status.value == "PASS":
@@ -876,7 +962,9 @@ def main() -> int:
                             )
                         else:
                             # 风控检查: 开仓后总敞口是否超限
-                            ok, reason = positions.can_open_new(symbol, additional_notional=notional)
+                            ok, reason = positions.can_open_new(
+                                symbol, additional_notional=notional, direction=req.direction,
+                            )
                             if not ok:
                                 log.info("Gate PASS but %s rejected by position cap: %s", symbol, reason)
                                 console.print(f"           [yellow]SKIP — {reason}[/yellow]")

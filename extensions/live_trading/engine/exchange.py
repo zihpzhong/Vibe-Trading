@@ -96,6 +96,10 @@ class ExchangeBase(ABC):
         """
         return True
 
+    def get_positions(self) -> list[dict[str, Any]]:
+        """Fetch open positions (futures positionRisk). Spot: non-zero balances."""
+        return []
+
 
 class MockExchange(ExchangeBase):
     """Mock exchange that returns simulated data.
