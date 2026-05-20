@@ -108,6 +108,31 @@ class LiveTradingConfig:
     pair_whitelist: List[str] = field(default_factory=list)  # 白名单，空=Top-N模式
 
     @classmethod
+    def with_top50_whitelist(cls, **overrides: object) -> LiveTradingConfig:
+        """Create a config scoped to the top-50 cryptocurrency whitelist.
+
+        Loads from ``whitelist.json`` when available, falls back to the
+        in-code ``TOP_50`` preset. Sets ``pair_whitelist`` and switches
+        ``scan_top_n`` to 0 (whitelist mode). Additional overrides can be
+        passed as kwargs.
+
+        Usage:
+            config = LiveTradingConfig.with_top50_whitelist()
+            config = LiveTradingConfig.with_top50_whitelist(
+                execution_gate=ExecutionGateConfig(min_liquidity_usdt=500_000),
+            )
+        """
+        try:
+            from extensions.live_trading.whitelist import load_whitelist
+            profile = load_whitelist()
+            symbols = profile.symbols
+        except Exception:
+            from extensions.live_trading.whitelist import TOP_50
+            symbols = list(TOP_50)
+
+        return cls(pair_whitelist=symbols, scan_top_n=0, **overrides)
+
+    @classmethod
     def aggressive(cls) -> LiveTradingConfig:
         """激进模式：放宽风控阈值."""
         return cls(
@@ -143,6 +168,8 @@ class LiveTradingConfig:
             return f"signal_cooldown_minutes ({self.execution_gate.signal_cooldown_minutes}) must be >= 1"
         if self.default_scan_interval_minutes < 1:
             return f"default_scan_interval_minutes ({self.default_scan_interval_minutes}) must be >= 1"
-        if self.scan_top_n < 1:
-            return f"scan_top_n ({self.scan_top_n}) must be >= 1"
+        if self.pair_whitelist and self.scan_top_n == 0:
+            pass  # whitelist mode: top_n is ignored at scan time
+        elif self.scan_top_n < 1:
+            return f"scan_top_n ({self.scan_top_n}) must be >= 1 (or set pair_whitelist)"
         return None

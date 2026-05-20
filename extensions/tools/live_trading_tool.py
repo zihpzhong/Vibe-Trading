@@ -117,8 +117,9 @@ class LiveTradingTool(BaseTool):
     }
     is_readonly = False
 
-    def __init__(self, mock: bool = True) -> None:
+    def __init__(self, mock: bool = True, pair_whitelist: Optional[list[str]] = None) -> None:
         self._mock = mock
+        self._whitelist: Optional[list[str]] = pair_whitelist
         self._exchange: Optional[Any] = None
         self._positions: Optional[PositionTracker] = None
         self._monitor: Optional[TPSLMonitor] = None
@@ -157,6 +158,13 @@ class LiveTradingTool(BaseTool):
             return json.dumps({"status": "error", "message": "Missing required field: direction"})
         if action == "close_position" and not symbol:
             return json.dumps({"status": "error", "message": "Missing required field: symbol"})
+
+        # --- Whitelist guard: reject non-whitelisted symbols at the gate ---
+        if action in ("run_gate",) and symbol and not self._is_whitelisted(symbol):
+            return json.dumps({
+                "status": "rejected",
+                "summary": f"{symbol} is not in trading whitelist",
+            }, ensure_ascii=False)
 
         if action == "run_gate":
             direction = SignalDirection(kwargs["direction"])
@@ -211,6 +219,7 @@ class LiveTradingTool(BaseTool):
             signal, ticker=ticker, funding_rate=funding_rate,
             orderbook=orderbook, order_qty=order_qty,
             account_balance=account_balance, order_margin=order_margin,
+            whitelist=self._whitelist,
         )
 
         return json.dumps({
@@ -261,7 +270,7 @@ class LiveTradingTool(BaseTool):
         exchange = self._get_exchange()
         positions = self._get_positions()
         scheduler = TradingScheduler(exchange, positions, trading_enabled=True)
-        report = scheduler.run_once()
+        report = scheduler.run_once(whitelist=self._whitelist)
         return json.dumps({
             "rankings": report.rankings,
             "phase2_requests": [dataclasses.asdict(r) for r in report.phase2_requests],
@@ -297,6 +306,20 @@ class LiveTradingTool(BaseTool):
             "active_count": positions.active_count,
             "exposure": positions.get_exposure(),
         })
+
+    # ------------------------------------------------------------------
+    # Whitslist enforcement
+    # ------------------------------------------------------------------
+
+    def _is_whitelisted(self, symbol: str) -> bool:
+        """Check if a symbol is in the trading whitelist.
+
+        Returns ``True`` when no whitelist is configured (allow all).
+        """
+        if not self._whitelist:
+            return True
+        base = symbol.upper().removesuffix("USDT")
+        return base in {w.upper().removesuffix("USDT") for w in self._whitelist}
 
     # ------------------------------------------------------------------
     # New actions: TP/SL monitor lifecycle

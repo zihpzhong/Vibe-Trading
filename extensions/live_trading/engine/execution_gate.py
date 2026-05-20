@@ -39,6 +39,7 @@ class ExecGateEngine:
         order_qty: float = 0.0,
         account_balance: float = 0.0,
         order_margin: float = 0.0,
+        whitelist: Optional[list[str]] = None,
     ) -> ExecutionGateResult:
         """Run all gate checks against a signal.
 
@@ -55,6 +56,8 @@ class ExecGateEngine:
             order_margin: Margin allocated to this position. If provided,
                 position cap is checked on margin usage; otherwise the
                 check falls back to order notional from order_qty * entry.
+            whitelist: Optional list of allowed base currencies. When set,
+                symbols not in the whitelist are hard-rejected.
 
         Returns:
             ExecutionGateResult with aggregated verdict.
@@ -64,6 +67,13 @@ class ExecGateEngine:
             direction=signal.direction,
             status=GateStatus.PASS,
         )
+
+        # --- Early exit: whitelist enforcement (hard block) ---
+        if not self._check_whitelist(signal.symbol, whitelist):
+            result.add_check("whitelist", False, f"{signal.symbol} not in trading whitelist")
+            result.status = GateStatus.REJECT
+            result.summary = f"REJECTED: {signal.symbol} not in whitelist"
+            return result
 
         self._check_liquidity(result, ticker)
         self._check_funding_rate(result, funding_rate)
@@ -290,3 +300,14 @@ class ExecGateEngine:
                 f"Position {measured_label} ${measured_value:.2f} ({position_pct:.1f}%) > cap {max_pct}% "
                 f"(balance=${account_balance:.2f})",
             )
+
+    @staticmethod
+    def _check_whitelist(symbol: str, whitelist: Optional[list[str]] = None) -> bool:
+        """Check if symbol is allowed by the whitelist.
+
+        Returns ``True`` when no whitelist is configured (allow all).
+        """
+        if not whitelist:
+            return True
+        base = symbol.upper().removesuffix("USDT")
+        return base in {w.upper().removesuffix("USDT") for w in whitelist}
