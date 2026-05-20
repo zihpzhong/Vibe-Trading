@@ -90,7 +90,7 @@ def check_btc_1h_trend(kline_1h: pd.DataFrame) -> BTCTrendHint:
     """Check BTCUSDT 1h short-term trend for altcoin trade gating.
 
     WEAKNESS: EMA12 < EMA26 on 1h — avoid altcoin LONGs.
-    STRENGTH: EMA12 > EMA26 and RSI > 70 — avoid altcoin SHORTs.
+    STRENGTH: EMA12 > EMA26 on 1h — avoid altcoin SHORTs (bullish 1h structure).
 
     Args:
         kline_1h: BTCUSDT 1h kline DataFrame with at least 'close' column.
@@ -105,16 +105,8 @@ def check_btc_1h_trend(kline_1h: pd.DataFrame) -> BTCTrendHint:
     ema12 = close.ewm(span=12, adjust=False).mean().iloc[-1]
     ema26 = close.ewm(span=26, adjust=False).mean().iloc[-1]
 
-    # Wilder RSI(14) for overbought check
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = (-delta).where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1]
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1]
-    rsi = 100.0 - (100.0 / (1.0 + avg_gain / avg_loss)) if avg_loss > 0 else 100.0
-
     if ema12 < ema26:
         return BTCTrendHint.WEAKNESS
-    elif rsi > 70:
+    if ema12 > ema26:
         return BTCTrendHint.STRENGTH
     return BTCTrendHint.NEUTRAL

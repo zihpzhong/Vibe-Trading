@@ -12,7 +12,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Optional
@@ -190,13 +190,15 @@ class PositionTracker:
         self,
         account_balance: float = 10_000.0,
         max_exposure_pct: float = 0.25,
-        max_positions: int = 5,
+        max_positions: int = 3,
+        max_same_direction: int = 2,
         cooldown_minutes: int = 30,
         persist_dir: Optional[str | Path] = None,
     ) -> None:
         self._account_balance = account_balance
         self._max_exposure_pct = max_exposure_pct
         self._max_positions = max_positions
+        self._max_same_direction = max_same_direction
         self._cooldown_minutes = cooldown_minutes
         base_dir = Path(persist_dir) if persist_dir else _DEFAULT_PERSIST_DIR
         self._db_path = base_dir / "trading.db"
@@ -396,8 +398,6 @@ class PositionTracker:
             entry_score=pos.entry_score,
         )
         self._closed.append(record)
-        if len(self._closed) > 50:
-            self._closed = self._closed[-50:]
 
     def get_recent_closed(self, n: int = 10) -> list[CloseRecord]:
         """Return the most recent N closed position records."""
@@ -679,12 +679,41 @@ class PositionTracker:
     # Guards
     # ------------------------------------------------------------------
 
-    def can_open_new(self, symbol: str, additional_notional: float = 0.0) -> tuple[bool, str]:
+    def count_direction(self, direction: str) -> int:
+        """Count active positions in the given direction (LONG or SHORT)."""
+        direction = direction.upper()
+        with self._lock:
+            return sum(1 for p in self._positions.values() if p.direction == direction)
+
+    def get_rolling_drawdown_pct(self, hours: int = 24) -> float:
+        """Peak-to-current balance drawdown over the last N hours (0.0–1.0)."""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        cutoff_s = cutoff.isoformat()
+        with self._lock:
+            balances = [
+                e["balance"] for e in self._equity_history
+                if e.get("timestamp", "") >= cutoff_s
+            ]
+            if not balances:
+                return 0.0
+            peak = max(balances)
+            current = self._account_balance
+            if peak <= 0:
+                return 0.0
+            return max(0.0, (peak - current) / peak)
+
+    def can_open_new(
+        self,
+        symbol: str,
+        additional_notional: float = 0.0,
+        direction: Optional[str] = None,
+    ) -> tuple[bool, str]:
         """Check if a new position can be opened.
 
         Args:
             symbol: Trading symbol to check.
             additional_notional: Expected notional of the new position (0 = skip).
+            direction: Intended direction (LONG/SHORT) for correlated exposure cap.
 
         Returns:
             (True, "") if allowed, or (False, "reason string") if rejected.
@@ -692,6 +721,7 @@ class PositionTracker:
         Rejects if:
         - Symbol already has an active position
         - Maximum number of positions reached
+        - Same-direction position count at cap
         - Total exposure (current + new) exceeds limit
         """
         with self._lock:
@@ -699,6 +729,13 @@ class PositionTracker:
                 return False, f"已有 {symbol} 持仓"
             if len(self._positions) >= self._max_positions:
                 return False, f"仓位已达上限 ({self._max_positions})"
+            if direction:
+                dir_upper = direction.upper()
+                same_dir = sum(1 for p in self._positions.values() if p.direction == dir_upper)
+                if same_dir >= self._max_same_direction:
+                    return False, (
+                        f"同向仓位已达上限 ({same_dir}/{self._max_same_direction} {dir_upper})"
+                    )
             current_exp = self._get_exposure_unlocked()
             post_exp = current_exp + (additional_notional / self._account_balance) if additional_notional > 0 else current_exp
             if post_exp >= self._max_exposure_pct - 1e-9:
