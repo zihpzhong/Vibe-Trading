@@ -211,20 +211,38 @@ def main() -> int:
     from extensions.live_trading.models import GateStatus, LiveSignal, ScheduleReport, SignalDirection
 
     # ---- 配置 ----
-    config = LiveTradingConfig()
-    if args.mode == "conservative":
-        config = LiveTradingConfig.conservative()
-    elif args.mode == "aggressive":
-        config = LiveTradingConfig.aggressive()
+    # 基础: top-50 白名单（避免低流动性币种如 BZUSDT/CLUSDT 进入交易）
+    config = LiveTradingConfig.with_top50_whitelist()
     config.default_scan_interval_minutes = args.interval
 
-    # Trading pair whitelist: --pairs CLI > TRADING_PAIRS env var
+    # 模式覆盖（仅修改风控阈值，保留 pair_whitelist）
+    if args.mode == "conservative":
+        from extensions.live_trading.config import ExecutionGateConfig as _EGC
+        config.execution_gate = _EGC(
+            min_liquidity_usdt=2_000_000,
+            max_orderbook_impact_pct=0.3,
+            min_risk_reward_ratio=1.5,
+            max_position_pct=2.0,
+            signal_cooldown_minutes=60,
+        )
+    elif args.mode == "aggressive":
+        from extensions.live_trading.config import ExecutionGateConfig as _EGC
+        config.execution_gate = _EGC(
+            min_liquidity_usdt=500_000,
+            max_orderbook_impact_pct=1.0,
+            min_risk_reward_ratio=0.8,
+            max_position_pct=10.0,
+            signal_cooldown_minutes=15,
+        )
+
+    # 交易对白名单: --pairs CLI > TRADING_PAIRS 环境变量 > top-50 默认
     if args.pairs is not None:
         config.pair_whitelist = list(args.pairs)
     elif os.environ.get("TRADING_PAIRS"):
         config.pair_whitelist = [
             p.strip() for p in os.environ["TRADING_PAIRS"].split(",") if p.strip()
         ]
+    # else: 已由 with_top50_whitelist() 设置
 
     config_err = config.validate()
     if config_err:
