@@ -172,15 +172,27 @@ class TestCanOpenNew:
         assert "已有" in reason
 
     def test_rejects_at_max_positions(self, tracker: PositionTracker) -> None:
-        tracker.open_position("A", "LONG", 100.0, 1.0, 90.0)
-        tracker.open_position("B", "LONG", 200.0, 1.0, 180.0)
-        tracker.open_position("C", "LONG", 300.0, 1.0, 270.0)
-        tracker.open_position("D", "LONG", 400.0, 1.0, 360.0)
-        tracker.open_position("E", "LONG", 500.0, 1.0, 450.0)
-        assert tracker.active_count == 5
-        ok, reason = tracker.can_open_new("F")
+        t = PositionTracker(
+            account_balance=10_000.0, max_exposure_pct=5.0, max_positions=5, persist_dir=tracker._db_path.parent,
+        )
+        t.open_position("A", "LONG", 100.0, 1.0, 90.0)
+        t.open_position("B", "LONG", 200.0, 1.0, 180.0)
+        t.open_position("C", "LONG", 300.0, 1.0, 270.0)
+        t.open_position("D", "LONG", 400.0, 1.0, 360.0)
+        t.open_position("E", "LONG", 500.0, 1.0, 450.0)
+        assert t.active_count == 5
+        ok, reason = t.can_open_new("F")
         assert ok is False
         assert "上限" in reason
+
+    def test_rejects_at_max_same_direction(self, tracker: PositionTracker) -> None:
+        tracker.open_position("A", "SHORT", 100.0, 1.0, 110.0)
+        tracker.open_position("B", "SHORT", 200.0, 1.0, 220.0)
+        ok, reason = tracker.can_open_new("C", direction="SHORT")
+        assert ok is False
+        assert "同向" in reason
+        ok, _ = tracker.can_open_new("C", direction="LONG")
+        assert ok is True
 
     def test_rejects_when_exposure_exceeded(self, tracker: PositionTracker) -> None:
         # 3000 value / 10000 balance = 0.30 > 0.25 max
