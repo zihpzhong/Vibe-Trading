@@ -43,6 +43,8 @@ class Position:
     first_entry_cost: float = 0.0  # 首次入场价（永不改变，de-risk 参照系）
     first_entry_quantity: float = 0.0  # 首次数量（永不改变）
     de_risk_level: int = 0  # 已触发的最高 de-risk 级别 (0-4)
+    sl_order_id: Optional[str] = None  # 交易所止损单 ID
+    tp_order_id: Optional[str] = None  # 交易所止盈单 ID
 
     def __post_init__(self) -> None:
         if not self.opened_at:
@@ -68,6 +70,8 @@ class Position:
             "first_entry_cost": self.first_entry_cost,
             "first_entry_quantity": self.first_entry_quantity,
             "de_risk_level": self.de_risk_level,
+            "sl_order_id": self.sl_order_id,
+            "tp_order_id": self.tp_order_id,
         }
 
     @classmethod
@@ -86,6 +90,8 @@ class Position:
             first_entry_cost=float(d.get("first_entry_cost", 0.0)),
             first_entry_quantity=float(d.get("first_entry_quantity", 0.0)),
             de_risk_level=int(d.get("de_risk_level", 0)),
+            sl_order_id=d.get("sl_order_id") or None,
+            tp_order_id=d.get("tp_order_id") or None,
         )
 
 
@@ -294,6 +300,15 @@ class PositionTracker:
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
         """)
+        self._migrate_positions_schema()
+
+    def _migrate_positions_schema(self) -> None:
+        """Add columns for exchange bracket order IDs (idempotent)."""
+        for col in ("sl_order_id", "tp_order_id"):
+            try:
+                self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     # ------------------------------------------------------------------
     # Position lifecycle
@@ -330,6 +345,25 @@ class PositionTracker:
             self._persist()
             logger.info("Position opened: %s %s @ %.4f qty=%.4f lev=%dx", symbol, direction, entry_price, quantity, leverage)
             return pos
+
+    def set_bracket_order_ids(
+        self,
+        symbol: str,
+        sl_order_id: Optional[str],
+        tp_order_id: Optional[str],
+    ) -> None:
+        """Attach exchange SL/TP order IDs to an open position."""
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if pos is None:
+                return
+            pos.sl_order_id = sl_order_id
+            pos.tp_order_id = tp_order_id
+            self._persist()
+
+    def clear_bracket_order_ids(self, symbol: str) -> None:
+        """Clear exchange bracket order IDs (after cancel or fill)."""
+        self.set_bracket_order_ids(symbol, None, None)
 
     def close_position(self, symbol: str, exit_price: Optional[float] = None, reason: str = "MANUAL") -> Optional[Position]:
         """Close and remove a position. Records it in closed history with PnL.
@@ -846,12 +880,14 @@ class PositionTracker:
                     """INSERT INTO positions
                        (symbol, direction, entry_price, quantity, stop_loss,
                         take_profit, opened_at, dca_count, leverage, entry_score,
-                        first_entry_cost, first_entry_quantity, de_risk_level)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        first_entry_cost, first_entry_quantity, de_risk_level,
+                        sl_order_id, tp_order_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (pos.symbol, pos.direction, pos.entry_price, pos.quantity,
                      pos.stop_loss, pos.take_profit, pos.opened_at, pos.dca_count,
                      pos.leverage, pos.entry_score, pos.first_entry_cost,
-                     pos.first_entry_quantity, pos.de_risk_level),
+                     pos.first_entry_quantity, pos.de_risk_level,
+                     pos.sl_order_id, pos.tp_order_id),
                 )
 
             # Closed trades: incremental append
@@ -935,6 +971,7 @@ class PositionTracker:
                 if not _VALID_SYMBOL_RE.match(sym):
                     logger.warning("Skipping invalid symbol in positions: %r", sym)
                     continue
+                keys = row.keys()
                 self._positions[sym] = Position(
                     symbol=row["symbol"], direction=row["direction"],
                     entry_price=row["entry_price"], quantity=row["quantity"],
@@ -944,6 +981,8 @@ class PositionTracker:
                     first_entry_cost=row["first_entry_cost"],
                     first_entry_quantity=row["first_entry_quantity"],
                     de_risk_level=row["de_risk_level"],
+                    sl_order_id=row["sl_order_id"] if "sl_order_id" in keys else None,
+                    tp_order_id=row["tp_order_id"] if "tp_order_id" in keys else None,
                 )
 
             # Closed trades

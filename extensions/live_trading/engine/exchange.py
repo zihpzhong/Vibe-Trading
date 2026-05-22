@@ -84,6 +84,22 @@ class ExchangeBase(ABC):
         """
         ...
 
+    def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
+        """Create a take-profit order (TAKE_PROFIT_MARKET on futures).
+
+        Returns:
+            dict with keys: order_id, symbol, side, type, amount, tp_price, filled, status
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support take-profit orders")
+
+    def cancel_order(self, order_id: str, symbol: str) -> dict:
+        """Cancel an open order by ID."""
+        raise NotImplementedError(f"{type(self).__name__} does not support cancel_order")
+
+    def fetch_order(self, order_id: str, symbol: str) -> dict:
+        """Query order status."""
+        raise NotImplementedError(f"{type(self).__name__} does not support fetch_order")
+
     def get_min_qty(self, symbol: str) -> float:
         """Return minimum tradeable quantity for symbol (0.0 = unknown)."""
         return 0.0
@@ -198,8 +214,22 @@ class MockExchange(ExchangeBase):
             "order_id": f"mock_sl_{random.randint(1000, 9999)}",
             "symbol": symbol, "side": side, "type": "STOP_MARKET",
             "amount": amount, "stop_price": stop_price,
-            "filled": amount, "status": "closed",
+            "filled": 0, "status": "NEW",
         }
+
+    def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
+        return {
+            "order_id": f"mock_tp_{random.randint(1000, 9999)}",
+            "symbol": symbol, "side": side, "type": "TAKE_PROFIT_MARKET",
+            "amount": amount, "tp_price": tp_price,
+            "filled": 0, "status": "NEW",
+        }
+
+    def cancel_order(self, order_id: str, symbol: str) -> dict:
+        return {"order_id": order_id, "status": "CANCELED"}
+
+    def fetch_order(self, order_id: str, symbol: str) -> dict:
+        return {"order_id": order_id, "status": "FILLED", "filled": 0}
 
 
 def create_exchange(mock: bool = True, seed_price: Optional[float] = None) -> ExchangeBase:
