@@ -88,6 +88,14 @@ class DataBackend(ABC):
     def get_st_list(self) -> set[str]:
         return set()
 
+    def get_financials(self, symbol: str) -> dict[str, Any]:
+        """Return pe_ttm, pb, eps, revenue_growth, profit_growth or empty dict."""
+        return {}
+
+    def get_money_flow(self, symbol: str) -> dict[str, Any]:
+        """Return net_main_inflow, net_retail_inflow, total_amount or empty dict."""
+        return {}
+
     def is_limit(self, symbol: str, price: float, prev_close: float, board: str, is_st: bool = False) -> str:
         """Return ``up`` / ``down`` / ``none``."""
         if prev_close <= 0:
@@ -159,6 +167,7 @@ class MockDataBackend(DataBackend):
                     "amount": random.uniform(5e7, 5e8),
                     "turnover_rate": random.uniform(0.5, 5.0),
                     "change_pct": chg,
+                    "market_cap": round(base * random.uniform(5e8, 2e9), 2),
                 }
             )
         return out
@@ -169,6 +178,12 @@ class MockDataBackend(DataBackend):
         flat = max(0, 5000 - up - down)
         total = up + down + flat
         return {"up": up, "down": down, "flat": flat, "ratio": up / total if total else 0.5}
+
+    def get_financials(self, symbol: str) -> dict[str, Any]:
+        return {"pe_ttm": random.uniform(10, 40), "pb": random.uniform(1, 6), "eps": random.uniform(0.5, 5)}
+
+    def get_money_flow(self, symbol: str) -> dict[str, Any]:
+        return {"net_main_inflow": random.uniform(-5e7, 5e7), "net_retail_inflow": random.uniform(-2e7, 2e7)}
 
 
 class AkshareDataBackend(DataBackend):
@@ -235,9 +250,45 @@ class AkshareDataBackend(DataBackend):
                     "amount": float(row.get("成交额", 0) or 0),
                     "turnover_rate": float(row.get("换手率", 0) or 0),
                     "change_pct": float(row.get("涨跌幅", 0) or 0),
+                    "market_cap": float(row.get("总市值", 0) or 0),
                 }
             )
         return out
+
+    def get_financials(self, symbol: str) -> dict[str, Any]:
+        import akshare as ak
+
+        try:
+            code = symbol_to_ak_code(symbol)
+            df = ak.stock_financial_abstract_ths(symbol=code, indicator="按年度")
+            if df is None or df.empty:
+                return {"pe_ttm": 0, "pb": 0, "eps": 0}
+            latest = df.iloc[0]
+            return {
+                "pe_ttm": float(latest.get("市盈率-动态", latest.get("PE", 0)) or 0),
+                "pb": float(latest.get("市净率", latest.get("PB", 0)) or 0),
+                "eps": float(latest.get("每股收益", latest.get("EPS", 0)) or 0),
+            }
+        except Exception as exc:
+            logger.debug("akshare financials failed for %s: %s", symbol, exc)
+            return {}
+
+    def get_money_flow(self, symbol: str) -> dict[str, Any]:
+        import akshare as ak
+
+        try:
+            code = symbol_to_ak_code(symbol)
+            df = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("6") else "sz")
+            if df is None or df.empty:
+                return {}
+            latest = df.iloc[-1]
+            return {
+                "net_main_inflow": float(latest.get("主力净流入-净额", 0) or 0),
+                "net_retail_inflow": float(latest.get("小单净流入-净额", 0) or 0),
+            }
+        except Exception as exc:
+            logger.debug("akshare money_flow failed for %s: %s", symbol, exc)
+            return {}
 
 
 class TushareDataBackend(DataBackend):
@@ -285,18 +336,149 @@ class TushareDataBackend(DataBackend):
     def get_realtime(self, symbols: list[str]) -> list[dict[str, Any]]:
         return []
 
+    def get_financials(self, symbol: str) -> dict[str, Any]:
+        try:
+            sym = normalize_symbol(symbol)
+            api = self._api()
+            df = api.fina_indicator(ts_code=sym, limit=1)
+            if df is None or df.empty:
+                return {}
+            row = df.iloc[0]
+            return {
+                "pe_ttm": float(row.get("pe", 0) or 0),
+                "pb": float(row.get("pb", 0) or 0),
+                "eps": float(row.get("eps", 0) or 0),
+            }
+        except Exception as exc:
+            logger.debug("tushare financials failed for %s: %s", symbol, exc)
+            return {}
+
+    def get_money_flow(self, symbol: str) -> dict[str, Any]:
+        try:
+            sym = normalize_symbol(symbol)
+            api = self._api()
+            df = api.moneyflow(ts_code=sym, limit=1)
+            if df is None or df.empty:
+                return {}
+            row = df.iloc[0]
+            return {
+                "net_main_inflow": float(row.get("net_amount", 0) or 0),
+                "net_retail_inflow": float(row.get("buy_sm_vol", 0) or 0),
+            }
+        except Exception as exc:
+            logger.debug("tushare money_flow failed for %s: %s", symbol, exc)
+            return {}
+
+
+class PytdxDataBackend(DataBackend):
+    """通达信数据接口 (pytdx) — last resort before mock."""
+
+    _HOSTS = ["119.147.212.81", "119.147.212.113", "218.75.126.72", "180.153.18.170"]
+    _PORT = 7709
+
+    def __init__(self) -> None:
+        self._api: Any = None
+
+    def is_available(self) -> bool:
+        try:
+            import pytdx  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def _get_api(self):
+        if self._api is not None:
+            return self._api
+        from pytdx.hq import TdxHq_API
+
+        for host in self._HOSTS:
+            try:
+                api = TdxHq_API()
+                api.connect(host, self._PORT)
+                self._api = api
+                return api
+            except Exception:
+                continue
+        return None
+
+    def _code(self, symbol: str) -> tuple[str, int]:
+        sym = normalize_symbol(symbol)
+        code = sym.split(".")[0]
+        market = 1 if sym.endswith(".SH") else 0
+        return code, market
+
+    def get_daily(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        api = self._get_api()
+        if api is None:
+            return pd.DataFrame()
+        try:
+            code, market = self._code(symbol)
+            count = 120
+            result = api.get_security_bars(9, market, code, 0, count)
+            if not result:
+                return pd.DataFrame()
+            df = pd.DataFrame(result)
+            df["date"] = pd.to_datetime(
+                df["year"].astype(str) + df["month"].astype(str).str.zfill(2) + df["day"].astype(str).str.zfill(2)
+            ).dt.strftime("%Y-%m-%d")
+            return pd.DataFrame(
+                {
+                    "date": df["date"],
+                    "open": df["open"].astype(float),
+                    "high": df["high"].astype(float),
+                    "low": df["low"].astype(float),
+                    "close": df["close"].astype(float),
+                    "volume": df["vol"].astype(float),
+                    "amount": df["amount"].astype(float),
+                }
+            )
+        except Exception as exc:
+            logger.debug("pytdx daily failed for %s: %s", symbol, exc)
+            return pd.DataFrame()
+
+    def get_realtime(self, symbols: list[str]) -> list[dict[str, Any]]:
+        api = self._get_api()
+        if api is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for sym in symbols:
+            try:
+                code, market = self._code(sym)
+                quote = api.get_security_quotes([(market, code)])
+                if not quote:
+                    continue
+                q = quote[0]
+                last = float(q.get("price", 0))
+                prev = float(q.get("last_close", last))
+                out.append(
+                    {
+                        "symbol": normalize_symbol(sym),
+                        "name": sym,
+                        "last": last,
+                        "prev_close": prev,
+                        "volume": float(q.get("vol", 0)),
+                        "amount": float(q.get("amount", 0)),
+                        "change_pct": ((last / prev - 1) * 100) if prev > 0 else 0.0,
+                    }
+                )
+            except Exception as exc:
+                logger.debug("pytdx quote failed for %s: %s", sym, exc)
+        return out
+
 
 class DataChain:
     """Try backends in order until one succeeds."""
 
     def __init__(self, sources: Optional[list[str]] = None) -> None:
-        order = sources or ["akshare", "tushare", "mock"]
+        order = sources or ["akshare", "tushare", "pytdx", "mock"]
         self._backends: list[DataBackend] = []
         for name in order:
             if name == "akshare":
                 self._backends.append(AkshareDataBackend())
             elif name == "tushare":
                 self._backends.append(TushareDataBackend())
+            elif name == "pytdx":
+                self._backends.append(PytdxDataBackend())
             elif name == "mock":
                 self._backends.append(MockDataBackend())
         if not any(b.is_available() for b in self._backends):
@@ -340,3 +522,9 @@ class DataChain:
 
     def is_limit(self, symbol: str, price: float, prev_close: float, board: str, is_st: bool = False) -> str:
         return self._pick().is_limit(symbol, price, prev_close, board, is_st)
+
+    def get_financials(self, symbol: str) -> dict[str, Any]:
+        return self._pick().get_financials(symbol)
+
+    def get_money_flow(self, symbol: str) -> dict[str, Any]:
+        return self._pick().get_money_flow(symbol)
