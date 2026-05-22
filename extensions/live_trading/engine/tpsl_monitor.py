@@ -57,6 +57,7 @@ class TPSLMonitor(Thread):
         max_leverage: int = 5,
         position_size_pct: float = 0.05,
         status_log_interval: float = 60.0,
+        use_exchange_brackets: bool = True,
     ) -> None:
         super().__init__(daemon=True, name="TPSLMonitor")
         self._exchange = exchange
@@ -72,6 +73,7 @@ class TPSLMonitor(Thread):
         self._dca_gate_engine = dca_gate_engine
         self._max_leverage = max_leverage
         self._position_size_pct = position_size_pct
+        self._use_exchange_brackets = use_exchange_brackets
         self._status_poll_counter = 0
         self._status_poll_threshold = max(1, int(status_log_interval / poll_interval))
         # Track trailing stop levels per position (symbol → adjusted_stop_loss)
@@ -179,16 +181,24 @@ class TPSLMonitor(Thread):
             self._update_trailing_stop(pos, current_price)            # 1. Trailing stop
             effective_sl = self._trailing_stops.get(pos.symbol, pos.stop_loss)
 
-            if self._check_stop_loss(pos, current_price, effective_sl):  # 2. SL hard guard before DCA
+            defer_exchange_sl = (
+                self._use_exchange_brackets
+                and pos.sl_order_id
+                and pos.symbol not in self._trailing_stops
+            )
+            if not defer_exchange_sl and self._check_stop_loss(pos, current_price, effective_sl):
                 self._execute_sl(pos, current_price, effective_sl)
                 continue
 
             self._check_dca(pos, current_price)                       # 3. DCA when losing
 
-            if self._check_take_profit(pos, current_price):           # 4. TP
+            defer_exchange_tp = self._use_exchange_brackets and bool(pos.tp_order_id)
+            if self._check_take_profit(pos, current_price):
                 self._execute_tp(pos, current_price)
             elif self._check_de_risk(pos, current_price):             # 5. De-risk partial exit
                 pass
+            elif defer_exchange_tp:
+                pass  # fixed TP on exchange until dynamic TP triggers market close
 
         # 6. 僵尸仓位检测
         if self._check_stale_positions(active, prices):
@@ -603,6 +613,15 @@ class TPSLMonitor(Thread):
         self._positions.set_extended_cooldown(pos.symbol, pos.direction, DE_RISK_EXTENDED_COOLDOWN_MINUTES)
         return True
 
+    def _cancel_exchange_brackets(self, pos: Position) -> None:
+        """Cancel exchange SL/TP before software market close."""
+        if not self._use_exchange_brackets:
+            return
+        from .exchange_brackets import cancel_bracket_orders
+
+        cancel_bracket_orders(self._exchange, pos)
+        self._positions.clear_bracket_order_ids(pos.symbol)
+
     def _execute_order_with_retry(
         self, pos: Position, side: str, qty: float, price: float,
         reason: str, is_de_risk: bool = False, de_risk_level: int = 0,
@@ -618,6 +637,7 @@ class TPSLMonitor(Thread):
             is_de_risk: If True, call de_risk_partial_exit instead of close.
             de_risk_level: De-risk level (1-4), only used when is_de_risk=True.
         """
+        self._cancel_exchange_brackets(pos)
         logger.info(
             "%s for %s %s @ %.4f qty=%.4f",
             reason, pos.symbol, pos.direction, price, qty,
@@ -714,7 +734,9 @@ class TPSLMonitor(Thread):
                 current_sl = self._trailing_stops.get(pos.symbol, pos.stop_loss)
                 # Only move up (never retreat)
                 if trail_sl > current_sl:
+                    was_trailing = pos.symbol in self._trailing_stops
                     self._trailing_stops[pos.symbol] = trail_sl
+                    self._handoff_sl_to_trailing(pos, was_trailing)
         else:  # SHORT
             pnl_pct = (pos.entry_price - current_price) / pos.entry_price * 100
             if pnl_pct >= self._trailing_activation_pct:
@@ -726,7 +748,20 @@ class TPSLMonitor(Thread):
                 current_sl = self._trailing_stops.get(pos.symbol, pos.stop_loss)
                 # Only move down (never retreat)
                 if trail_sl < current_sl:
+                    was_trailing = pos.symbol in self._trailing_stops
                     self._trailing_stops[pos.symbol] = trail_sl
+                    self._handoff_sl_to_trailing(pos, was_trailing)
+
+    def _handoff_sl_to_trailing(self, pos: Position, was_trailing: bool) -> None:
+        """Cancel exchange fixed SL when software trailing stop takes over."""
+        if was_trailing or not self._use_exchange_brackets or not pos.sl_order_id:
+            return
+        from .exchange_brackets import cancel_exchange_sl_order
+
+        sl_oid = pos.sl_order_id
+        cancel_exchange_sl_order(self._exchange, pos)
+        self._positions.set_bracket_order_ids(pos.symbol, None, pos.tp_order_id)
+        logger.info("Trailing stop active for %s — cancelled exchange SL %s", pos.symbol, sl_oid)
 
     # ------------------------------------------------------------------
     # Order execution
@@ -734,6 +769,7 @@ class TPSLMonitor(Thread):
 
     def _execute_tp(self, pos: Position, price: float) -> None:
         """Execute take-profit: market order to close position with retry."""
+        self._cancel_exchange_brackets(pos)
         side = "sell" if pos.direction == "LONG" else "buy"
         logger.info("TP triggered: %s %s @ %.4f (TP=%.4f)", pos.symbol, pos.direction, price, pos.take_profit)
 
@@ -786,12 +822,8 @@ class TPSLMonitor(Thread):
             self._on_error(last_err)
 
     def _execute_sl(self, pos: Position, price: float, effective_sl: float) -> None:
-        """Execute stop-loss: market order to close position with 3x retry.
-
-        Uses market order (not STOP_LOSS) because the SL condition has already
-        been triggered — we need immediate execution, not a conditional algo order.
-        Binance spot API does not support STOP_LOSS on /api/v3/order.
-        """
+        """Execute stop-loss: market order to close position with 3x retry."""
+        self._cancel_exchange_brackets(pos)
         side = "sell" if pos.direction == "LONG" else "buy"
         logger.info(
             "SL triggered: %s %s @ %.4f (SL=%.4f)",
