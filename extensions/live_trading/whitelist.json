@@ -1,9 +1,9 @@
 {
   "meta": {
     "name": "top50",
-    "description": "市值前50加密货币白名单（排除稳定币/衍生品）",
-    "version": "2026-05-20",
-    "total": 50
+    "description": "市值前50加密货币白名单（排除稳定币/衍生品）— 44个Binance永续合约可用币种",
+    "version": "2026-05-22",
+    "total": 44
   },
   "tiers": {
     "blue_chip": {
@@ -24,60 +24,55 @@
     },
     "major": {
       "name": "主流资产",
-      "range": "11-25",
+      "range": "11-23",
       "coins": [
         {"rank": 11, "symbol": "DOT",   "name": "Polkadot",     "sector": "L1"},
         {"rank": 12, "symbol": "LINK",  "name": "Chainlink",    "sector": "Oracle"},
-        {"rank": 13, "symbol": "SHIB",  "name": "Shiba Inu",    "sector": "Meme"},
-        {"rank": 14, "symbol": "TON",   "name": "Toncoin",      "sector": "L1"},
-        {"rank": 15, "symbol": "LTC",   "name": "Litecoin",     "sector": "L1"},
-        {"rank": 16, "symbol": "BCH",   "name": "Bitcoin Cash", "sector": "L1"},
-        {"rank": 17, "symbol": "NEAR",  "name": "NEAR Protocol","sector": "L1"},
-        {"rank": 18, "symbol": "UNI",   "name": "Uniswap",      "sector": "DeFi"},
-        {"rank": 19, "symbol": "PEPE",  "name": "Pepe",         "sector": "Meme"},
-        {"rank": 20, "symbol": "POL",   "name": "Polygon",      "sector": "L2"},
-        {"rank": 21, "symbol": "APT",   "name": "Aptos",        "sector": "L1"},
-        {"rank": 22, "symbol": "SUI",   "name": "Sui",          "sector": "L1"},
-        {"rank": 23, "symbol": "ATOM",  "name": "Cosmos",       "sector": "L1"},
-        {"rank": 24, "symbol": "INJ",   "name": "Injective",    "sector": "DeFi"},
-        {"rank": 25, "symbol": "FIL",   "name": "Filecoin",     "sector": "Storage"}
+        {"rank": 13, "symbol": "TON",   "name": "Toncoin",      "sector": "L1"},
+        {"rank": 14, "symbol": "LTC",   "name": "Litecoin",     "sector": "L1"},
+        {"rank": 15, "symbol": "BCH",   "name": "Bitcoin Cash", "sector": "L1"},
+        {"rank": 16, "symbol": "NEAR",  "name": "NEAR Protocol","sector": "L1"},
+        {"rank": 17, "symbol": "UNI",   "name": "Uniswap",      "sector": "DeFi"},
+        {"rank": 18, "symbol": "POL",   "name": "Polygon",      "sector": "L2"},
+        {"rank": 19, "symbol": "APT",   "name": "Aptos",        "sector": "L1"},
+        {"rank": 20, "symbol": "SUI",   "name": "Sui",          "sector": "L1"},
+        {"rank": 21, "symbol": "ATOM",  "name": "Cosmos",       "sector": "L1"},
+        {"rank": 22, "symbol": "INJ",   "name": "Injective",    "sector": "DeFi"},
+        {"rank": 23, "symbol": "FIL",   "name": "Filecoin",     "sector": "Storage"}
       ]
     },
     "mid_cap": {
       "name": "中等市值",
-      "range": "26-50",
+      "range": "24-44",
       "coins": [
-        {"rank": 26, "symbol": "AAVE",   "name": "Aave",         "sector": "DeFi"},
-        {"rank": 27, "symbol": "HBAR",   "name": "Hedera",       "sector": "L1"},
-        {"rank": 28, "symbol": "RENDER", "name": "Render",       "sector": "AI"},
-        {"rank": 29, "symbol": "KAS",    "name": "Kaspa",        "sector": "L1"},
-        {"rank": 30, "symbol": "STX",    "name": "Stacks",       "sector": "L2"},
-        {"rank": 31, "symbol": "ARB",    "name": "Arbitrum",     "sector": "L2"},
-        {"rank": 32, "symbol": "FET",    "name": "Fetch.ai",     "sector": "AI"},
-        {"rank": 33, "symbol": "VET",    "name": "VeChain",      "sector": "L1"},
-        {"rank": 34, "symbol": "RUNE",   "name": "THORChain",    "sector": "DeFi"},
-        {"rank": 35, "symbol": "ALGO",   "name": "Algorand",     "sector": "L1"},
-        {"rank": 36, "symbol": "FTM",    "name": "Fantom",       "sector": "L1"},
-        {"rank": 37, "symbol": "IMX",    "name": "Immutable",    "sector": "Gaming"},
-        {"rank": 38, "symbol": "GRT",    "name": "The Graph",    "sector": "Infra"},
-        {"rank": 39, "symbol": "MKR",    "name": "Maker",        "sector": "DeFi"},
-        {"rank": 40, "symbol": "PENDLE", "name": "Pendle",       "sector": "DeFi"},
-        {"rank": 41, "symbol": "TIA",    "name": "Celestia",     "sector": "L1"},
-        {"rank": 42, "symbol": "EOS",    "name": "EOS",          "sector": "L1"},
-        {"rank": 43, "symbol": "FLOW",   "name": "Flow",         "sector": "L1"},
-        {"rank": 44, "symbol": "CRV",    "name": "Curve DAO",    "sector": "DeFi"},
-        {"rank": 45, "symbol": "OP",     "name": "Optimism",     "sector": "L2"},
-        {"rank": 46, "symbol": "MINA",   "name": "Mina",         "sector": "L1"},
-        {"rank": 47, "symbol": "SEI",    "name": "Sei",          "sector": "L1"},
-        {"rank": 48, "symbol": "CRO",    "name": "Cronos",       "sector": "CEX"},
-        {"rank": 49, "symbol": "THETA",  "name": "Theta Network","sector": "Infra"},
-        {"rank": 50, "symbol": "JUP",    "name": "Jupiter",      "sector": "DeFi"}
+        {"rank": 24, "symbol": "AAVE",   "name": "Aave",         "sector": "DeFi"},
+        {"rank": 25, "symbol": "HBAR",   "name": "Hedera",       "sector": "L1"},
+        {"rank": 26, "symbol": "RENDER", "name": "Render",       "sector": "AI"},
+        {"rank": 27, "symbol": "KAS",    "name": "Kaspa",        "sector": "L1"},
+        {"rank": 28, "symbol": "STX",    "name": "Stacks",       "sector": "L2"},
+        {"rank": 29, "symbol": "ARB",    "name": "Arbitrum",     "sector": "L2"},
+        {"rank": 30, "symbol": "FET",    "name": "Fetch.ai",     "sector": "AI"},
+        {"rank": 31, "symbol": "VET",    "name": "VeChain",      "sector": "L1"},
+        {"rank": 32, "symbol": "RUNE",   "name": "THORChain",    "sector": "DeFi"},
+        {"rank": 33, "symbol": "ALGO",   "name": "Algorand",     "sector": "L1"},
+        {"rank": 34, "symbol": "IMX",    "name": "Immutable",    "sector": "Gaming"},
+        {"rank": 35, "symbol": "GRT",    "name": "The Graph",    "sector": "Infra"},
+        {"rank": 36, "symbol": "PENDLE", "name": "Pendle",       "sector": "DeFi"},
+        {"rank": 37, "symbol": "TIA",    "name": "Celestia",     "sector": "L1"},
+        {"rank": 38, "symbol": "FLOW",   "name": "Flow",         "sector": "L1"},
+        {"rank": 39, "symbol": "CRV",    "name": "Curve DAO",    "sector": "DeFi"},
+        {"rank": 40, "symbol": "OP",     "name": "Optimism",     "sector": "L2"},
+        {"rank": 41, "symbol": "MINA",   "name": "Mina",         "sector": "L1"},
+        {"rank": 42, "symbol": "SEI",    "name": "Sei",          "sector": "L1"},
+        {"rank": 43, "symbol": "THETA",  "name": "Theta Network","sector": "Infra"},
+        {"rank": 44, "symbol": "JUP",    "name": "Jupiter",      "sector": "DeFi"}
       ]
     }
   },
   "exclusion_reasons": {
     "stablecoin": "USDT, USDC, USDe, DAI, FDUSD, TUSD — 无独立价格发现",
     "derivatives": "STETH, WBTC, WETH — 追踪底层资产价格",
-    "shitcoin": "流动性不足、基本面不明的极低市值代币"
+    "shitcoin": "流动性不足、基本面不明的极低市值代币",
+    "delisted": "SHIB/PEPE(1000倍合约名不匹配), FTM/MKR/EOS/CRO(Binance永续已下架)"
   }
 }
