@@ -44,7 +44,7 @@ def main(run_dir: Path) -> None:
             json.dumps(
                 {
                     "error": f"unsupported engine {engine_type!r}; "
-                    f"use extensions/backtest/ext_runner.py with {_VALID_ENGINES}",
+                    f"use extensions/ext_backtest/ext_runner.py with {_VALID_ENGINES}",
                 }
             )
         )

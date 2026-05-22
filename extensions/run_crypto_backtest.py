@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--runner",
         action="store_true",
-        help="Run via extensions/backtest/ext_runner.py + run_dir (per extension-guide)",
+        help="Run via extensions/ext_backtest/ext_runner.py + run_dir (per extension-guide)",
     )
     p.add_argument("--top50", action="store_true", help="Top50 whitelist (uses first N with --max-symbols)")
     p.add_argument(
@@ -135,7 +135,7 @@ def fetch_ccxt(
     cache_dir: Path,
 ) -> dict[str, pd.DataFrame]:
     """Fetch via extension CCXT helper (proxy/futures) with parquet cache."""
-    from extensions.backtest.ccxt_helpers import fetch_ohlcv_map
+    from extensions.ext_backtest.ccxt_helpers import fetch_ohlcv_map
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     data_map: dict[str, pd.DataFrame] = {}
@@ -213,13 +213,13 @@ def run_via_runner(config: dict[str, Any], run_dir: Path) -> None:
         encoding="utf-8",
     )
     (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    from extensions.backtest.ext_runner import main as ext_runner_main
+    from extensions.ext_backtest.ext_runner import main as ext_runner_main
 
     ext_runner_main(run_dir)
 
 
 def _apply_proxy_env(proxy: str | None) -> None:
-    from extensions.backtest.ccxt_helpers import apply_proxy_env
+    from extensions.ext_backtest.ccxt_helpers import apply_proxy_env
 
     url = apply_proxy_env(proxy)
     if url:
