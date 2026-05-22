@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 _INTERVAL_MAP = {
     "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-    "1h": "1h", "1H": "1h", "4h": "4h", "4H": "4h", "1d": "1d", "1D": "1d",
+    "1H": "1h", "4H": "4h", "1D": "1d",
 }
 
 # P12-b: ccxt had no request timeout and an unbounded paginated fetch with
@@ -35,27 +35,6 @@ _INTERVAL_MAP = {
 # scheduling is delegated to :mod:`backtest.loaders.base`.
 _CCXT_TIMEOUT_MS = int(os.getenv("CCXT_TIMEOUT_MS", "15000"))
 _CCXT_FETCH_BUDGET_S = float(os.getenv("CCXT_FETCH_BUDGET_S", "60"))
-
-
-def _ccxt_proxies() -> Optional[dict[str, str]]:
-    """HTTP(S) proxy for ccxt (e.g. local Clash on 127.0.0.1:7897)."""
-    raw = (
-        os.getenv("CCXT_PROXY")
-        or os.getenv("HTTPS_PROXY")
-        or os.getenv("HTTP_PROXY")
-        or ""
-    ).strip()
-    if not raw:
-        port = os.getenv("CCXT_PROXY_PORT", "").strip()
-        if port.isdigit():
-            raw = f"http://127.0.0.1:{port}"
-    if not raw:
-        return None
-    if raw.isdigit():
-        raw = f"http://127.0.0.1:{raw}"
-    if not raw.startswith("http"):
-        raw = f"http://{raw}"
-    return {"http": raw, "https": raw}
 
 
 @register
@@ -85,15 +64,7 @@ class DataLoader:
         if exchange_cls is None:
             logger.warning("Unknown CCXT exchange %s, falling back to binance", exchange_id)
             exchange_cls = ccxt.binance
-        options: dict = {"enableRateLimit": True, "timeout": _CCXT_TIMEOUT_MS}
-        market_type = os.getenv("BINANCE_MARKET_TYPE", os.getenv("CCXT_DEFAULT_TYPE", "")).lower()
-        if market_type in ("future", "futures", "swap"):
-            options.setdefault("options", {})["defaultType"] = "swap"
-        proxies = _ccxt_proxies()
-        if proxies:
-            options["proxies"] = proxies
-            logger.info("CCXT using proxy %s", proxies.get("https", proxies.get("http")))
-        return exchange_cls(options)
+        return exchange_cls({"enableRateLimit": True, "timeout": _CCXT_TIMEOUT_MS})
 
     def fetch(
         self,
