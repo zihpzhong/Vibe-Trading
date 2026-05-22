@@ -61,9 +61,16 @@ class MockBroker(BrokerBase):
         if existing:
             total_shares = existing.shares + shares
             avg = (existing.entry_price * existing.shares + price * shares) / total_shares
-            existing.shares = total_shares
-            existing.entry_price = avg
-            existing.is_today_buy = True
+            self._positions[sym] = AStockPosition(
+                symbol=existing.symbol,
+                name=existing.name,
+                shares=total_shares,
+                entry_price=avg,
+                stop_loss=existing.stop_loss,
+                take_profit=existing.take_profit,
+                opened_at=existing.opened_at,
+                is_today_buy=True,
+            )
         else:
             self._positions[sym] = AStockPosition(
                 symbol=sym,
@@ -88,9 +95,20 @@ class MockBroker(BrokerBase):
         commission = max(notional * self._fees.commission_rate, self._fees.min_commission_cny)
         stamp = notional * self._fees.stamp_tax_rate
         self._cash += notional - commission - stamp
-        pos.shares -= shares
-        if pos.shares <= 0:
+        remaining = pos.shares - shares
+        if remaining <= 0:
             del self._positions[sym]
+        else:
+            self._positions[sym] = AStockPosition(
+                symbol=pos.symbol,
+                name=pos.name,
+                shares=remaining,
+                entry_price=pos.entry_price,
+                stop_loss=pos.stop_loss,
+                take_profit=pos.take_profit,
+                opened_at=pos.opened_at,
+                is_today_buy=pos.is_today_buy,
+            )
         oid = str(uuid.uuid4())[:8]
         return {
             "order_id": oid,
@@ -111,8 +129,20 @@ class MockBroker(BrokerBase):
         return {"cash": self._cash, "market_value": market_value, "total": self._cash + market_value}
 
     def clear_today_buy_flags(self) -> None:
-        for p in self._positions.values():
-            p.is_today_buy = False
+        updated = {}
+        for sym, p in self._positions.items():
+            updated[sym] = AStockPosition(
+                symbol=p.symbol,
+                name=p.name,
+                shares=p.shares,
+                entry_price=p.entry_price,
+                stop_loss=p.stop_loss,
+                take_profit=p.take_profit,
+                opened_at=p.opened_at,
+                is_today_buy=False,
+            )
+        self._positions.clear()
+        self._positions.update(updated)
 
 
 def create_broker(name: str, config: Optional[AStockTradingConfig] = None) -> BrokerBase:

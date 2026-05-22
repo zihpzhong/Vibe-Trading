@@ -44,7 +44,19 @@ class AStockExchangeBase(ABC):
         ...
 
     @abstractmethod
+    def is_st(self, symbol: str) -> bool:
+        ...
+
+    @abstractmethod
+    def get_listing_days(self, symbol: str) -> int:
+        ...
+
+    @abstractmethod
     def is_limit(self, symbol: str) -> str:
+        ...
+
+    @abstractmethod
+    def get_orderbook(self, symbol: str, depth: int = 5) -> dict[str, Any]:
         ...
 
     @abstractmethod
@@ -122,6 +134,7 @@ class MockAStockExchange(AStockExchangeBase):
             "amount": 1e9,
             "turnover_rate": 1.0,
             "change_pct": 0.0,
+            "market_cap": 1e10,
         }
 
     def get_market_index(self, index_code: str, limit: int = 60) -> pd.DataFrame:
@@ -133,12 +146,27 @@ class MockAStockExchange(AStockExchangeBase):
     def is_suspended(self, symbol: str) -> bool:
         return False
 
+    def is_st(self, symbol: str) -> bool:
+        return False
+
+    def get_listing_days(self, symbol: str) -> int:
+        """Mock: assume all stocks listed > 1 year."""
+        return 400
+
     def is_limit(self, symbol: str) -> str:
         q = self.get_realtime_quote(symbol)
         board = infer_board(symbol)
         return self._data.is_limit(
             symbol, float(q["last"]), float(q.get("prev_close", q["last"])), board
         )
+
+    def get_orderbook(self, symbol: str, depth: int = 5) -> dict[str, Any]:
+        q = self.get_realtime_quote(symbol)
+        last = float(q["last"])
+        spread = last * 0.001
+        bids = [[round(last - spread * (i + 1), 2), int(1e4 * (depth - i))] for i in range(depth)]
+        asks = [[round(last + spread * (i + 1), 2), int(1e4 * (depth - i))] for i in range(depth)]
+        return {"bids": bids, "asks": asks, "symbol": symbol}
 
     def create_buy_order(self, symbol: str, price: float, shares: int) -> dict[str, Any]:
         lot = self.config.lot_size

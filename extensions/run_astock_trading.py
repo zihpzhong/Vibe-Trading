@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["default", "conservative", "aggressive"], default="default")
     p.add_argument("--no-phase2", action="store_true", help="Skip phase2 stub")
     p.add_argument("--once", action="store_true", help="Single scan cycle then exit")
+    p.add_argument("--universe", default="", help="Comma-separated stock codes (default: config or mock universe)")
     p.add_argument("--market", default="astock", help=argparse.SUPPRESS)
     args, _unknown = p.parse_known_args()
     return args
@@ -63,6 +64,8 @@ def build_config(args: argparse.Namespace):
     cfg.data_sources = [s.strip() for s in args.data_source.split(",") if s.strip()]
     cfg.market_index = args.market_index
     cfg.scan_interval_minutes = args.interval
+    if args.universe:
+        cfg.universe = [s.strip().upper() for s in args.universe.split(",") if s.strip()]
     if args.mock and "mock" not in cfg.data_sources:
         cfg.data_sources.append("mock")
     return cfg

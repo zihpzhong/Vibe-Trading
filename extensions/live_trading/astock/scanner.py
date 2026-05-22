@@ -93,7 +93,7 @@ class AStockScanner:
             if row is None:
                 filtered += 1
                 continue
-            if row["score"] >= 5:
+            if row["score"] >= self._config.scan_entry_threshold:
                 rankings.append(row)
             elif row["score"] >= MIN_SCORE:
                 watchlist.append(row)
@@ -111,6 +111,10 @@ class AStockScanner:
     def _scan_symbol(self, symbol: str) -> Optional[dict[str, Any]]:
         if self._exchange.is_suspended(symbol):
             return None
+        if self._exchange.is_st(symbol):
+            return None
+        if self._exchange.get_listing_days(symbol) < self._config.gate.min_listing_days:
+            return None
         lim = self._exchange.is_limit(symbol)
         if lim in ("up", "down"):
             return None
@@ -127,6 +131,9 @@ class AStockScanner:
         ticker = self._exchange.get_ticker(symbol)
         amount = float(ticker.get("amount", 0) or 0)
         if amount < self._config.gate.min_daily_amount_cny:
+            return None
+        market_cap = float(ticker.get("market_cap", 0) or 0)
+        if market_cap > 0 and market_cap < self._config.gate.min_market_cap_cny:
             return None
 
         ma20 = float(close.tail(20).mean())
@@ -161,4 +168,5 @@ class AStockScanner:
             "alpha_signal": alpha_sig,
             "board": infer_board(symbol),
             "amount": amount,
+            "market_cap": market_cap,
         }
