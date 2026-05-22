@@ -49,13 +49,11 @@ TIER_1: Final[list[str]] = [
 TIER_2: Final[list[str]] = [
     "DOT",   # Polkadot
     "LINK",  # Chainlink
-    "SHIB",  # Shiba Inu
     "TON",   # Toncoin
     "LTC",   # Litecoin
     "BCH",   # Bitcoin Cash
     "NEAR",  # NEAR Protocol
     "UNI",   # Uniswap
-    "PEPE",  # Pepe
     "POL",   # Polygon (ex-MATIC)
     "APT",   # Aptos
     "SUI",   # Sui
@@ -78,19 +76,15 @@ TIER_3: Final[list[str]] = [
     "VET",    # VeChain
     "RUNE",   # THORChain
     "ALGO",   # Algorand
-    "FTM",    # Fantom
     "IMX",    # Immutable
     "GRT",    # The Graph
-    "MKR",    # Maker
     "PENDLE", # Pendle
     "TIA",    # Celestia
-    "EOS",    # EOS
     "FLOW",   # Flow
     "CRV",    # Curve DAO
     "OP",     # Optimism
     "MINA",   # Mina
     "SEI",    # Sei
-    "CRO",    # Cronos
     "THETA",  # Theta Network
     "JUP",    # Jupiter
 ]
