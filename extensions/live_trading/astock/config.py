@@ -20,10 +20,12 @@ class AStockGateConfig:
 class AStockStopConfig:
     atr_multiplier: float = 2.0
     atr_period: int = 14
-    hard_stop_loss_pct: float = 7.0
+    hard_stop_loss_pct: float = 10.0
     min_stop_distance_pct: float = 3.0
-    max_stop_distance_pct: float = 10.0
-    default_reward_risk: float = 2.0
+    max_stop_distance_pct: float = 12.0
+    default_reward_risk: float = 3.0
+    trail_activation_pct: float = 3.0
+    trail_distance_pct: float = 8.0
 
 
 @dataclass
@@ -47,8 +49,11 @@ class AStockTradingConfig:
     fees: AStockFeeConfig = field(default_factory=AStockFeeConfig)
     de_risk: AStockDeRiskConfig = field(default_factory=AStockDeRiskConfig)
     scan_top_n: int = 20
+    scan_entry_threshold: int = 5
+    max_positions: int = 5
+    max_holding_days: int = 60
     scan_interval_minutes: int = 30
-    position_size_pct: float = 0.12
+    position_size_pct: float = 0.15
     market_index: str = "000300.SH"
     universe: list[str] = field(default_factory=list)
     data_sources: list[str] = field(default_factory=lambda: ["akshare", "tushare", "mock"])

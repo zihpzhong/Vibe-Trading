@@ -29,6 +29,7 @@ class AStockGateEngine:
         self._check_st(result, is_st)
         self._check_limit(result, exchange, signal.symbol)
         self._check_liquidity(result, ticker)
+        self._check_orderbook_impact(result, signal, exchange, order_shares)
         self._check_risk_reward(result, signal)
         self._check_position_cap(result, signal, ticker, account_balance, order_shares)
 
@@ -80,6 +81,49 @@ class AStockGateEngine:
         rr = reward / risk
         ok = rr >= self.gate.min_risk_reward_ratio
         result.add_check("risk_reward", ok, f"R:R={rr:.2f}")
+
+    def _check_orderbook_impact(
+        self,
+        result: ExecutionGateResult,
+        signal: AStockSignal,
+        exchange: AStockExchangeBase,
+        shares: int,
+    ) -> None:
+        if shares <= 0:
+            result.add_check("orderbook_impact", True, "skipped")
+            return
+        try:
+            ob = exchange.get_orderbook(signal.symbol, depth=5)
+        except Exception:
+            result.add_check("orderbook_impact", True, "no_orderbook_data")
+            return
+        asks = ob.get("asks", [])
+        if not asks:
+            result.add_check("orderbook_impact", True, "empty_orderbook")
+            return
+        remaining = shares
+        total_cost = 0.0
+        mid = (asks[0][0] + ob.get("bids", [[0]])[0][0]) / 2 if ob.get("bids") else asks[0][0]
+        if mid <= 0:
+            result.add_check("orderbook_impact", True, "invalid_mid")
+            return
+        for ask_price, ask_size in asks:
+            fill = min(remaining, int(ask_size))
+            total_cost += ask_price * fill
+            remaining -= fill
+            if remaining <= 0:
+                break
+        if remaining > 0:
+            result.add_check("orderbook_impact", False, f"shares={shares} exceeds orderbook depth")
+            return
+        avg_fill = total_cost / shares
+        impact_pct = (avg_fill / mid - 1) * 100
+        ok = impact_pct <= self.gate.max_orderbook_impact_pct
+        result.add_check(
+            "orderbook_impact",
+            ok,
+            f"impact={impact_pct:.2f}% vs limit={self.gate.max_orderbook_impact_pct}%",
+        )
 
     def _check_position_cap(
         self,
