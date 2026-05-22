@@ -90,3 +90,5 @@ extensions/.cache_crypto/
 trading.db
 claudedocs/
 .deepseek/
+.cursor/
+.codegraph/

@@ -106,6 +106,7 @@ class LiveTradingConfig:
     scan_batch_size: int = 5  # 并发批次大小
     default_scan_interval_minutes: int = 5  # 闪电模式默认间隔
     pair_whitelist: List[str] = field(default_factory=list)  # 白名单，空=Top-N模式
+    use_exchange_bracket_orders: bool = True  # 开仓后挂交易所 SL/TP 条件单
 
     @classmethod
     def with_top50_whitelist(cls, **overrides: object) -> LiveTradingConfig:

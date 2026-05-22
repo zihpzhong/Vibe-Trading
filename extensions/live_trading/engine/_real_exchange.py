@@ -453,11 +453,14 @@ class RealExchange(ExchangeBase):
         """
         qty = self._round_qty(symbol, amount)
         order_type = "STOP_MARKET" if self._market_type == "future" else "STOP_LOSS"
+        params: dict[str, str] = {
+            "symbol": symbol, "side": self._binance_side(side), "type": order_type,
+            "quantity": str(qty), "stopPrice": str(stop_price),
+        }
+        if self._market_type == "future":
+            params["reduceOnly"] = "true"
         with self._lock:
-            raw = _retry(f"stop_loss({symbol},{side},{qty},{stop_price})", self._trade_request, "/api/v3/order", {
-                "symbol": symbol, "side": self._binance_side(side), "type": order_type,
-                "quantity": str(qty), "stopPrice": str(stop_price),
-            })
+            raw = _retry(f"stop_loss({symbol},{side},{qty},{stop_price})", self._trade_request, "/api/v3/order", params)
             return {
                 "order_id": raw.get("orderId"),
                 "symbol": raw.get("symbol"),
@@ -477,11 +480,14 @@ class RealExchange(ExchangeBase):
         """
         qty = self._round_qty(symbol, amount)
         order_type = "TAKE_PROFIT_MARKET" if self._market_type == "future" else "TAKE_PROFIT"
+        params: dict[str, str] = {
+            "symbol": symbol, "side": self._binance_side(side), "type": order_type,
+            "quantity": str(qty), "stopPrice": str(tp_price),
+        }
+        if self._market_type == "future":
+            params["reduceOnly"] = "true"
         with self._lock:
-            raw = _retry(f"take_profit({symbol},{side},{qty},{tp_price})", self._trade_request, "/api/v3/order", {
-                "symbol": symbol, "side": self._binance_side(side), "type": order_type,
-                "quantity": str(qty), "stopPrice": str(tp_price),
-            })
+            raw = _retry(f"take_profit({symbol},{side},{qty},{tp_price})", self._trade_request, "/api/v3/order", params)
             return {
                 "order_id": raw.get("orderId"),
                 "symbol": raw.get("symbol"),

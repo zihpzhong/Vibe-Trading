@@ -332,6 +332,7 @@ def main() -> int:
         dca_gate_engine=gate_engine,
         max_leverage=args.max_leverage,
         position_size_pct=args.position_size,
+        use_exchange_brackets=config.use_exchange_bracket_orders and not args.mock,
     )
     monitor.start()
     log.info("TPSL Monitor started (de-risk: [%.0f%%:%.0f%%, %.0f%%:%.0f%%, %.0f%%:%.0f%%], doom=%.0f%%)",
@@ -1011,7 +1012,20 @@ def main() -> int:
                                     except Exception:
                                         pass
 
-                                positions.open_position(
+                                fill_price = float(order.get("avg_price") or 0)
+                                if fill_price <= 0 and order.get("filled") and order.get("cummulative_quote"):
+                                    filled = float(order.get("filled") or 0)
+                                    if filled > 0:
+                                        fill_price = float(order["cummulative_quote"]) / filled
+                                if fill_price > 0:
+                                    entry_price = fill_price
+                                    risk = abs(entry_price - stop_price)
+                                    if direction.value == "LONG":
+                                        tp_price = entry_price + risk * active_rr
+                                    else:
+                                        tp_price = entry_price - risk * active_rr
+
+                                pos = positions.open_position(
                                     symbol=symbol,
                                     direction=direction.value,
                                     entry_price=entry_price,
@@ -1021,11 +1035,31 @@ def main() -> int:
                                     leverage=leverage,
                                     entry_score=score,
                                 )
+                                bracket_note = ""
+                                if (
+                                    config.use_exchange_bracket_orders
+                                    and not args.mock
+                                ):
+                                    from extensions.live_trading.engine.exchange_brackets import (
+                                        has_bracket_support,
+                                        place_bracket_orders,
+                                    )
+
+                                    if has_bracket_support(exchange):
+                                        sl_id, tp_id = place_bracket_orders(exchange, pos)
+                                        positions.set_bracket_order_ids(symbol, sl_id, tp_id)
+                                        if sl_id or tp_id:
+                                            bracket_note = f" SL/TP 条件单: {sl_id or '-'}/{tp_id or '-'}"
+                                        else:
+                                            log.warning(
+                                                "Exchange bracket orders failed for %s — TPSL software fallback",
+                                                symbol,
+                                            )
                                 cycle_orders += 1
                                 total_orders += 1
                                 console.print(
                                     f"           [green]✅ 开仓成功: {symbol} "
-                                    f"{direction.value} qty={quantity} @ {entry_price:.2f}[/green]"
+                                    f"{direction.value} qty={quantity} @ {entry_price:.2f}{bracket_note}[/green]"
                                 )
                             except Exception as exc:
                                 log.error("Order failed for %s: %s", symbol, exc)
