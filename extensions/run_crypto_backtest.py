@@ -42,7 +42,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fetch-only", action="store_true")
     p.add_argument("--synthetic", action="store_true", help="Use synthetic OHLCV (no network)")
     p.add_argument("--no-whitelist", action="store_true", help="Set enforce_whitelist=false in config")
-    p.add_argument("--runner", action="store_true", help="Run via agent/backtest/runner.py + run_dir")
+    p.add_argument(
+        "--runner",
+        action="store_true",
+        help="Run via extensions/backtest/ext_runner.py + run_dir (per extension-guide)",
+    )
     p.add_argument("--top50", action="store_true", help="Top50 whitelist (uses first N with --max-symbols)")
     p.add_argument(
         "--max-symbols",
@@ -130,35 +134,32 @@ def fetch_ccxt(
     interval: str,
     cache_dir: Path,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch via agent backtest ccxt loader with parquet cache."""
+    """Fetch via extension CCXT helper (proxy/futures) with parquet cache."""
+    from extensions.backtest.ccxt_helpers import fetch_ohlcv_map
+
     cache_dir.mkdir(parents=True, exist_ok=True)
     data_map: dict[str, pd.DataFrame] = {}
-    try:
-        from backtest.loaders.ccxt_loader import DataLoader as CcxtLoader
-    except ImportError:
-        agent_path = _PROJECT_ROOT / "agent"
-        sys.path.insert(0, str(agent_path))
-        from backtest.loaders.ccxt_loader import DataLoader as CcxtLoader
-
-    loader = CcxtLoader()
+    to_fetch: list[str] = []
     for code in codes:
         sym = normalize_symbol(code)
         cache_path = cache_dir / f"{sym}_{interval}.parquet"
         if cache_path.exists():
             data_map[sym] = pd.read_parquet(cache_path)
-            continue
-        ccxt_code = sym.replace("USDT", "/USDT")
-        chunk = loader.fetch([ccxt_code], start, end, interval=interval)
-        if not chunk:
-            continue
-        df = chunk.get(ccxt_code)
-        if df is None:
-            df = chunk.get(sym)
-        if df is None and chunk:
-            df = next(iter(chunk.values()))
-        if df is not None and not df.empty:
-            data_map[sym] = df
-            df.to_parquet(cache_path)
+        else:
+            to_fetch.append(sym)
+
+    if to_fetch:
+        ccxt_codes = [c.replace("USDT", "/USDT") for c in to_fetch]
+        chunk = fetch_ohlcv_map(ccxt_codes, start, end, interval=interval)
+        for sym in to_fetch:
+            ccxt_code = sym.replace("USDT", "/USDT")
+            df = chunk.get(ccxt_code) or chunk.get(sym)
+            if df is None and chunk:
+                continue
+            if df is not None and not df.empty:
+                data_map[sym] = df
+                (cache_dir / f"{sym}_{interval}.parquet").parent.mkdir(parents=True, exist_ok=True)
+                df.to_parquet(cache_dir / f"{sym}_{interval}.parquet")
     return data_map
 
 
@@ -212,25 +213,17 @@ def run_via_runner(config: dict[str, Any], run_dir: Path) -> None:
         encoding="utf-8",
     )
     (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    agent_root = _PROJECT_ROOT / "agent"
-    sys.path.insert(0, str(agent_root))
-    from backtest.runner import main as runner_main
+    from extensions.backtest.ext_runner import main as ext_runner_main
 
-    runner_main(run_dir)
+    ext_runner_main(run_dir)
 
 
 def _apply_proxy_env(proxy: str | None) -> None:
-    if not proxy:
-        return
-    url = proxy.strip()
-    if url.isdigit():
-        url = f"http://127.0.0.1:{url}"
-    elif not url.startswith("http"):
-        url = f"http://{url}"
-    os.environ["CCXT_PROXY"] = url
-    os.environ["HTTP_PROXY"] = url
-    os.environ["HTTPS_PROXY"] = url
-    print(f"CCXT proxy: {url}")
+    from extensions.backtest.ccxt_helpers import apply_proxy_env
+
+    url = apply_proxy_env(proxy)
+    if url:
+        print(f"CCXT proxy: {url}")
 
 
 def main() -> int:

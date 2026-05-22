@@ -45,7 +45,7 @@ from backtest.engines._market_hooks import (  # noqa: F401  (re-exported)
 logger = logging.getLogger(__name__)
 
 _VALID_INTERVALS = {"1m", "5m", "15m", "30m", "1H", "4H", "1D"}
-_VALID_ENGINES = {"daily", "options", "astock"}
+_VALID_ENGINES = {"daily", "options"}
 _VALID_SOURCES = {"tushare", "okx", "yfinance", "akshare", "ccxt", "auto"}
 
 
@@ -468,25 +468,6 @@ def main(run_dir: Path) -> None:
     if engine_type == "options":
         from backtest.engines.options_portfolio import run_options_backtest
         run_options_backtest(config, loader, signal_engine, run_dir, bars_per_year=bars_per_year)
-    elif engine_type == "astock":
-        from extensions.live_trading.astock.backtest.engine import (
-            AStockBacktestEngine,
-            _NullSignalEngine,
-        )
-        # Wrap user's signal_engine with null adapter — AStockBacktestEngine
-        # generates signals internally via scanner-based evaluation.
-        signal_engine = _NullSignalEngine()
-        market_engine = AStockBacktestEngine(config)
-        market_engine.run_backtest(config, loader, signal_engine, run_dir, bars_per_year=bars_per_year)
-    elif engine_type == "crypto_live":
-        from extensions.live_trading.crypto_backtest.engine import (
-            CryptoLiveBacktestEngine,
-            _NullSignalEngine,
-        )
-
-        signal_engine = _NullSignalEngine()
-        market_engine = CryptoLiveBacktestEngine(config)
-        market_engine.run_backtest(config, loader, signal_engine, run_dir, bars_per_year=bars_per_year)
     else:
         market_engine = _create_market_engine(effective_source, config, codes)
         market_engine.run_backtest(config, loader, signal_engine, run_dir, bars_per_year=bars_per_year)
