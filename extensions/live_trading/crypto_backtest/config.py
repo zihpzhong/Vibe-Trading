@@ -36,6 +36,7 @@ class CryptoBacktestConfig:
     phase2_enabled: bool = False
     phase2_replay_path: str = ""
     phase2_fast_track_neutral: bool = False
+    phase2_replay_swarm: bool = False
     enable_dca: bool = True
     coverage_min_pct: float = 0.90
     maker_rate: float = 0.0002
@@ -104,6 +105,7 @@ class CryptoBacktestConfig:
             phase2_enabled=bool(d.get("phase2_enabled", cls.phase2_enabled)),
             phase2_replay_path=str(d.get("phase2_replay_path", cls.phase2_replay_path) or ""),
             phase2_fast_track_neutral=bool(d.get("phase2_fast_track_neutral", cls.phase2_fast_track_neutral)),
+            phase2_replay_swarm=bool(d.get("phase2_replay_swarm", cls.phase2_replay_swarm)),
             enable_dca=bool(d.get("enable_dca", cls.enable_dca)),
             coverage_min_pct=float(d.get("coverage_min_pct", cls.coverage_min_pct)),
             maker_rate=float(d.get("maker_rate", cls.maker_rate)),

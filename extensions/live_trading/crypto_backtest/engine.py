@@ -258,7 +258,10 @@ class CryptoLiveBacktestEngine(CryptoEngine):
         if self._bt.phase2_enabled:
             if self._phase2_replay is None:
                 return
-            if not self._phase2_replay.allows_entry(
+            if self._bt.phase2_replay_swarm:
+                if not self._phase2_replay.allows_entry_swarm_as_phase2(ts, symbol):
+                    return
+            elif not self._phase2_replay.allows_entry(
                 ts,
                 symbol,
                 fast_track_neutral=self._bt.phase2_fast_track_neutral,

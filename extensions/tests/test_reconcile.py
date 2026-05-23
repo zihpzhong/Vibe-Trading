@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -43,6 +44,41 @@ class TestReconcilePositions:
         pos = tracker.get_active_positions()[0]
         assert pos.symbol == "ETHUSDT"
         assert pos.direction == "SHORT"
+
+    def test_adopts_with_bracket_orders_when_exchange_provided(self) -> None:
+        mock_exchange = MagicMock()
+        mock_exchange.create_stop_loss_order.return_value = {"order_id": "sl123"}
+        mock_exchange.create_take_profit_order.return_value = {"order_id": "tp456"}
+        _tmp = tempfile.mkdtemp()
+        tracker = PositionTracker(account_balance=10_000.0, max_positions=3, persist_dir=_tmp)
+        exch = [{
+            "symbol": "ETHUSDT",
+            "direction": "SHORT",
+            "entry_price": 3200.0,
+            "quantity": 0.05,
+        }]
+        summary = reconcile_positions(tracker, exch, exchange=mock_exchange)
+        assert "ETHUSDT" in summary["adopted"]
+        pos = tracker.get_position("ETHUSDT")
+        assert pos is not None
+        assert pos.sl_order_id is not None  # SL placed with hardcoded 8%
+        assert pos.tp_order_id is None  # TP not set on adoption
+
+    def test_adopts_skips_brackets_when_no_exchange(self) -> None:
+        _tmp = tempfile.mkdtemp()
+        tracker = PositionTracker(account_balance=10_000.0, max_positions=3, persist_dir=_tmp)
+        exch = [{
+            "symbol": "BTCUSDT",
+            "direction": "LONG",
+            "entry_price": 65000.0,
+            "quantity": 0.01,
+        }]
+        summary = reconcile_positions(tracker, exch)
+        assert "BTCUSDT" in summary["adopted"]
+        pos = tracker.get_position("BTCUSDT")
+        assert pos is not None
+        assert pos.sl_order_id is None
+        assert pos.tp_order_id is None
 
     def test_persists_closed_beyond_fifty(self) -> None:
         tmp = Path(tempfile.mkdtemp())

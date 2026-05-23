@@ -60,6 +60,33 @@ DIM_LABELS: dict[str, str] = {
     "dim10": "行为/监管",  # NEW
 }
 
+
+def format_alpha_context_block(alpha_context: dict | None) -> str:
+    """Format Phase 1 alpha factor fields for Phase 2 prompt injection."""
+    if not alpha_context:
+        return ""
+    lines: list[str] = []
+    signal = alpha_context.get("alpha_signal")
+    if signal is not None:
+        try:
+            sig = float(signal)
+            bias = "bullish" if sig >= 0.4 else "bearish" if sig < 0 else "neutral"
+            lines.append(f"- alpha_signal (aggregate): {sig:.3f} ({bias})")
+        except (TypeError, ValueError):
+            pass
+    for key in sorted(alpha_context):
+        if key == "alpha_signal" or not key.startswith("alpha_"):
+            continue
+        try:
+            val = float(alpha_context[key])
+            lines.append(f"- {key}: {val:.3f}")
+        except (TypeError, ValueError):
+            continue
+    if not lines:
+        return ""
+    return "## Alpha Factor Signals (Phase 1)\n" + "\n".join(lines) + "\n"
+
+
 class Phase2Analyzer:
     """Phase 2 deep analysis: load skills per dimension → LLM → verdict."""
 
@@ -130,6 +157,7 @@ Rules:
         funding_rate: Optional[float] = None,
         orderbook: Optional[dict] = None,
         btc_1h_trend: str = "NEUTRAL",
+        alpha_context: Optional[dict] = None,
     ) -> Optional[dict]:
         """Run Phase 2 on one signal. Returns verdict dict or None on failure."""
         needed = [d for d in req.dims if d in DIM_SKILL_MAP]
@@ -153,7 +181,15 @@ Rules:
                     req.symbol, loaded_count, len(needed), needed_threshold,
                 )
                 return {"symbol": req.symbol, "consensus": "NEUTRAL", "summary": "insufficient dimension data", "dimensions": {}}
-            prompt = self._build_prompt(req, ticker or {}, skills, funding_rate, orderbook, btc_1h_trend)
+            prompt = self._build_prompt(
+                req,
+                ticker or {},
+                skills,
+                funding_rate,
+                orderbook,
+                btc_1h_trend,
+                alpha_context=alpha_context,
+            )
             llm = self._get_llm()
             response = llm.chat(
                 messages=[
@@ -175,8 +211,10 @@ Rules:
         funding_rate: Optional[float] = None,
         orderbook: Optional[dict] = None,
         btc_1h_trend: str = "NEUTRAL",
+        alpha_context: Optional[dict] = None,
     ) -> str:
         dim_list = "\n".join(f"  - {d} ({DIM_LABELS.get(d, d)})" for d in skills.keys())
+        alpha_block = format_alpha_context_block(alpha_context)
 
         skills_block = ""
         for dim, content in skills.items():
@@ -219,6 +257,7 @@ Rules:
 {btc_line}
 {ob_summary}
 
+{alpha_block}
 ## Required Dimensions (load_skill per dim)
 {dim_list}
 

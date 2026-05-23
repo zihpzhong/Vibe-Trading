@@ -132,6 +132,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-phase2", action="store_true",
                         help="跳过 Phase 2 LLM 深度分析 (仅 Phase 1 + Gate)")
     parser.add_argument(
+        "--swarm-phase2-shadow",
+        action="store_true",
+        help="enhanced 档后台并行 Swarm 分析 (shadow 模式，不影响开仓，写 swarm_shadow.jsonl)",
+    )
+    parser.add_argument(
+        "--phase2-enhanced-strict",
+        action="store_true",
+        help="enhanced 档 Phase 2 需至少 2 维 PASS 才继续 (否则 SKIP)",
+    )
+    parser.add_argument(
         "--pairs", nargs="*", default=None,
         help="交易对白名单 e.g. --pairs BTC ETH SOL (空=Top-N 模式, 也支持 TRADING_PAIRS 环境变量)",
     )
@@ -213,6 +223,11 @@ def main() -> int:
     from extensions.live_trading.engine.atr_stop import calculate_atr_stop
     from extensions.live_trading.engine.execution_gate import ExecGateEngine
     from extensions.live_trading.engine.phase2 import Phase2Analyzer
+    from extensions.live_trading.engine.swarm_phase2 import (
+        SwarmPhase2Config,
+        SwarmPhase2Engine,
+        extract_alpha_context,
+    )
     from extensions.live_trading.engine.reconcile import reconcile_positions
     from extensions.live_trading.config import LiveTradingConfig
     from extensions.live_trading.models import GateStatus, LiveSignal, ScheduleReport, SignalDirection
@@ -317,6 +332,13 @@ def main() -> int:
         log.info("Phase 2 deep analysis enabled (LLM-driven skills)")
     else:
         log.info("Phase 2 disabled (--no-phase2)")
+
+    swarm_shadow_engine: SwarmPhase2Engine | None = None
+    if args.swarm_phase2_shadow:
+        swarm_shadow_engine = SwarmPhase2Engine(SwarmPhase2Config(enabled=True, shadow_only=True))
+        log.info("Swarm Phase 2 shadow enabled (enhanced tier, log=%s)", swarm_shadow_engine._log_path)
+    if args.phase2_enhanced_strict:
+        log.info("Phase 2 enhanced strict: require >=2 dim PASS")
 
     # ---- Gate 引擎 ----
     gate_engine = ExecGateEngine(config)
@@ -693,7 +715,11 @@ def main() -> int:
                         except Exception:
                             return 0.0
 
-                    summary = reconcile_positions(positions, exch_pos, price_lookup=_mark_price)
+                    summary = reconcile_positions(
+                        positions, exch_pos,
+                        price_lookup=_mark_price,
+                        exchange=exchange if config.use_exchange_bracket_orders and not args.mock else None,
+                    )
                     if summary.get("removed") or summary.get("adopted"):
                         console.print(
                             f"[yellow]持仓对账: 移除幽灵 {summary.get('removed')} "
@@ -704,6 +730,7 @@ def main() -> int:
 
             if report.phase2_requests:
                 console.print(f"[bold]--- 自动交易评估 ({'LIVE' if not args.dry_run else 'DRY RUN'}) ---[/bold]")
+                ranking_by_symbol = {str(r.get("symbol", "")): r for r in report.rankings}
 
                 for req in report.phase2_requests:
                     symbol = req.symbol
@@ -768,20 +795,53 @@ def main() -> int:
                         log.warning("Funding rate fetch failed for %s: %s", symbol, exc)
 
                     # 2c. Phase 2: LLM深度分析 — load_skill per dim → 综合评分
+                    watch_only_flag = False
+                    phase2_result: dict | None = None
+                    alpha_context = extract_alpha_context(ranking_by_symbol.get(symbol, {}))
                     if phase2_analyzer and req.dims:
                         phase2_result = phase2_analyzer.analyze(
                             req, ticker,
                             funding_rate=funding_rate,
                             orderbook=orderbook,
                             btc_1h_trend=btc_hint,
+                            alpha_context=alpha_context or None,
                         )
                         if phase2_result:
                             dims_str = "; ".join(
-                                f"{d}:{phase2_result.get('dimensions', {}).get(d, {}).get('verdict', '?')}"
+                                f"{d}:{(phase2_result.get('dimensions') or {}).get(d, {}).get('verdict', '?')}"
                                 for d in req.dims
                             )
                             consensus = phase2_result.get("consensus", "NEUTRAL")
                             summary = phase2_result.get("summary", "")
+
+                            # Swarm shadow fires for ALL enhanced tier (regardless of gate decision)
+                            if swarm_shadow_engine and req.tier == "enhanced":
+                                swarm_shadow_engine.submit_shadow(
+                                    req,
+                                    ticker,
+                                    funding_rate=funding_rate,
+                                    orderbook=orderbook,
+                                    btc_1h_trend=btc_hint,
+                                    mono_result=phase2_result,
+                                )
+
+                            if (
+                                args.phase2_enhanced_strict
+                                and req.tier == "enhanced"
+                                and consensus != "FAIL"
+                            ):
+                                pass_count = sum(
+                                    1
+                                    for d in req.dims
+                                    if (phase2_result.get("dimensions") or {}).get(d, {}).get("verdict") == "PASS"
+                                )
+                                if pass_count < 2:
+                                    console.print(
+                                        f"  {symbol:12s} [yellow]PHASE2 STRICT SKIP[/yellow] — "
+                                        f"enhanced needs >=2 PASS dims (got {pass_count})"
+                                    )
+                                    console.print(f"           {dims_str}")
+                                    continue
                             if consensus == "FAIL":
                                 console.print(
                                     f"  {symbol:12s} [red]PHASE2 FAIL[/red] — {summary}"
@@ -797,7 +857,7 @@ def main() -> int:
                                     console.print(f"           {dims_str}")
                                     watch_only_flag = False
                                 elif all(
-                                    phase2_result.get("dimensions", {}).get(d, {}).get("verdict") == "NEUTRAL"
+                                    (phase2_result.get("dimensions") or {}).get(d, {}).get("verdict") == "NEUTRAL"
                                     for d in req.dims
                                 ):
                                     # 所有维度均 NEUTRAL（通常是缺乏实时数据，不是真正风险信号）
@@ -1007,7 +1067,7 @@ def main() -> int:
                                         if status.get("status") == "NEW":
                                             exchange.cancel_order(order["order_id"], symbol)
                                             log.warning("Order %s cancelled — not filled after 2s", order["order_id"])
-                                            console.print(f"           [yellow]⚠️ 订单未成交，已取消[/yellow]")
+                                            console.print("           [yellow]⚠️ 订单未成交，已取消[/yellow]")
                                             continue
                                     except Exception:
                                         pass
