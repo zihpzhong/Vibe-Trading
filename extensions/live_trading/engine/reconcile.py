@@ -18,6 +18,7 @@ def reconcile_positions(
     exchange_positions: list[dict[str, Any]],
     *,
     price_lookup: Optional[Callable[[str], float]] = None,
+    exchange: Any = None,
 ) -> dict[str, Any]:
     """Align tracker with exchange positionRisk snapshot.
 
@@ -89,6 +90,33 @@ def reconcile_positions(
 
     unchanged = len(exch_syms & local_syms)
     summary = {"removed": removed, "adopted": adopted, "unchanged": unchanged}
+
+    # Place exchange bracket orders for newly adopted positions
+    if exchange and adopted:
+        _place_adopted_brackets(tracker, exchange, adopted)
+
     if removed or adopted:
         logger.info("Reconcile complete: %s", summary)
     return summary
+
+
+def _place_adopted_brackets(
+    tracker: PositionTracker,
+    exchange: Any,
+    adopted: list[str],
+) -> None:
+    """Place SL/TP bracket orders on exchange for positions adopted via reconcile."""
+    try:
+        from .exchange_brackets import has_bracket_support, place_bracket_orders
+
+        if not has_bracket_support(exchange):
+            logger.info("Exchange lacks bracket support — skip bracket placement for adopted positions")
+            return
+        for sym in adopted:
+            pos = tracker.get_position(sym)
+            if not pos or (pos.stop_loss is None or pos.stop_loss <= 0):
+                continue
+            sl_id, tp_id = place_bracket_orders(exchange, pos)
+            tracker.set_bracket_order_ids(sym, sl_id, tp_id)
+    except Exception:
+        logger.exception("Failed to place bracket orders for adopted positions")

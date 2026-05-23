@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         help="HTTP proxy for CCXT (port e.g. 7897 or full URL http://127.0.0.1:7897)",
     )
     p.add_argument("--scan-every", type=int, default=12, help="Scan every N bars (default 12 for speed)")
+    p.add_argument("--replay-phase2", action="store_true", help="Enable Phase 2 replay (verdict gating)")
+    p.add_argument(
+        "--replay-swarm",
+        action="store_true",
+        help="Enable Swarm Phase 2 replay (swarm consensus gating)",
+    )
     return p.parse_args()
 
 
@@ -164,7 +170,7 @@ def fetch_ccxt(
 
 
 def build_config(args: argparse.Namespace, codes: list[str]) -> dict[str, Any]:
-    return {
+    config: dict[str, Any] = {
         "codes": codes,
         "start_date": args.start,
         "end_date": args.end,
@@ -179,13 +185,23 @@ def build_config(args: argparse.Namespace, codes: list[str]) -> dict[str, Any]:
         "pair_whitelist": codes,
         "enforce_whitelist": not args.no_whitelist,
         "scan_top_n": 0,
-        "phase2_enabled": False,
+        "phase2_enabled": args.replay_phase2 or args.replay_swarm,
         "maker_rate": 0.0002,
         "taker_rate": 0.0005,
         "slippage": 0.0005,
         "funding_rate": 0.0001,
         "btc_symbol": "BTCUSDT",
+        "phase2_replay_swarm": args.replay_swarm,
     }
+    if args.replay_phase2 or args.replay_swarm:
+        # Auto-discover latest replay JSONL
+        replay_dir = Path.home() / ".vibe-trading" / "logs"
+        jsonl_files = sorted(replay_dir.glob("phase2_replay_*.jsonl"))
+        if jsonl_files:
+            config["phase2_replay_path"] = str(jsonl_files[-1])
+            print(f"  Phase 2 replay: {jsonl_files[-1].name}" +
+                  (" (swarm)" if args.replay_swarm else ""))
+    return config
 
 
 def run_direct(config: dict[str, Any], data_map: dict[str, pd.DataFrame]) -> dict[str, Any]:
