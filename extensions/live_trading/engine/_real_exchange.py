@@ -12,7 +12,7 @@ import logging
 import os
 import threading
 import time
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -150,6 +150,7 @@ class RealExchange(ExchangeBase):
 
         # Pre-fetch LOT_SIZE stepSizes from exchangeInfo for quantity rounding
         self._step_sizes: dict[str, float] = {}
+        self._tick_sizes: dict[str, float] = {}
         # Also store min notional and min qty for reference
         self._min_notionals: dict[str, float] = {}
         self._min_qtys: dict[str, float] = {}
@@ -498,6 +499,7 @@ class RealExchange(ExchangeBase):
         Spot: uses /api/v3/order with STOP_LOSS (regular endpoint).
         """
         qty = self._round_qty(symbol, amount)
+        trigger = self._format_decimal(self._round_price(symbol, stop_price))
         with self._lock:
             if self._market_type == "future":
                 # Binance Algo Order API — reduceOnly handles direction
@@ -505,7 +507,8 @@ class RealExchange(ExchangeBase):
                 params: dict[str, str] = {
                     "algoType": "CONDITIONAL",
                     "symbol": symbol, "side": bs, "type": "STOP_MARKET",
-                    "quantity": str(qty), "triggerPrice": str(stop_price), "reduceOnly": "true",
+                    "quantity": self._format_decimal(qty),
+                    "triggerPrice": trigger, "reduceOnly": "true",
                 }
                 raw = _retry(
                     f"stop_loss({symbol},{side},{qty},{stop_price})",
@@ -538,13 +541,15 @@ class RealExchange(ExchangeBase):
         Spot: uses /api/v3/order with TAKE_PROFIT (regular endpoint).
         """
         qty = self._round_qty(symbol, amount)
+        trigger = self._format_decimal(self._round_price(symbol, tp_price))
         with self._lock:
             if self._market_type == "future":
                 bs = self._binance_side(side)
                 params: dict[str, str] = {
                     "algoType": "CONDITIONAL",
                     "symbol": symbol, "side": bs, "type": "TAKE_PROFIT_MARKET",
-                    "quantity": str(qty), "triggerPrice": str(tp_price), "reduceOnly": "true",
+                    "quantity": self._format_decimal(qty),
+                    "triggerPrice": trigger, "reduceOnly": "true",
                 }
                 raw = _retry(
                     f"take_profit({symbol},{side},{qty},{tp_price})",
@@ -790,7 +795,8 @@ class RealExchange(ExchangeBase):
                         step = float(f.get("stepSize", 1))
                         self._step_sizes[sym] = step
                         self._min_qtys[sym] = float(f.get("minQty", 0))
-                        break
+                    elif f.get("filterType") == "PRICE_FILTER":
+                        self._tick_sizes[sym] = float(f.get("tickSize", 0.01))
         except Exception as exc:
             logger.warning("Failed to load exchangeInfo for LOT_SIZE: %s", exc)
 
@@ -819,6 +825,21 @@ class RealExchange(ExchangeBase):
             )
             return fallback
         return result
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round price to the symbol's PRICE_FILTER tickSize."""
+        tick = self._tick_sizes.get(symbol)
+        if tick is None or tick <= 0:
+            return round(price, 8)
+        tick_d = Decimal(str(tick))
+        price_d = Decimal(str(price))
+        rounded = (price_d / tick_d).to_integral_value(rounding=ROUND_HALF_UP) * tick_d
+        return float(rounded)
+
+    @staticmethod
+    def _format_decimal(value: float) -> str:
+        """Format a float for Binance API without excess precision."""
+        return format(Decimal(str(value)).normalize(), "f")
 
     def _fapi_post(self, path: str, params: dict) -> dict:
         """Send a signed POST to fapi.binance.com with full path.
