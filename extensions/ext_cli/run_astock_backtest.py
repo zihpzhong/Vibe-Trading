@@ -1,7 +1,7 @@
 """Run AStockBacktestEngine with real A-share historical data via akshare.
 
 Usage:
-    cd /Users/uncless/workspace/python-code/Vibe-Trading && .venv/bin/python extensions/cli/run_astock_backtest.py
+    cd /Users/uncless/workspace/python-code/Vibe-Trading && .venv/bin/python extensions/ext_cli/run_astock_backtest.py
 
 Demonstrates the full scanner-based backtest pipeline on actual market data:
   akshare fetch → BacktestExchange → per-bar scanner evaluation → gate → TPSL → metrics

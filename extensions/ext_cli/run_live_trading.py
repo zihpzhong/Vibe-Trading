@@ -4,9 +4,9 @@
   BTC传导 → Phase 1 扫描 → ATR止损 → Execution Gate → 自动开仓 → TP/SL守护
 
 Usage:
-    python extensions/cli/run_live_trading.py              # 默认 dry-run，仅扫描不交易
-    python extensions/cli/run_live_trading.py --mock       # 模拟测试
-    python extensions/cli/run_live_trading.py --live --confirm-live I_UNDERSTAND
+    python extensions/ext_cli/run_live_trading.py              # 默认 dry-run，仅扫描不交易
+    python extensions/ext_cli/run_live_trading.py --mock       # 模拟测试
+    python extensions/ext_cli/run_live_trading.py --live --confirm-live I_UNDERSTAND
 """
 
 from __future__ import annotations

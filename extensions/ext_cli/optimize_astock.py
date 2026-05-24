@@ -4,24 +4,24 @@ Runs multiple backtests across a parameter grid, caches results,
 and reports the top configurations ranked by total_return.
 
 Usage:
-    cd /Users/uncless/workspace/python-code/Vibe-Trading && .venv/bin/python extensions/cli/optimize_astock.py
+    cd /Users/uncless/workspace/python-code/Vibe-Trading && .venv/bin/python extensions/ext_cli/optimize_astock.py
 
     1D sweeps (recommended first):
-        python extensions/cli/optimize_astock.py --sweep position_size_pct
-        python extensions/cli/optimize_astock.py --sweep scan_top_n
-        python extensions/cli/optimize_astock.py --sweep atr_multiplier
-        python extensions/cli/optimize_astock.py --sweep hard_stop_loss_pct
-        python extensions/cli/optimize_astock.py --sweep reward_risk
-        python extensions/cli/optimize_astock.py --sweep min_score
+        python extensions/ext_cli/optimize_astock.py --sweep position_size_pct
+        python extensions/ext_cli/optimize_astock.py --sweep scan_top_n
+        python extensions/ext_cli/optimize_astock.py --sweep atr_multiplier
+        python extensions/ext_cli/optimize_astock.py --sweep hard_stop_loss_pct
+        python extensions/ext_cli/optimize_astock.py --sweep reward_risk
+        python extensions/ext_cli/optimize_astock.py --sweep min_score
 
     Combined grid (small subset):
-        python extensions/cli/optimize_astock.py --grid quick
+        python extensions/ext_cli/optimize_astock.py --grid quick
 
     Full grid search (may take hours):
-        python extensions/cli/optimize_astock.py --grid full
+        python extensions/ext_cli/optimize_astock.py --grid full
 
     Re-run from cache only:
-        python extensions/cli/optimize_astock.py --cache-only
+        python extensions/ext_cli/optimize_astock.py --cache-only
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ from extensions.trading.astock.backtest.engine import (
     AStockBacktestEngine,
     _NullSignalEngine,
 )
-from extensions.cli.run_astock_backtest import (
+from extensions.ext_cli.run_astock_backtest import (
     CODES,
     START_DATE,
     END_DATE,

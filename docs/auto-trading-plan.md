@@ -31,7 +31,7 @@
 | 批量行情         | `ccxt.fetch_tickers()`                 | futures 默认 `/fapi/v1/ticker/24hr`，spot 模式 `/api/v3/ticker/24hr`                                                      |
 | K线数据         | ccxt `fetch_ohlcv()`                   | `/api/v3/klines` 直连，futures 不可用时自动 fallback 到 spot                                                                   |
 | 签名方式         | ccxt 内置                                | **HMAC-SHA256** 自实现，无第三方依赖                                                                                           |
-| 部署方式         | 未指定                                    | **本地/服务器**: `python extensions/cli/run_live_trading.py`；**Docker**: `docker compose up -d live-trading`（`compose` 挂载数据卷） |
+| 部署方式         | 未指定                                    | **本地/服务器**: `python extensions/ext_cli/run_live_trading.py`；**Docker**: `docker compose up -d live-trading`（`compose` 挂载数据卷） |
 | Phase 1 标的池  | Top-N 成交量扫描                            | **默认 Top50 白名单**（`with_top50_whitelist()`，`scan_top_n=0`）；`--pairs` 或 `scan_top_n=20` 可切回 Top-N                      |
 | Phase 2 分析   | 8 个独立 Skill 文件                         | **Phase2Analyzer** (SkillsLoader + ChatLLM, **10** dim→skill 映射, JSON verdict 输出)                                    |
 | Alpha 因子     | 无                                      | 12 个公式化因子 → `alpha_signal` 贡献 ±1 分给 LONG/SHORT 评分                                                                    |
@@ -470,8 +470,8 @@ flowchart TD
 | 闲置扫描告警         | `TradingScheduler._consecutive_idle_scans` (12 次阈值)                                               | 代码      | ✅         |
 | 余额同步+暴跌保护      | 每轮 `get_account_balance()` → 50% 崩盘保护                                                             | 代码      | ✅         |
 | 主循环集成          | `run_live_trading.py` 主循环 → Phase2Analyzer → ATR → Gate → 下单                                      | 代码      | ✅         |
-| 启动             | `python extensions/cli/run_live_trading.py --balance 50 --interval 10`                                | dry-run | ✅ 默认观察模式  |
-| 实盘启动           | `python extensions/cli/run_live_trading.py --live --confirm-live I_UNDERSTAND ...`                    | live    | ✅ 显式确认    |
+| 启动             | `python extensions/ext_cli/run_live_trading.py --balance 50 --interval 10`                                | dry-run | ✅ 默认观察模式  |
+| 实盘启动           | `python extensions/ext_cli/run_live_trading.py --live --confirm-live I_UNDERSTAND ...`                    | live    | ✅ 显式确认    |
 
 
 ## 配置体系 (config.py)
@@ -1084,7 +1084,7 @@ class DailyRiskTracker:
 | `extensions/trading/models.py`                  | ✅   | 核心数据模型 (Gate/Signal/Phase2Request/ScheduleReport)                           |
 | `extensions/trading/config.py`                  | ✅   | 完整配置 (DeRisk+DCA+ATR+Gate+BTC+Funding+模式预设+validate+exchange bracket)       |
 | `extensions/tools/live_trading_tool.py`              | ✅   | 8 actions (Agent 工具集成)                                                      |
-| `extensions/cli/run_live_trading.py`                     | ✅   | 入口脚本 (日亏损熔断+余额同步+暴跌保护+可用余额上限+信号处理+Swarm shadow+Enhanced strict)                 |
+| `extensions/ext_cli/run_live_trading.py`                     | ✅   | 入口脚本 (日亏损熔断+余额同步+暴跌保护+可用余额上限+信号处理+Swarm shadow+Enhanced strict)                 |
 | `extensions/trading/crypto_backtest/phase2_replay.py` | ✅ | Phase 2 / Swarm 回测 replay (含 swarm_verdict/allows_entry_swarm)                   |
 | `extensions/tests/test_live_trading_e2e.py`          | ✅   | 端到端集成测试                                                                     |
 | `extensions/tests/test_market_scanner.py`            | ✅   | 评分规则单元测试 (12+)                                                              |

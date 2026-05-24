@@ -70,14 +70,14 @@ Vibe-Trading/
 | 本地配置覆盖 | `extensions/config/.env.local` | 无 | gitignore 保护，不提交 |
 | 前端扩展 | `extensions/frontend/`（按需创建） | 极低 | 需同步修改 vite 配置 |
 | A 股/加密扩展回测 | `extensions/backtest/ext_runner.py` | 无 | 替代修改 `agent/backtest/runner.py` |
-| 回测脚本 | `extensions/cli/run_astock_backtest.py` 等 | 无 | 直接调用扩展引擎，不依赖上游 runner |
+| 回测脚本 | `extensions/ext_cli/run_astock_backtest.py` 等 | 无 | 直接调用扩展引擎，不依赖上游 runner |
 
 ### 扩展回测（A 股 / crypto_live）
 
 **不要**在 `agent/backtest/runner.py` 增加 `astock` / `crypto_live` 分支（rebase 会与上游冲突）。
 
-- 进程内回测：`python extensions/cli/run_astock_backtest.py` 或 `run_crypto_backtest.py`（默认）
-- 需要 run_dir 产物：`python extensions/cli/run_crypto_backtest.py --runner` → 调用 `extensions/backtest/ext_runner.py`
+- 进程内回测：`python extensions/ext_cli/run_astock_backtest.py` 或 `run_crypto_backtest.py`（默认）
+- 需要 run_dir 产物：`python extensions/ext_cli/run_crypto_backtest.py --runner` → 调用 `extensions/backtest/ext_runner.py`
 - CCXT 代理、合约 `defaultType`：仅通过 `extensions/backtest/ccxt_helpers.py` 或脚本内 `CCXT_PROXY` 环境变量
 
 ### 代码风格（PEP 8 / Ruff）
@@ -89,7 +89,7 @@ ruff check agent/ extensions/ --ignore E501
 ruff check extensions/ --fix --ignore E501   # 自动修复 import / f-string 等
 ```
 
-- `extensions/cli/*.py` 允许 `E402`（先设置 `sys.path` 再 import）
+- `extensions/ext_cli/*.py` 允许 `E402`（先设置 `sys.path` 再 import）
 - CI 在 push/PR 时对 `extensions/` 跑 Ruff（`agent/` 为上游范围，本地可选 `ruff check agent/ --ignore E501`）
 
 ---

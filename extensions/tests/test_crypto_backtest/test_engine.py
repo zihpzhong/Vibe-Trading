@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 from extensions.trading.crypto.backtest.engine import CryptoLiveBacktestEngine, _NullSignalEngine
-from extensions.cli.run_crypto_backtest import _synthetic_ohlcv, filter_universe_by_coverage
+from extensions.ext_cli.run_crypto_backtest import _synthetic_ohlcv, filter_universe_by_coverage
 
 
 def test_backtest_runs_on_synthetic_btc_eth():
