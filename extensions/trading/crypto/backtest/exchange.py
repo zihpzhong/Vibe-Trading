@@ -193,6 +193,22 @@ class CryptoBacktestExchange(ExchangeBase):
             "status": "NEW",
         }
 
+    def create_take_profit_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        tp_price: float,
+    ) -> dict[str, Any]:
+        return {
+            "order_id": f"bt-tp-{symbol}",
+            "symbol": normalize_symbol(symbol),
+            "side": side,
+            "amount": amount,
+            "tp_price": tp_price,
+            "status": "NEW",
+        }
+
     def get_min_qty(self, symbol: str) -> float:
         del symbol
         return self._min_qty

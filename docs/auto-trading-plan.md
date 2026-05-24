@@ -17,8 +17,10 @@
 - `swarm_phase2.py` — **Swarm Phase 2** 并行维度分析 + 代码共识（P0 shadow 模式，enhanced tier 后台线程对比分析）
 - `exchange_brackets.py` — 交易所原生 SL/TP 条件单挂载/撤销（开仓后自动挂，软件 TPSL 介入时先撤）
 - `reconcile.py` — 交易所 ↔ Tracker 持仓对账（ghost 仓位清理 + orphan 仓位收养）
-- `config.py` — 完整配置体系（DeRisk + DCA + ATR + Gate + BTC + Funding + 模式预设 + exchange bracket orders 开关）
-- `run_live_trading.py` — 主入口（默认 **Top50 白名单** `with_top50_whitelist()` + 日亏损熔断 + 余额同步+暴跌保护 + 50% crash guard + 可用余额开仓上限 + Swarm shadow + Enhanced strict 模式）
+- `config.py` + `config.json` — 完整配置体系（DeRisk + DCA + ATR + Gate + BTC + Funding + 模式预设 + exchange bracket orders 开关 + exchange_name 多交易所选择；JSON 集中管理 ~50 参数）
+- `_bitget_exchange.py` — Bitget 交易所封装（ccxt 驱动，完整格式转换 + 异常重试 + symbol 转换）
+- `exchange_brackets.py` — 交易所原生 SL/TP 条件单挂载/撤销（开仓后自动挂，软件 TPSL 介入时先撤）
+- `run_live_trading.py` — 主入口（默认 **Top50 白名单** + 日亏损熔断 + 余额同步+暴跌保护 + 50% crash guard + 可用余额开仓上限 + Swarm shadow + Enhanced strict 模式）
 - `whitelist.py` + `whitelist.json` — Top50 币种三档白名单（Agent/Scanner/Gate 三层强制）
 - 扩展测试覆盖 Gate、ATR、Scheduler、Phase2、PositionTracker、TPSLMonitor、RealExchange、入口安全、Swarm Phase 2
 
@@ -32,6 +34,8 @@
 | K线数据         | ccxt `fetch_ohlcv()`                   | `/api/v3/klines` 直连，futures 不可用时自动 fallback 到 spot                                                                   |
 | 签名方式         | ccxt 内置                                | **HMAC-SHA256** 自实现，无第三方依赖                                                                                           |
 | 部署方式         | 未指定                                    | **本地/服务器**: `python extensions/ext_cli/run_live_trading.py`；**Docker**: `docker compose up -d live-trading`（`compose` 挂载数据卷） |
+| 交易所选择       | 仅 Binance                               | **`--exchange binance|bitget`** CLI 参数 / `CRYPTO_EXCHANGE` 环境变量，`create_exchange()` 工厂三路分发（Mock/Real/Bitget） |
+| 配置管理         | 代码硬编码                                | **`config.json`** 集中管理 ~50 参数，CLI 参数 > 环境变量 > config.json > 代码默认值，`load_from_json()` 工厂函数 |
 | Phase 1 标的池  | Top-N 成交量扫描                            | **默认 Top50 白名单**（`with_top50_whitelist()`，`scan_top_n=0`）；`--pairs` 或 `scan_top_n=20` 可切回 Top-N                      |
 | Phase 2 分析   | 8 个独立 Skill 文件                         | **Phase2Analyzer** (SkillsLoader + ChatLLM, **10** dim→skill 映射, JSON verdict 输出)                                    |
 | Alpha 因子     | 无                                      | 12 个公式化因子 → `alpha_signal` 贡献 ±1 分给 LONG/SHORT 评分                                                                    |
@@ -474,9 +478,66 @@ flowchart TD
 | 实盘启动           | `python extensions/ext_cli/run_live_trading.py --live --confirm-live I_UNDERSTAND ...`                    | live    | ✅ 显式确认    |
 
 
-## 配置体系 (config.py)
+## 配置体系 (config.py + config.json)
 
-### FundingRateConfig — 资金费率过滤
+参数加载优先级（从高到低）：
+```
+CLI 参数 (--position-size, --rr, --exchange, --pairs ...)
+    ↓
+环境变量 (CRYPTO_EXCHANGE, TRADING_PAIRS...)
+    ↓
+config.json (extensions/config/config.json)  ← 集中配置 ~50 参数
+    ↓
+LiveTradingConfig dataclass 代码默认值
+```
+
+`LiveTradingConfig.load_from_json("extensions/config/config.json")` 从 JSON 加载并合并到 dataclass 默认值，缺失字段保留代码默认值（向前兼容）。
+
+JSON 包含 10 个分组：
+| 分组 | 用途 | 参数数量 |
+|------|------|---------|
+| `exchange` | 交易所选择/扫描配置 | 5 |
+| `trading` | 仓位/R:R/熔断/间隔 | 11 |
+| `execution_gate` | 开仓校验阈值 | 5 |
+| `atr_stop` | ATR 动态止损 | 5 |
+| `funding_rate` | 资金费率过滤 | 2 |
+| `btc_conduction` | BTC 传导联动 | 5 |
+| `de_risk` | 分级减仓 | 8 |
+| `dca` | 阶梯加仓 | 7 |
+| `tpsl_monitor` | TPSL 守护线程 | 8 |
+| `market_scanner` | 市场扫描过滤 | 3 |
+
+### LiveTradingConfig 顶层字段
+
+```python
+@dataclass
+class LiveTradingConfig:
+    funding_rate: FundingRateConfig
+    atr_stop: ATRStopConfig
+    btc_conduction: BTCConductionConfig
+    execution_gate: ExecutionGateConfig
+    de_risk: DeRiskConfig
+    dca: DCAConfig
+    scan_top_n: int = 20               # Phase 1 Top-N 扫描数量（白名单模式下设为 0）
+    scan_batch_size: int = 5           # 并发批次大小
+    default_scan_interval_minutes: int = 5  # 配置类默认间隔
+    pair_whitelist: List[str] = []     # 白名单；非空且 scan_top_n=0 → 白名单模式
+    use_exchange_bracket_orders: bool = True  # 开仓后挂交易所 SL/TP 条件单
+    exchange_name: str = "binance"     # 交易所: "binance" 或 "bitget"
+
+    _NESTED_SECTIONS: ClassVar[dict[str, str]] = {
+        "execution_gate": "ExecutionGateConfig",
+        "atr_stop": "ATRStopConfig",
+        "funding_rate": "FundingRateConfig",
+        "btc_conduction": "BTCConductionConfig",
+        "de_risk": "DeRiskConfig",
+        "dca": "DCAConfig",
+    }
+
+    @classmethod
+    def load_from_json(cls, path, **overrides) -> LiveTradingConfig:
+        # 从 JSON 加载 + 合并 dataclass 默认值 + **overrides 覆盖
+```
 
 ```python
 @dataclass
@@ -1076,13 +1137,15 @@ class DailyRiskTracker:
 | `extensions/trading/whitelist.py`               | ✅   | Top50 白名单加载 (`whitelist.json` / `TOP_50` 回退)                                |
 | `extensions/trading/engine/phase2.py`           | ✅   | Phase 2 LLM 分析 (10 维, SkillsLoader + ChatLLM, alpha context 注入)                |
 | `extensions/trading/engine/swarm_phase2.py`     | ✅   | Swarm Phase 2 并行维度分析 + 代码共识 (P0 shadow 模式)                                  |
-| `extensions/trading/engine/exchange_brackets.py`| ✅   | 交易所原生 SL/TP 条件单 (STOP_MARKET + TAKE_PROFIT_MARKET)                            |
+| `extensions/trading/crypto/live/_bitget_exchange.py` | ✅ | Bitget 交易所 (ccxt 封装, 格式转换, 异常重试, symbol 转换) |
+| `extensions/trading/crypto/live/exchange_brackets.py` | ✅ | 交易所原生 SL/TP 条件单 (STOP_MARKET + TAKE_PROFIT_MARKET) |
 | `extensions/trading/engine/reconcile.py`        | ✅   | 交易所 ↔ Tracker 持仓对账 (ghost/orphan 清理收养)                                       |
 | `extensions/trading/engine/migration.py`        | ✅   | positions.json → trading.db 单次迁移                                                     |
 | `extensions/trading/engine/btc_conduction.py`   | ✅   | BTC 4h 联动 + 1h 趋势检查                                                         |
 | `extensions/trading/__init__.py`                | ✅   | 包导出                                                                         |
 | `extensions/trading/models.py`                  | ✅   | 核心数据模型 (Gate/Signal/Phase2Request/ScheduleReport)                           |
-| `extensions/trading/config.py`                  | ✅   | 完整配置 (DeRisk+DCA+ATR+Gate+BTC+Funding+模式预设+validate+exchange bracket)       |
+| `extensions/trading/crypto/config.py` + `extensions/config/config.json` | ✅ | 完整配置体系 + JSON 集中管理 ~50 参数 (含 exchange_name/load_from_json) |
+| `extensions/config/config.json` | ✅ | 集中配置 ~50 参数 (10 分组: exchange/trading/gate/atr/funding/btc/de_risk/dca/tpsl/scanner) |
 | `extensions/tools/live_trading_tool.py`              | ✅   | 8 actions (Agent 工具集成)                                                      |
 | `extensions/ext_cli/run_live_trading.py`                     | ✅   | 入口脚本 (日亏损熔断+余额同步+暴跌保护+可用余额上限+信号处理+Swarm shadow+Enhanced strict)                 |
 | `extensions/trading/crypto_backtest/phase2_replay.py` | ✅ | Phase 2 / Swarm 回测 replay (含 swarm_verdict/allows_entry_swarm)                   |

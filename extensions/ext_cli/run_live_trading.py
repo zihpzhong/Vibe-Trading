@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal as _signal
@@ -91,17 +92,50 @@ log = logging.getLogger("live_trading")
 
 console = Console()
 
-# 默认开仓比例: 单次开仓使用资金比例
-DEFAULT_POSITION_SIZE_PCT = 0.12  # 12% of account (reduced from 20% to mitigate -93% DD risk)
-# 默认R:R = 2:1 计算止盈
+# ---- 配置加载 ----
+_CONFIG_JSON_PATH = Path(__file__).resolve().parent.parent / "config" / "config.json"
+"""Path to the centralized config.json file."""
+
+_JSON_CONFIG_CACHE: dict | None = None
+"""Cached parsed config.json contents (load once)."""
+
+
+def _load_json_config() -> dict:
+    """Load config.json into a dict.
+
+    Returns:
+        dict with top-level sections (exchange, trading, execution_gate, etc.)
+        Falls back to empty dict if file is missing/invalid.  Results are
+        cached after the first read.
+    """
+    global _JSON_CONFIG_CACHE
+    if _JSON_CONFIG_CACHE is not None:
+        return _JSON_CONFIG_CACHE
+    try:
+        import json as _json
+        with open(_CONFIG_JSON_PATH, encoding="utf-8") as _f:
+            _JSON_CONFIG_CACHE = _json.load(_f)
+    except (FileNotFoundError, PermissionError, json.JSONDecodeError):
+        _JSON_CONFIG_CACHE = {}
+    return _JSON_CONFIG_CACHE
+
+
+# 默认参数常量（保留作为 config.json 缺失时的 fallback）
+DEFAULT_POSITION_SIZE_PCT = 0.12  # 12%
 DEFAULT_REWARD_RISK_RATIO = 2.0
 DEFAULT_MAX_POSITIONS = 3
 DEFAULT_MAX_SAME_DIRECTION = 2
 DEFAULT_MIN_ENTRY_SCORE = 5
 SCORE_TIER_HALF_SIZE = 5  # score==5 → 50% position size
-DEFAULT_MAX_DAILY_LOSS_PCT = 0.05  # 5% realized daily loss circuit breaker
-DEFAULT_MAX_ROLLING_DRAWDOWN_PCT = 0.05  # 5% peak-to-trough over 24h
+DEFAULT_MAX_DAILY_LOSS_PCT = 0.05  # 5%
+DEFAULT_MAX_ROLLING_DRAWDOWN_PCT = 0.05  # 5%
 LIVE_CONFIRM_PHRASE = "I_UNDERSTAND"
+
+
+def _get_cfg(section: str, key: str, default: object = None) -> object:
+    """Read a value from config.json, returning default if missing."""
+    cfg = _load_json_config()
+    return cfg.get(section, {}).get(key, default)
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,6 +179,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pairs", nargs="*", default=None,
         help="交易对白名单 e.g. --pairs BTC ETH SOL (空=Top-N 模式, 也支持 TRADING_PAIRS 环境变量)",
+    )
+    parser.add_argument(
+        "--exchange", choices=["binance", "bitget"], default=None,
+        help="交易所 (默认: CRYPTO_EXCHANGE 环境变量, 再 fallback binance)",
     )
     args = parser.parse_args()
     if args.live and args.dry_run:
@@ -234,9 +272,20 @@ def main() -> int:
     from extensions.trading.crypto.models import GateStatus, LiveSignal, ScheduleReport, SignalDirection
 
     # ---- 配置 ----
-    # 基础: top-50 白名单（避免低流动性币种如 BZUSDT/CLUSDT 进入交易）
-    config = LiveTradingConfig.with_top50_whitelist()
+    # 1) 从 config.json 加载（缺失则使用代码默认值）
+    config = LiveTradingConfig.load_from_json(_CONFIG_JSON_PATH)
+    # 2) 覆盖为 top-50 白名单（保留 JSON 中已加载的风控参数）
+    whitelist_cfg = LiveTradingConfig.with_top50_whitelist()
+    config.pair_whitelist = whitelist_cfg.pair_whitelist
+    config.scan_top_n = whitelist_cfg.scan_top_n
+    # 3) CLI 参数覆盖
     config.default_scan_interval_minutes = args.interval
+    config.exchange_name = args.exchange or os.environ.get("CRYPTO_EXCHANGE", config.exchange_name)
+
+    # 4) 从 config.json 解析交易循环参数
+    _min_entry_score = int(_get_cfg("trading", "min_entry_score", DEFAULT_MIN_ENTRY_SCORE))  # type: ignore[arg-type]
+    _score_half = int(_get_cfg("trading", "score_tier_half_size", SCORE_TIER_HALF_SIZE))  # type: ignore[arg-type]
+    _trading_interval = args.interval
 
     # 模式覆盖（仅修改风控阈值，保留 pair_whitelist）
     if args.mode == "conservative":
@@ -274,13 +323,26 @@ def main() -> int:
 
     mode_label = {"default": "默认", "conservative": "保守", "aggressive": "激进"}
     # ---- 交易所 ----
-    exchange = create_exchange(mock=args.mock)
+    exchange_name = args.exchange or os.environ.get("CRYPTO_EXCHANGE", "binance")
+    exchange = create_exchange(mock=args.mock, exchange_name=exchange_name)
     log.info(
-        "Exchange: %s (mock=%s, auth=%s)",
+        "Exchange: %s (mock=%s, exchange=%s, auth=%s)",
         type(exchange).__name__,
         args.mock,
+        exchange_name,
         getattr(exchange, "has_auth", False),
     )
+
+    # ---- 白名单交易所交叉校验（仅非 Binance 时） ----
+    if exchange_name != "binance" and hasattr(exchange, "validate_symbols") and config.pair_whitelist:
+        valid = exchange.validate_symbols(config.pair_whitelist)
+        removed = set(config.pair_whitelist) - set(valid)
+        if removed:
+            log.warning(
+                "交易所切换检测: %d 个交易对在 %s 上不可用: %s",
+                len(removed), exchange_name, sorted(removed)[:10],
+            )
+            config.pair_whitelist = valid
 
     # ---- 检查实际账户余额（仅 futures） ----
     actual_usdt_balance = None
@@ -314,11 +376,14 @@ def main() -> int:
     # ---- 持仓管理 ----
     # 使用实际余额（优先）或 CLI 默认值
     effective_balance = actual_usdt_balance if actual_usdt_balance is not None else args.balance
+    _max_pos = int(_get_cfg("trading", "max_positions", DEFAULT_MAX_POSITIONS))  # type: ignore[arg-type]
+    _max_dir = int(_get_cfg("trading", "max_same_direction", DEFAULT_MAX_SAME_DIRECTION))  # type: ignore[arg-type]
+    _max_exp = float(_get_cfg("trading", "max_exposure_pct", 3.0))  # type: ignore[arg-type]
     positions = PositionTracker(
         account_balance=effective_balance,
-        max_positions=DEFAULT_MAX_POSITIONS,
-        max_same_direction=DEFAULT_MAX_SAME_DIRECTION,
-        max_exposure_pct=3.0,  # 总敞口上限 300%（3 仓 × ~100%/仓 名义）
+        max_positions=_max_pos,
+        max_same_direction=_max_dir,
+        max_exposure_pct=_max_exp,
     )
     # 确保 _load() 不覆盖构造函数传入的交易所真实余额
     if actual_usdt_balance is not None:
@@ -348,8 +413,14 @@ def main() -> int:
     scheduler = TradingScheduler(exchange, positions, trading_enabled=True)
 
     # ---- TP/SL 守护 ----
+    _tpsl_poll = float(_get_cfg("tpsl_monitor", "poll_interval_seconds", 5.0))  # type: ignore[arg-type]
+    _tpsl_trail_act = float(_get_cfg("tpsl_monitor", "trailing_activation_pct", 3.0))  # type: ignore[arg-type]
+    _tpsl_trail_dist = float(_get_cfg("tpsl_monitor", "trail_distance_pct", 1.5))  # type: ignore[arg-type]
     monitor = TPSLMonitor(
-        exchange, positions, poll_interval=5.0,
+        exchange, positions,
+        poll_interval=_tpsl_poll,
+        trailing_activation_pct=_tpsl_trail_act,
+        trail_distance_pct=_tpsl_trail_dist,
         de_risk_config=config.de_risk,
         dca_config=config.dca,
         dca_gate_engine=gate_engine,
@@ -541,9 +612,9 @@ def main() -> int:
             return self._realized_pnl
 
     daily_risk = DailyRiskTracker(
-        max_daily_loss_pct=DEFAULT_MAX_DAILY_LOSS_PCT,
-        max_rolling_drawdown_pct=DEFAULT_MAX_ROLLING_DRAWDOWN_PCT,
-        cooldown_hours=4.0,
+        max_daily_loss_pct=float(_get_cfg("trading", "max_daily_loss_pct", DEFAULT_MAX_DAILY_LOSS_PCT)),  # type: ignore[arg-type]
+        max_rolling_drawdown_pct=float(_get_cfg("trading", "max_rolling_drawdown_pct", DEFAULT_MAX_ROLLING_DRAWDOWN_PCT)),  # type: ignore[arg-type]
+        cooldown_hours=float(_get_cfg("trading", "cooldown_hours", 4.0)),  # type: ignore[arg-type]
     )
 
     max_initial_notional = estimate_max_order_notional(
@@ -777,10 +848,10 @@ def main() -> int:
                     entry_price = req.entry_price
 
                     # 2a. 评分门槛
-                    if score < DEFAULT_MIN_ENTRY_SCORE:
-                        log.info("%s SKIP score=%d < min %d", symbol, score, DEFAULT_MIN_ENTRY_SCORE)
+                    if score < _min_entry_score:
+                        log.info("%s SKIP score=%d < min %d", symbol, score, _min_entry_score)
                         console.print(
-                            f"  {symbol} [yellow]SKIP[/yellow] 评分 {score} < 最低 {DEFAULT_MIN_ENTRY_SCORE}"
+                            f"  {symbol} [yellow]SKIP[/yellow] 评分 {score} < 最低 {_min_entry_score}"
                         )
                         continue
 
@@ -971,7 +1042,7 @@ def main() -> int:
                         "standard": 1.0,
                         "premium": 1.0,
                     }.get(price_tier, 1.0)
-                    if score == SCORE_TIER_HALF_SIZE:
+                    if score == _score_half:
                         tier_factor *= 0.5
                         log.info("%s: score=%d → 仓位系数 50%%", symbol, score)
                     if tier_factor < 1.0:

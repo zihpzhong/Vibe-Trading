@@ -6,6 +6,7 @@ Supports real (OKX/CCXT) and mock modes for testing.
 
 from __future__ import annotations
 
+import os
 import random
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
@@ -75,14 +76,13 @@ class ExchangeBase(ABC):
         """
         ...
 
-    @abstractmethod
     def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
         """Create a stop-loss order (STOP_MARKET).
 
         Returns:
             dict with keys: order_id, symbol, side, type, amount, stop_price, filled, status
         """
-        ...
+        raise NotImplementedError(f"{type(self).__name__} does not support stop-loss orders")
 
     def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
         """Create a take-profit order (TAKE_PROFIT_MARKET on futures).
@@ -232,23 +232,42 @@ class MockExchange(ExchangeBase):
         return {"order_id": order_id, "status": "FILLED", "filled": 0}
 
 
-def create_exchange(mock: bool = True, seed_price: Optional[float] = None) -> ExchangeBase:
+def create_exchange(
+    mock: bool = True,
+    seed_price: Optional[float] = None,
+    exchange_name: Optional[str] = None,
+) -> ExchangeBase:
     """Factory: create an exchange instance.
 
     Args:
-        mock: If True, return MockExchange. Otherwise return RealExchange.
+        mock: If True, return MockExchange. Otherwise return a real exchange.
         seed_price: Optional base price for mock data.
+        exchange_name: Exchange name ("binance" or "bitget"). Ignored when
+            mock=True. Falls back to CRYPTO_EXCHANGE env var, then "binance".
 
     Returns:
         ExchangeBase instance.
     """
     if mock:
         return MockExchange(seed_price=seed_price)
-    try:
-        # Lazy import to avoid hard dependency
-        from ._real_exchange import RealExchange  # type: ignore[import-untyped,unused-ignore]
-        return RealExchange()
-    except ImportError:
-        raise ImportError(
-            "RealExchange requires ccxt. Install with: pip install ccxt, or use mock=True"
-        )
+
+    exchange_name = (exchange_name or os.environ.get("CRYPTO_EXCHANGE", "binance")).lower()
+
+    if exchange_name == "bitget":
+        try:
+            from ._bitget_exchange import BitgetExchange  # type: ignore[import-untyped,unused-ignore]
+            return BitgetExchange()
+        except ImportError as exc:
+            raise ImportError(
+                "BitgetExchange requires ccxt. Install with: pip install ccxt, or use mock=True"
+            ) from exc
+    elif exchange_name == "binance":
+        try:
+            from ._real_exchange import RealExchange  # type: ignore[import-untyped,unused-ignore]
+            return RealExchange()
+        except ImportError as exc:
+            raise ImportError(
+                "RealExchange requires ccxt. Install with: pip install ccxt, or use mock=True"
+            ) from exc
+    else:
+        raise ValueError(f"Unknown exchange: {exchange_name}")

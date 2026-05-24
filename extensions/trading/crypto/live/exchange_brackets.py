@@ -25,12 +25,34 @@ _ACTIVE_ALGO_STATUSES = frozenset({"NEW", "TRIGGERED"})
 
 def has_bracket_support(exchange: ExchangeBase) -> bool:
     """True when exchange can place stop-loss and take-profit conditional orders."""
-    return (
-        hasattr(exchange, "create_stop_loss_order")
-        and hasattr(exchange, "create_take_profit_order")
-        and callable(getattr(exchange, "create_stop_loss_order"))
-        and callable(getattr(exchange, "create_take_profit_order"))
+    for method_name in ("create_stop_loss_order", "create_take_profit_order"):
+        method = getattr(exchange, method_name, None)
+        if method is None:
+            logger.info(
+                "Exchange %s missing %s — software TPSL fallback",
+                type(exchange).__name__, method_name,
+            )
+            return False
+        # Concrete methods on ExchangeBase raise NotImplementedError
+        try:
+            method("TEST", "sell", 0.001, 1.0)
+        except NotImplementedError:
+            logger.info(
+                "Exchange %s %s raises NotImplementedError — software TPSL fallback",
+                type(exchange).__name__, method_name,
+            )
+            return False
+        except Exception:
+            logger.warning(
+                "Exchange %s %s probe failed (bracket support assumed):",
+                type(exchange).__name__, method_name,
+                exc_info=True,
+            )
+    logger.info(
+        "Exchange %s supports bracket orders",
+        type(exchange).__name__,
     )
+    return True
 
 
 def close_side(direction: str) -> str:

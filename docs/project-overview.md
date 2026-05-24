@@ -1,6 +1,6 @@
 # Vibe-Trading 项目总览
 
-> 更新时间：2026-05-08
+> 更新时间：2026-05-25
 
 ---
 
@@ -124,6 +124,11 @@ Vibe-Trading/
 │   ├── vite.config.ts
 │   └── tailwind.config.ts
 │
+├── extensions/                  # 扩展子系统（加密/A 股实盘与回测）
+│   └── config/
+│       ├── config.json          # ~50 参数集中管理
+│       └── config.py            # LiveTradingConfig dataclass 体系
+
 ├── docs/                       # 项目文档
 ├── scripts/dev                 # 开发启动脚本
 ├── docker-compose.yml          # Docker 部署

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import MagicMock, patch
 
 from extensions.trading.crypto.live.exchange import ExchangeBase, MockExchange, create_exchange
 
@@ -210,6 +211,24 @@ class TestCreateExchangeFactory:
     def test_create_exchange_mock(self) -> None:
         ex = create_exchange(mock=True)
         assert isinstance(ex, MockExchange)
+
+    def test_create_exchange_binance(self) -> None:
+        """create_exchange(exchange_name='binance') returns RealExchange."""
+        from extensions.trading.crypto.live._real_exchange import RealExchange
+        ex = create_exchange(mock=False, exchange_name="binance")
+        assert isinstance(ex, RealExchange)
+
+    @patch("ccxt.bitget")
+    def test_create_exchange_bitget(self, mock_bitget: MagicMock) -> None:
+        """create_exchange(exchange_name='bitget') returns BitgetExchange."""
+        from extensions.trading.crypto.live._bitget_exchange import BitgetExchange
+        ex = create_exchange(mock=False, exchange_name="bitget")
+        assert isinstance(ex, BitgetExchange)
+
+    def test_create_exchange_invalid(self) -> None:
+        """create_exchange with unknown exchange_name raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown exchange"):
+            create_exchange(mock=False, exchange_name="unknown")
 
     def test_create_exchange_full_import_chain(self) -> None:
         """Full import chain: exchange.py → _real_exchange.py."""
