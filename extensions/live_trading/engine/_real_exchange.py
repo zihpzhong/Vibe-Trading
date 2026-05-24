@@ -481,7 +481,7 @@ class RealExchange(ExchangeBase):
     def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
         """Place a stop-loss (market on trigger) order via Binance Algo Order API.
 
-        Futures: uses /fapi/v1/algo/order/new with STOP_MARKET + reduceOnly.
+        Futures: uses /fapi/v1/algoOrder with STOP_MARKET + reduceOnly.
         Spot: uses /api/v3/order with STOP_LOSS (regular endpoint).
         """
         qty = self._round_qty(symbol, amount)
@@ -490,12 +490,13 @@ class RealExchange(ExchangeBase):
                 # Binance Algo Order API — reduceOnly handles direction
                 bs = self._binance_side(side)
                 params: dict[str, str] = {
+                    "algoType": "CONDITIONAL",
                     "symbol": symbol, "side": bs, "type": "STOP_MARKET",
-                    "quantity": str(qty), "stopPrice": str(stop_price), "reduceOnly": "true",
+                    "quantity": str(qty), "triggerPrice": str(stop_price), "reduceOnly": "true",
                 }
                 raw = _retry(
                     f"stop_loss({symbol},{side},{qty},{stop_price})",
-                    self._algo_trade_request, "/fapi/v1/algo/order/new", params,
+                    self._algo_trade_request, "/fapi/v1/algoOrder", params,
                 )
                 order_id = str(raw.get("algoId") or raw.get("clientAlgoId") or "")
             else:
@@ -520,7 +521,7 @@ class RealExchange(ExchangeBase):
     def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
         """Place a take-profit (market on trigger) order via Binance Algo Order API.
 
-        Futures: uses /fapi/v1/algo/order/new with TAKE_PROFIT_MARKET + reduceOnly.
+        Futures: uses /fapi/v1/algoOrder with TAKE_PROFIT_MARKET + reduceOnly.
         Spot: uses /api/v3/order with TAKE_PROFIT (regular endpoint).
         """
         qty = self._round_qty(symbol, amount)
@@ -528,12 +529,13 @@ class RealExchange(ExchangeBase):
             if self._market_type == "future":
                 bs = self._binance_side(side)
                 params: dict[str, str] = {
+                    "algoType": "CONDITIONAL",
                     "symbol": symbol, "side": bs, "type": "TAKE_PROFIT_MARKET",
-                    "quantity": str(qty), "stopPrice": str(tp_price), "reduceOnly": "true",
+                    "quantity": str(qty), "triggerPrice": str(tp_price), "reduceOnly": "true",
                 }
                 raw = _retry(
                     f"take_profit({symbol},{side},{qty},{tp_price})",
-                    self._algo_trade_request, "/fapi/v1/algo/order/new", params,
+                    self._algo_trade_request, "/fapi/v1/algoOrder", params,
                 )
                 order_id = str(raw.get("algoId") or raw.get("clientAlgoId") or "")
             else:
