@@ -445,15 +445,23 @@ class RealExchange(ExchangeBase):
                 "status": raw.get("status"),
             }
 
-    def _algo_trade_request(self, endpoint: str, params: dict) -> dict:
-        """Send a signed POST request to the Binance Algo Order API (futures).
+    _ALGO_ORDER_ENDPOINT = "/fapi/v1/algoOrder"
 
-        Binance deprecated STOP_MARKET/TAKE_PROFIT_MARKET on the regular
-        /fapi/v1/order endpoint; these now require /fapi/v1/algo/order/new.
+    def _algo_signed_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict,
+        *,
+        op: str,
+    ) -> dict:
+        """Send a signed request to the Binance Algo Order API (futures).
+
+        Binance deprecated STOP_MARKET/TAKE_PROFIT_MARKET on /fapi/v1/order;
+        conditional orders must use /fapi/v1/algoOrder (POST/DELETE).
         """
-        self._require_auth("algo_trade")
-        base = "https://fapi.binance.com"
-        url = f"{base}{endpoint}"
+        self._require_auth(op)
+        url = f"https://fapi.binance.com{endpoint}"
         data = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
         data.update(params)
         query_string = urlencode(sorted(data.items()))
@@ -463,20 +471,25 @@ class RealExchange(ExchangeBase):
             hashlib.sha256,
         ).hexdigest()
         query_string += f"&signature={signature}"
-        resp = requests.post(
-            url,
-            data=query_string,
-            headers={"X-MBX-APIKEY": self._ccxt.apiKey},
-            timeout=10,
-        )
+        headers = {"X-MBX-APIKEY": self._ccxt.apiKey}
+        if method == "DELETE":
+            resp = requests.delete(f"{url}?{query_string}", headers=headers, timeout=10)
+        else:
+            resp = requests.post(url, data=query_string, headers=headers, timeout=10)
         if resp.status_code == 401:
-            raise RuntimeError(f"Algo trade auth failed: {resp.text}")
+            raise RuntimeError(f"Algo {op} auth failed: {resp.text}")
         if not resp.ok:
-            raise RuntimeError(f"Algo trade failed ({resp.status_code}): {resp.text}")
+            raise RuntimeError(f"Algo {op} failed ({resp.status_code}): {resp.text}")
         raw = resp.json()
-        if isinstance(raw, dict) and "code" in raw and raw["code"] < 0:
-            raise RuntimeError(f"Binance error {raw['code']}: {raw.get('msg', '')}")
+        if isinstance(raw, dict) and "code" in raw and str(raw["code"]) not in ("200", "0"):
+            code = raw["code"]
+            if isinstance(code, int) and code < 0:
+                raise RuntimeError(f"Binance error {code}: {raw.get('msg', '')}")
         return raw
+
+    def _algo_trade_request(self, endpoint: str, params: dict) -> dict:
+        """POST to Binance Algo Order API."""
+        return self._algo_signed_request("POST", endpoint, params, op="trade")
 
     def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
         """Place a stop-loss (market on trigger) order via Binance Algo Order API.
@@ -496,7 +509,7 @@ class RealExchange(ExchangeBase):
                 }
                 raw = _retry(
                     f"stop_loss({symbol},{side},{qty},{stop_price})",
-                    self._algo_trade_request, "/fapi/v1/algoOrder", params,
+                    self._algo_trade_request, self._ALGO_ORDER_ENDPOINT, params,
                 )
                 order_id = str(raw.get("algoId") or raw.get("clientAlgoId") or "")
             else:
@@ -511,11 +524,11 @@ class RealExchange(ExchangeBase):
                 "order_id": order_id,
                 "symbol": raw.get("symbol"),
                 "side": raw.get("side"),
-                "type": raw.get("type"),
+                "type": raw.get("orderType") or raw.get("type"),
                 "amount": amount,
                 "stop_price": stop_price,
                 "filled": float(raw.get("executedQty", 0)),
-                "status": raw.get("status"),
+                "status": raw.get("algoStatus") or raw.get("status"),
             }
 
     def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
@@ -535,7 +548,7 @@ class RealExchange(ExchangeBase):
                 }
                 raw = _retry(
                     f"take_profit({symbol},{side},{qty},{tp_price})",
-                    self._algo_trade_request, "/fapi/v1/algoOrder", params,
+                    self._algo_trade_request, self._ALGO_ORDER_ENDPOINT, params,
                 )
                 order_id = str(raw.get("algoId") or raw.get("clientAlgoId") or "")
             else:
@@ -550,17 +563,31 @@ class RealExchange(ExchangeBase):
                 "order_id": order_id,
                 "symbol": raw.get("symbol"),
                 "side": raw.get("side"),
-                "type": raw.get("type"),
+                "type": raw.get("orderType") or raw.get("type"),
                 "amount": amount,
                 "tp_price": tp_price,
                 "filled": float(raw.get("executedQty", 0)),
-                "status": raw.get("status"),
+                "status": raw.get("algoStatus") or raw.get("status"),
             }
 
     def cancel_order(self, order_id: str, symbol: str) -> dict:
-        """Cancel an open order via direct HTTP DELETE."""
+        """Cancel an open order (regular or algo conditional)."""
         with self._lock:
             self._require_auth("cancel_order")
+            if self._market_type == "future":
+                try:
+                    raw = self._algo_signed_request(
+                        "DELETE",
+                        self._ALGO_ORDER_ENDPOINT,
+                        {"algoId": order_id},
+                        op="cancel",
+                    )
+                    return {
+                        "order_id": str(raw.get("algoId", order_id)),
+                        "status": raw.get("msg", "CANCELED"),
+                    }
+                except RuntimeError:
+                    pass  # fall through to regular order cancel
             query_string = urlencode(sorted({
                 "symbol": symbol,
                 "orderId": order_id,

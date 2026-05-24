@@ -240,3 +240,81 @@ class TestStopMarketOrderType:
         # Futures: "STOP_MARKET" is the equivalent
         assert '"STOP_LOSS"' in source, "create_stop_loss_order must use STOP_LOSS (market trigger)"
         assert '"STOP_LOSS_LIMIT"' not in source, "Must not use limit trigger for stop-loss"
+        assert "algoType" in source
+        assert "triggerPrice" in source
+        assert "/fapi/v1/algoOrder" in source
+
+
+class TestAlgoOrderApi:
+    """Futures bracket orders use Binance Algo Order API."""
+
+    @pytest.fixture(autouse=True)
+    def _auth_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("BINANCE_API_KEY", "test_key")
+        monkeypatch.setenv("BINANCE_SECRET", "test_secret")
+        monkeypatch.setenv("BINANCE_MARKET_TYPE", "future")
+
+    def test_create_stop_loss_uses_algo_endpoint(self, monkeypatch) -> None:
+        from extensions.live_trading.engine._real_exchange import RealExchange
+
+        captured: dict = {}
+
+        def fake_algo(endpoint: str, params: dict) -> dict:
+            captured["endpoint"] = endpoint
+            captured["params"] = params
+            return {"algoId": 12345, "algoStatus": "NEW", "orderType": "STOP_MARKET", "symbol": "BTCUSDT", "side": "SELL"}
+
+        ex = RealExchange()
+        monkeypatch.setattr(ex, "_round_qty", lambda _sym, amt: amt)
+        monkeypatch.setattr(ex, "_algo_trade_request", fake_algo)
+
+        result = ex.create_stop_loss_order("BTCUSDT", "sell", 0.01, 59000.0)
+
+        assert captured["endpoint"] == "/fapi/v1/algoOrder"
+        assert captured["params"]["algoType"] == "CONDITIONAL"
+        assert captured["params"]["type"] == "STOP_MARKET"
+        assert captured["params"]["triggerPrice"] == "59000.0"
+        assert captured["params"]["reduceOnly"] == "true"
+        assert result["order_id"] == "12345"
+        assert result["status"] == "NEW"
+
+    def test_create_take_profit_uses_algo_endpoint(self, monkeypatch) -> None:
+        from extensions.live_trading.engine._real_exchange import RealExchange
+
+        captured: dict = {}
+
+        def fake_algo(endpoint: str, params: dict) -> dict:
+            captured["endpoint"] = endpoint
+            captured["params"] = params
+            return {"algoId": 67890, "algoStatus": "NEW", "orderType": "TAKE_PROFIT_MARKET", "symbol": "ETHUSDT", "side": "BUY"}
+
+        ex = RealExchange()
+        monkeypatch.setattr(ex, "_round_qty", lambda _sym, amt: amt)
+        monkeypatch.setattr(ex, "_algo_trade_request", fake_algo)
+
+        result = ex.create_take_profit_order("ETHUSDT", "buy", 0.05, 1800.0)
+
+        assert captured["endpoint"] == "/fapi/v1/algoOrder"
+        assert captured["params"]["algoType"] == "CONDITIONAL"
+        assert captured["params"]["type"] == "TAKE_PROFIT_MARKET"
+        assert captured["params"]["triggerPrice"] == "1800.0"
+        assert result["order_id"] == "67890"
+
+    def test_cancel_order_uses_algo_delete_for_futures(self, monkeypatch) -> None:
+        from extensions.live_trading.engine._real_exchange import RealExchange
+
+        captured: dict = {}
+
+        def fake_algo(method: str, endpoint: str, params: dict, *, op: str) -> dict:
+            captured.update({"method": method, "endpoint": endpoint, "params": params, "op": op})
+            return {"algoId": 12345, "msg": "success"}
+
+        ex = RealExchange()
+        monkeypatch.setattr(ex, "_algo_signed_request", fake_algo)
+
+        result = ex.cancel_order("12345", "BTCUSDT")
+
+        assert captured["method"] == "DELETE"
+        assert captured["endpoint"] == "/fapi/v1/algoOrder"
+        assert captured["params"]["algoId"] == "12345"
+        assert result["order_id"] == "12345"
