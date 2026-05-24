@@ -13,14 +13,14 @@ from typing import Any, Optional
 
 from src.agent.tools import BaseTool
 
-from extensions.live_trading.config import LiveTradingConfig
-from extensions.live_trading.models import LiveSignal, SignalDirection
-from extensions.live_trading.engine.execution_gate import ExecGateEngine
-from extensions.live_trading.engine.atr_stop import calculate_atr_stop
-from extensions.live_trading.engine.exchange import create_exchange
-from extensions.live_trading.engine.scheduler import TradingScheduler
-from extensions.live_trading.engine.position_tracker import PositionTracker
-from extensions.live_trading.engine.tpsl_monitor import TPSLMonitor
+from extensions.trading.crypto.config import LiveTradingConfig
+from extensions.trading.crypto.models import LiveSignal, SignalDirection
+from extensions.trading.crypto.live.execution_gate import ExecGateEngine
+from extensions.trading.crypto.live.atr_stop import calculate_atr_stop
+from extensions.trading.crypto.live.exchange import create_exchange
+from extensions.trading.crypto.live.scheduler import TradingScheduler
+from extensions.trading.crypto.live.position_tracker import PositionTracker
+from extensions.trading.crypto.live.tpsl_monitor import TPSLMonitor
 
 
 class LiveTradingTool(BaseTool):

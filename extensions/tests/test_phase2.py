@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from extensions.live_trading.engine.phase2 import Phase2Analyzer, format_alpha_context_block
-from extensions.live_trading.models import Phase2Request
+from extensions.trading.crypto.live.phase2 import Phase2Analyzer, format_alpha_context_block
+from extensions.trading.crypto.models import Phase2Request
 
 
 class TestPhase2Prompt:

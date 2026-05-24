@@ -9,8 +9,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from extensions.live_trading.engine.market_scanner import MarketScanner, ScanResult, _rsi, _ema, _bb_pct
-from extensions.live_trading.engine.exchange import MockExchange
+from extensions.trading.crypto.live.market_scanner import MarketScanner, ScanResult, _rsi, _ema, _bb_pct
+from extensions.trading.crypto.live.exchange import MockExchange
 
 
 # ---------------------------------------------------------------------------

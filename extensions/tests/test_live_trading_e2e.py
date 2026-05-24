@@ -15,27 +15,28 @@ import random
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from extensions.live_trading.config import DeRiskConfig, LiveTradingConfig
-from extensions.live_trading.models import (
+from extensions.trading.crypto.config import DeRiskConfig, LiveTradingConfig
+from extensions.trading.crypto.models import (
     ExecutionGateResult,
     GateStatus,
     LiveSignal,
     ScheduleReport,
     SignalDirection,
 )
-from extensions.live_trading.engine.atr_stop import calculate_atr_stop
-from extensions.live_trading.engine.btc_conduction import ConductionStatus, check_btc_conduction
-from extensions.live_trading.engine.exchange import MockExchange
-from extensions.live_trading.engine.execution_gate import ExecGateEngine
-from extensions.live_trading.engine.market_scanner import MarketScanner, ScanResult
-from extensions.live_trading.engine.position_tracker import PositionTracker
-from extensions.live_trading.engine.scheduler import ENHANCED_DIMS, FAST_TRACK_DIMS, TradingScheduler
-from extensions.live_trading.engine.tpsl_monitor import TPSLMonitor
+from extensions.trading.crypto.live.atr_stop import calculate_atr_stop
+from extensions.trading.crypto.live.btc_conduction import ConductionStatus, check_btc_conduction
+from extensions.trading.crypto.live.exchange import MockExchange
+from extensions.trading.crypto.live.execution_gate import ExecGateEngine
+from extensions.trading.crypto.live.market_scanner import MarketScanner, ScanResult
+from extensions.trading.crypto.live.position_tracker import PositionTracker
+from extensions.trading.crypto.live.scheduler import ENHANCED_DIMS, FAST_TRACK_DIMS, TradingScheduler
+from extensions.trading.crypto.live.tpsl_monitor import TPSLMonitor
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +146,7 @@ class TestSchedulerPhase2:
     ) -> None:
         """scheduler.run_once() produces a ScheduleReport."""
         sched = TradingScheduler(exchange, tracker, trading_enabled=True)
-        with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
+        with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
             report = sched.run_once()
         assert isinstance(report, ScheduleReport)
         assert hasattr(report, "rankings")
@@ -186,7 +187,7 @@ class TestSchedulerPhase2:
     ) -> None:
         """trading_enabled=False -> empty phase2_requests even with high scores."""
         sched = TradingScheduler(exchange, tracker, trading_enabled=False)
-        with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
+        with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
             report = sched.run_once()
         assert len(report.phase2_requests) == 0
 
@@ -594,7 +595,7 @@ class TestDCA:
         dca_enabled: bool = True,
     ) -> TPSLMonitor:
         """Helper: create TPSLMonitor with DCA enabled."""
-        from extensions.live_trading.config import DCAConfig
+        from extensions.trading.crypto.config import DCAConfig
         return TPSLMonitor(
             exchange, tracker, poll_interval=0.05,
             dca_config=DCAConfig(enabled=dca_enabled),
@@ -743,7 +744,7 @@ class TestFullPipeline:
             ex = MockExchange(seed_price=100.0)
             pos = PositionTracker(account_balance=10_000.0, max_positions=3, persist_dir=tmp)
             sched = TradingScheduler(ex, pos, trading_enabled=True)
-            with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
+            with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
                 report = sched.run_once()
             assert isinstance(report, ScheduleReport)
             assert report.btc_status == "CONDUCTION_OK"
@@ -759,7 +760,7 @@ class TestFullPipeline:
             ex = MockExchange(seed_price=100.0)
             pos = PositionTracker(account_balance=10_000.0, max_positions=3, persist_dir=tmp)
             sched = TradingScheduler(ex, pos, trading_enabled=True)
-            with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="LOCK_LONG"):
+            with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="LOCK_LONG"):
                 report = sched.run_once()
             assert len(report.rankings) == 0
             assert len(report.phase2_requests) == 0
@@ -775,7 +776,7 @@ class TestFullPipeline:
             ex = MockExchange(seed_price=100.0)
             pos = PositionTracker(account_balance=10_000.0, max_positions=3, persist_dir=tmp)
             sched = TradingScheduler(ex, pos, trading_enabled=True)
-            with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
+            with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
                 report1 = sched.run_once()
                 report2 = sched.run_once()
                 report3 = sched.run_once()

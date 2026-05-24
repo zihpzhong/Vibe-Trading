@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from extensions.live_trading.engine.exchange import MockExchange
-from extensions.live_trading.engine.exchange_brackets import (
+from extensions.trading.crypto.live.exchange import MockExchange
+from extensions.trading.crypto.live.exchange_brackets import (
     cancel_bracket_orders,
     close_side,
     has_bracket_support,
@@ -13,7 +13,7 @@ from extensions.live_trading.engine.exchange_brackets import (
     place_bracket_orders,
     sanitize_bracket_order_ids,
 )
-from extensions.live_trading.engine.position_tracker import Position
+from extensions.trading.crypto.live.position_tracker import Position
 
 
 def test_close_side() -> None:

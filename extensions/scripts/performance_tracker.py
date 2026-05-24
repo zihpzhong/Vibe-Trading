@@ -10,9 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import re
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -138,12 +136,6 @@ def compute_metrics(since: Optional[str] = None) -> dict[str, Any]:
     log_text = get_current_log()
     trades_data = parse_trades_from_log(log_text)
 
-    # Score tier analysis from log
-    tier_pattern = re.compile(
-        r"(?:fast_track|score=(\d+)).*?"
-        r"(?P<result>开仓|通过|跳过|REJECT|WATCH)"
-    )
-
     now = datetime.now(timezone.utc)
 
     return {
@@ -175,7 +167,7 @@ def generate_report(baseline: Optional[dict] = None) -> str:
 
     # Current metrics
     trades = current.get("trades", {})
-    lines.append(f"\n当前周期:")
+    lines.append("\n当前周期:")
     lines.append(f"  总交易: {trades.get('count', 0)}")
     lines.append(f"  胜率: {trades.get('win_rate_pct', 0):.1f}%")
     lines.append(f"  总 PnL: {trades.get('total_pnl_usdt', 0):.4f} USDT")
@@ -184,7 +176,7 @@ def generate_report(baseline: Optional[dict] = None) -> str:
     # Daily PnL breakdown
     daily = trades.get("daily_pnl", {})
     if daily:
-        lines.append(f"\n每日 PnL:")
+        lines.append("\n每日 PnL:")
         for day, pnl in sorted(daily.items()):
             icon = "+" if pnl >= 0 else ""
             lines.append(f"  {day}: {icon}{pnl:.4f} USDT")
@@ -192,7 +184,6 @@ def generate_report(baseline: Optional[dict] = None) -> str:
     # Compare with baseline
     if baseline:
         base_metrics = baseline.get("metrics", {})
-        base_trades = baseline.get("trades", {})
 
         lines.append(f"\n与基线对比 (基线时间: {baseline.get('timestamp', 'N/A')}):")
 
@@ -224,12 +215,12 @@ def generate_report(baseline: Optional[dict] = None) -> str:
         lines.append(f"  DE_RISK: {base_de_risk} → {cur_de_risk} ({delta_de_risk:+,d}) {arrow}")
 
     # Optimization changes status
-    lines.append(f"\n当前运行的优化:")
-    lines.append(f"  ✓ TP最低阈值 >120min: 0.5% → 2.0%")
-    lines.append(f"  ✓ BILLUSDT 黑名单")
-    lines.append(f"  ✓ 评分动量限制 (RSI<30 且 24h<-15% 评分≤5)")
-    lines.append(f"  ✓ Phase 2 跳过低数据维度")
-    lines.append(f"\n建议下次评估: 运行 24h 后比较每日 PnL 趋势")
+    lines.append("\n当前运行的优化:")
+    lines.append("  ✓ TP最低阈值 >120min: 0.5% → 2.0%")
+    lines.append("  ✓ BILLUSDT 黑名单")
+    lines.append("  ✓ 评分动量限制 (RSI<30 且 24h<-15% 评分≤5)")
+    lines.append("  ✓ Phase 2 跳过低数据维度")
+    lines.append("\n建议下次评估: 运行 24h 后比较每日 PnL 趋势")
 
     return "\n".join(lines)
 

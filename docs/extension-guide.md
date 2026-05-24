@@ -27,16 +27,29 @@ dev     ← 个人工作分支（所有扩展和优化在此分支）
 ```
 Vibe-Trading/
 ├── extensions/                          ← 自定义代码根目录（上游不存在）
-│   ├── tools/                           # 自定义 Agent 工具
-│   │   ├── __init__.py
-│   │   ├── example_tool.py              # 示例工具（可删除）
-│   │   └── 你的工具.py
-│   ├── backtest/                        # 扩展回测入口（勿改 agent/backtest/runner.py）
+│   ├── trading/                         # 交易业务包
+│   │   ├── crypto/                      # 加密货币
+│   │   │   ├── config.py, models.py, schema.py, whitelist.*
+│   │   │   ├── live/                    # 实盘引擎（scheduler / gate / TPSL …）
+│   │   │   └── backtest/                # 加密回测引擎
+│   │   └── astock/                      # A 股
+│   │       ├── config.py, models.py
+│   │       ├── live/                    # 实盘引擎
+│   │       └── backtest/                # A 股回测引擎
+│   ├── cli/                             # CLI 入口脚本
+│   │   ├── run_live_trading.py
+│   │   ├── run_crypto_backtest.py
+│   │   ├── run_astock_backtest.py
+│   │   └── optimize_*.py
+│   ├── backtest/                        # 扩展回测 runner（勿改 agent/backtest/runner.py）
 │   │   ├── ext_runner.py                # engine=astock | crypto_live
-│   │   └── ccxt_helpers.py              # CCXT 代理/合约类型（扩展侧）
+│   │   └── ccxt_helpers.py
+│   ├── tools/                           # 自定义 Agent 工具
+│   │   └── *.py                         # ext_bridge 自动发现
+│   ├── tests/                           # 扩展测试
 │   └── config/
-│       ├── .env.local.example           # 配置模板
-│       └── .env.local                   # 本地配置（已 gitignore）
+│       ├── .env.local.example
+│       └── .env.local                   # 已 gitignore
 │
 ├── agent/src/tools/
 │   └── ext_bridge.py                    ← 唯一加入上游目录的桥接文件
@@ -57,15 +70,27 @@ Vibe-Trading/
 | 本地配置覆盖 | `extensions/config/.env.local` | 无 | gitignore 保护，不提交 |
 | 前端扩展 | `extensions/frontend/`（按需创建） | 极低 | 需同步修改 vite 配置 |
 | A 股/加密扩展回测 | `extensions/backtest/ext_runner.py` | 无 | 替代修改 `agent/backtest/runner.py` |
-| 回测脚本 | `extensions/run_astock_backtest.py` 等 | 无 | 直接调用扩展引擎，不依赖上游 runner |
+| 回测脚本 | `extensions/cli/run_astock_backtest.py` 等 | 无 | 直接调用扩展引擎，不依赖上游 runner |
 
 ### 扩展回测（A 股 / crypto_live）
 
 **不要**在 `agent/backtest/runner.py` 增加 `astock` / `crypto_live` 分支（rebase 会与上游冲突）。
 
-- 进程内回测：`python extensions/run_astock_backtest.py` 或 `run_crypto_backtest.py`（默认）
-- 需要 run_dir 产物：`python extensions/run_crypto_backtest.py --runner` → 调用 `extensions/backtest/ext_runner.py`
+- 进程内回测：`python extensions/cli/run_astock_backtest.py` 或 `run_crypto_backtest.py`（默认）
+- 需要 run_dir 产物：`python extensions/cli/run_crypto_backtest.py --runner` → 调用 `extensions/backtest/ext_runner.py`
 - CCXT 代理、合约 `defaultType`：仅通过 `extensions/backtest/ccxt_helpers.py` 或脚本内 `CCXT_PROXY` 环境变量
+
+### 代码风格（PEP 8 / Ruff）
+
+扩展代码与 `agent/` 共用 `pyproject.toml` 中的 Ruff 配置（规则 `E`/`F`/`W`，行宽 120，忽略 `E501`）。
+
+```bash
+ruff check agent/ extensions/ --ignore E501
+ruff check extensions/ --fix --ignore E501   # 自动修复 import / f-string 等
+```
+
+- `extensions/cli/*.py` 允许 `E402`（先设置 `sys.path` 再 import）
+- CI 在 push/PR 时对 `extensions/` 跑 Ruff（`agent/` 为上游范围，本地可选 `ruff check agent/ --ignore E501`）
 
 ---
 

@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from extensions.live_trading.astock.backtest.engine import AStockBacktestEngine, _NullSignalEngine
-from extensions.live_trading.astock.backtest.exchange import BacktestExchange
+from extensions.trading.astock.backtest.engine import AStockBacktestEngine, _NullSignalEngine
+from extensions.trading.astock.backtest.exchange import BacktestExchange
 
 
 # ─── Synthetic data helpers ───

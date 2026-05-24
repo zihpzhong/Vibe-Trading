@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from extensions.live_trading.astock.broker import MockBroker, create_broker
-from extensions.live_trading.astock.config import AStockFeeConfig, AStockTradingConfig
+from extensions.trading.astock.live.broker import MockBroker, create_broker
+from extensions.trading.astock.config import AStockFeeConfig, AStockTradingConfig
 
 
 class TestMockBroker:

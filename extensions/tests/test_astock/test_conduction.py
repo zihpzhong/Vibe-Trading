@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import pandas as pd
-import pytest
 
-from extensions.live_trading.astock.conduction import check_market_conduction
-from extensions.live_trading.astock.models import MarketConductionStatus
+from extensions.trading.astock.live.conduction import check_market_conduction
+from extensions.trading.astock.models import MarketConductionStatus
 
 
 def _uptrend_kline(length: int = 80) -> pd.DataFrame:

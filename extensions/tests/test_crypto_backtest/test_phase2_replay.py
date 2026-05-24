@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from extensions.live_trading.crypto_backtest.phase2_replay import Phase2ReplayStore
+from extensions.trading.crypto.backtest.phase2_replay import Phase2ReplayStore
 
 
 def test_phase2_replay_pass_and_fail():

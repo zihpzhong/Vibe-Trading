@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from extensions.live_trading.engine.position_tracker import Position, PositionTracker
+from extensions.trading.crypto.live.position_tracker import Position, PositionTracker
 
 
 @pytest.fixture
@@ -439,8 +439,6 @@ class TestEntryScore:
         tracker.open_position("X", "LONG", 100.0, 1.0, 90.0, entry_score=8)
         tracker.close_position("X", exit_price=110.0, reason="TP")
         # Re-create tracker to trigger deserialization
-        import tempfile
-        import shutil
         persist_dir = tracker._db_path.parent
         t2 = PositionTracker(account_balance=10000.0, persist_dir=str(persist_dir))
         closed = t2.get_recent_closed(10)
@@ -538,7 +536,7 @@ class TestSQLite:
         json_path.write_text(json.dumps(mock_data))
 
         # Run migration
-        from extensions.live_trading.engine.migration import migrate_from_json
+        from extensions.trading.crypto.live.migration import migrate_from_json
         result = migrate_from_json(str(tmp))
         assert result is True
 
@@ -566,7 +564,7 @@ class TestSQLite:
         mock_data = {"positions": [], "closed": []}
         (tmp / "positions.json").write_text(json.dumps(mock_data))
 
-        from extensions.live_trading.engine.migration import migrate_from_json
+        from extensions.trading.crypto.live.migration import migrate_from_json
         assert migrate_from_json(str(tmp)) is True  # first run
         assert migrate_from_json(str(tmp)) is False  # second run skipped
 
@@ -574,8 +572,6 @@ class TestSQLite:
 
     def test_trailing_state_roundtrip(self, tracker: PositionTracker) -> None:
         """Trailing stop state survives restart."""
-        import sqlite3
-        import shutil
 
         tracker.set_trailing_state({"BTCUSDT": 76000.0}, {"BTCUSDT": 78000.0})
 

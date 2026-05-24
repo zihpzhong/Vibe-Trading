@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from extensions.live_trading.engine.exchange import ExchangeBase, MockExchange, create_exchange
+from extensions.trading.crypto.live.exchange import ExchangeBase, MockExchange, create_exchange
 
 
 class TestRealExchangeImport:
@@ -12,18 +12,18 @@ class TestRealExchangeImport:
 
     def test_real_exchange_imports(self) -> None:
         """RealExchange can be imported."""
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         assert RealExchange is not None
 
     def test_real_exchange_is_exchange_base(self) -> None:
         """RealExchange subclasses ExchangeBase."""
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert isinstance(ex, ExchangeBase)
 
     def test_real_exchange_has_all_methods(self) -> None:
         """All 13 required methods exist."""
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         market_methods = ["get_kline", "get_ticker", "get_tickers", "get_funding_rate", "get_orderbook"]
         trading_methods = [
@@ -38,7 +38,7 @@ class TestRealExchangeImport:
         """has_auth is False when no API keys set."""
         monkeypatch.delenv("BINANCE_API_KEY", raising=False)
         monkeypatch.delenv("BINANCE_SECRET", raising=False)
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert ex.has_auth is False
 
@@ -46,7 +46,7 @@ class TestRealExchangeImport:
         """has_auth is True when API keys are set."""
         monkeypatch.setenv("BINANCE_API_KEY", "test_key")
         monkeypatch.setenv("BINANCE_SECRET", "test_secret")
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert ex.has_auth is True
 
@@ -60,51 +60,51 @@ class TestRealExchangeAuthGuard:
         monkeypatch.delenv("BINANCE_SECRET", raising=False)
 
     def test_create_market_order_requires_auth(self) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         with pytest.raises(RuntimeError):
             ex.create_market_order("BTCUSDT", "buy", 0.01)
 
     def test_create_limit_order_requires_auth(self) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         with pytest.raises(RuntimeError):
             ex.create_limit_order("BTCUSDT", "buy", 0.01, 60000)
 
     def test_create_stop_loss_requires_auth(self) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         with pytest.raises(RuntimeError):
             ex.create_stop_loss_order("BTCUSDT", "sell", 0.01, 59000)
 
     def test_create_take_profit_requires_auth(self) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         with pytest.raises(RuntimeError):
             ex.create_take_profit_order("BTCUSDT", "sell", 0.01, 65000)
 
     def test_cancel_order_requires_auth(self) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         with pytest.raises(RuntimeError, match="BINANCE_API_KEY"):
             ex.cancel_order("123", "BTCUSDT")
 
     def test_fetch_order_requires_auth(self) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         with pytest.raises(RuntimeError, match="BINANCE_API_KEY"):
             ex.fetch_order("123", "BTCUSDT")
 
     def test_get_account_balance_graceful_no_auth(self) -> None:
         """get_account_balance returns {} gracefully when no API keys set."""
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert ex.has_auth is False
         assert ex.get_account_balance() == {}
 
     def test_get_positions_graceful_no_auth(self) -> None:
         """get_positions returns [] gracefully when no API keys set."""
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert ex.has_auth is False
         assert ex.get_positions() == []
@@ -114,7 +114,7 @@ class TestTickerFieldMapping:
     """ccxt ticker fields are mapped to internal format."""
 
     def test_ccxt_ticker_to_internal(self) -> None:
-        from extensions.live_trading.engine._real_exchange import _ccxt_ticker_to_internal
+        from extensions.trading.crypto.live._real_exchange import _ccxt_ticker_to_internal
         raw = {
             "symbol": "BTCUSDT",
             "last": 65000.0,
@@ -135,7 +135,7 @@ class TestTickerFieldMapping:
 
     def test_ccxt_ticker_missing_fields(self) -> None:
         """Missing fields default to 0.0."""
-        from extensions.live_trading.engine._real_exchange import _ccxt_ticker_to_internal
+        from extensions.trading.crypto.live._real_exchange import _ccxt_ticker_to_internal
         result = _ccxt_ticker_to_internal({"symbol": "XXXUSDT"})
         assert result["symbol"] == "XXXUSDT"
         assert result["last"] == 0.0
@@ -146,7 +146,7 @@ class TestRetryLogic:
     """_retry function retries with exponential backoff."""
 
     def test_retry_succeeds_first_attempt(self) -> None:
-        from extensions.live_trading.engine._real_exchange import _retry
+        from extensions.trading.crypto.live._real_exchange import _retry
         call_count = [0]
 
         def flaky():
@@ -158,7 +158,7 @@ class TestRetryLogic:
         assert call_count[0] == 1
 
     def test_retry_raises_after_exhaustion(self) -> None:
-        from extensions.live_trading.engine._real_exchange import _retry
+        from extensions.trading.crypto.live._real_exchange import _retry
         call_count = [0]
 
         def always_fail():
@@ -175,13 +175,13 @@ class TestTestnetConfig:
 
     def test_testnet_false_by_default(self, monkeypatch) -> None:
         monkeypatch.delenv("BINANCE_TESTNET", raising=False)
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert ex.is_testnet is False
 
     def test_testnet_true_with_env(self, monkeypatch) -> None:
         monkeypatch.setenv("BINANCE_TESTNET", "true")
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert ex.is_testnet is True
 
@@ -191,14 +191,14 @@ class TestMarketTypeConfig:
 
     def test_market_type_defaults_to_future(self, monkeypatch) -> None:
         monkeypatch.delenv("BINANCE_MARKET_TYPE", raising=False)
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert ex._market_type == "future"
         assert "/fapi/v1" in ex._data_prefix
 
     def test_market_type_can_be_set_to_spot(self, monkeypatch) -> None:
         monkeypatch.setenv("BINANCE_MARKET_TYPE", "spot")
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         ex = RealExchange()
         assert ex._market_type == "spot"
         assert ex._data_prefix.endswith("/api/v3")
@@ -213,8 +213,8 @@ class TestCreateExchangeFactory:
 
     def test_create_exchange_full_import_chain(self) -> None:
         """Full import chain: exchange.py → _real_exchange.py."""
-        from extensions.live_trading.engine._real_exchange import RealExchange  # noqa: F401
-        from extensions.live_trading.engine.exchange import ExchangeBase, MockExchange  # noqa: F401
+        from extensions.trading.crypto.live._real_exchange import RealExchange  # noqa: F401
+        from extensions.trading.crypto.live.exchange import ExchangeBase, MockExchange  # noqa: F401
 
 
 class TestGetTickersParsing:
@@ -222,7 +222,7 @@ class TestGetTickersParsing:
 
     def test_get_tickers_filters_non_usdt(self) -> None:
         """Non-USDT pairs are excluded from get_tickers results."""
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         # Verify the filtering logic by checking the code accepts USDT pairs
         ex = RealExchange()
         assert ex.get_tickers is not None
@@ -233,7 +233,7 @@ class TestStopMarketOrderType:
 
     def test_stop_loss_uses_market_trigger(self) -> None:
         """Verify create_stop_loss_order uses STOP_LOSS (market on trigger)."""
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
         import inspect
         source = inspect.getsource(RealExchange.create_stop_loss_order)
         # Spot: "STOP_LOSS" is market-on-trigger (fills on execution)
@@ -255,7 +255,7 @@ class TestAlgoOrderApi:
         monkeypatch.setenv("BINANCE_MARKET_TYPE", "future")
 
     def test_create_stop_loss_uses_algo_endpoint(self, monkeypatch) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
 
         captured: dict = {}
 
@@ -281,7 +281,7 @@ class TestAlgoOrderApi:
         assert result["status"] == "NEW"
 
     def test_create_take_profit_uses_algo_endpoint(self, monkeypatch) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
 
         captured: dict = {}
 
@@ -305,7 +305,7 @@ class TestAlgoOrderApi:
         assert result["order_id"] == "67890"
 
     def test_cancel_order_uses_algo_delete_for_futures(self, monkeypatch) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
 
         captured: dict = {}
 
@@ -324,7 +324,7 @@ class TestAlgoOrderApi:
         assert result["order_id"] == "12345"
 
     def test_round_price_uses_tick_size(self, monkeypatch) -> None:
-        from extensions.live_trading.engine._real_exchange import RealExchange
+        from extensions.trading.crypto.live._real_exchange import RealExchange
 
         ex = RealExchange()
         ex._tick_sizes["LTCUSDT"] = 0.01

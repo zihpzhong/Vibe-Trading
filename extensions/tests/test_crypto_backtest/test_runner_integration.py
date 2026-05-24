@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from extensions.run_crypto_backtest import _synthetic_ohlcv, filter_universe_by_coverage
+from extensions.cli.run_crypto_backtest import _synthetic_ohlcv, filter_universe_by_coverage
 
 
 @pytest.mark.integration
@@ -45,7 +45,7 @@ def test_runner_crypto_live_engine():
         def fetch(self, _c, _s, _e, **_kw):  # noqa: ANN001
             return data_map
 
-    from extensions.live_trading.crypto_backtest.engine import CryptoLiveBacktestEngine, _NullSignalEngine
+    from extensions.trading.crypto.backtest.engine import CryptoLiveBacktestEngine, _NullSignalEngine
 
     with tempfile.TemporaryDirectory() as tmp:
         run_dir = Path(tmp)

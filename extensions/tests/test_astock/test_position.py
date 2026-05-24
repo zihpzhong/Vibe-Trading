@@ -5,9 +5,9 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from extensions.live_trading.astock.broker import MockBroker
-from extensions.live_trading.astock.models import AStockPosition
-from extensions.live_trading.astock.position import AStockPositionTracker
+from extensions.trading.astock.live.broker import MockBroker
+from extensions.trading.astock.models import AStockPosition
+from extensions.trading.astock.live.position import AStockPositionTracker
 
 
 def test_t_plus_one_sell_blocked() -> None:

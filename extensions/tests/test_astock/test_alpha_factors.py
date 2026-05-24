@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from extensions.live_trading.astock.alpha_factors import _A_SHARE_WEIGHTS, aggregate_signal, compute_all
+from extensions.trading.astock.live.alpha_factors import _A_SHARE_WEIGHTS, aggregate_signal, compute_all
 
 
 def _mock_ohlcv(length: int = 60, base: float = 100.0) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:

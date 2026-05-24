@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from extensions.live_trading.astock.config import AStockTradingConfig
-from extensions.live_trading.astock.conduction import check_market_conduction
-from extensions.live_trading.astock.data import DataChain, normalize_symbol
-from extensions.live_trading.astock.exchange import create_astock_exchange
-from extensions.live_trading.astock.gate import AStockGateEngine
-from extensions.live_trading.astock.models import AStockSignal, GateStatus
-from extensions.live_trading.astock.scheduler import AStockScheduler, trading_session
+from extensions.trading.astock.config import AStockTradingConfig
+from extensions.trading.astock.live.conduction import check_market_conduction
+from extensions.trading.astock.live.data import DataChain, normalize_symbol
+from extensions.trading.astock.live.exchange import create_astock_exchange
+from extensions.trading.astock.live.gate import AStockGateEngine
+from extensions.trading.astock.models import AStockSignal, GateStatus
+from extensions.trading.astock.live.scheduler import AStockScheduler
 
 
 def test_normalize_symbol() -> None:

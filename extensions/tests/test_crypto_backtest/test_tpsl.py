@@ -5,8 +5,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from extensions.live_trading.crypto_backtest.engine import CryptoLiveBacktestEngine, _NullSignalEngine
-from extensions.run_crypto_backtest import _synthetic_ohlcv, filter_universe_by_coverage
+from extensions.trading.crypto.backtest.engine import CryptoLiveBacktestEngine, _NullSignalEngine
+from extensions.cli.run_crypto_backtest import _synthetic_ohlcv, filter_universe_by_coverage
 
 
 def test_tpsl_flags_run():

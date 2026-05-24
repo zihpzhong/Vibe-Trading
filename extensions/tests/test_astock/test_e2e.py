@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from extensions.live_trading.astock.config import AStockTradingConfig
-from extensions.live_trading.astock.exchange import create_astock_exchange
-from extensions.live_trading.astock.gate import AStockGateEngine
-from extensions.live_trading.astock.position import AStockPositionTracker
-from extensions.live_trading.astock.scheduler import AStockScheduler
+from extensions.trading.astock.config import AStockTradingConfig
+from extensions.trading.astock.live.exchange import create_astock_exchange
+from extensions.trading.astock.live.gate import AStockGateEngine
+from extensions.trading.astock.live.position import AStockPositionTracker
+from extensions.trading.astock.live.scheduler import AStockScheduler
 
 
 def test_e2e_scan_to_orders() -> None:
@@ -33,7 +33,7 @@ def test_e2e_scan_to_orders() -> None:
         max_notional = balance * cfg.position_size_pct
         shares = max(lot, int(max_notional / entry) // lot * lot) if entry > 0 else lot
 
-        from extensions.live_trading.astock.models import AStockSignal
+        from extensions.trading.astock.models import AStockSignal
 
         signal = AStockSignal(
             symbol=req.symbol,
@@ -43,7 +43,7 @@ def test_e2e_scan_to_orders() -> None:
             stop_loss=entry * 0.93,
             take_profit=entry * 1.14,
         )
-        gate_result = gate.run_gate(signal, ex, balance, shares)
+        gate.run_gate(signal, ex, balance, shares)
         orders += 1
 
     # Should not crash — at least attempted some signals

@@ -7,10 +7,10 @@ from unittest.mock import patch
 
 import pytest
 
-from extensions.live_trading.engine.scheduler import TradingScheduler, FAST_TRACK_DIMS, ENHANCED_DIMS
-from extensions.live_trading.engine.exchange import MockExchange
-from extensions.live_trading.engine.position_tracker import PositionTracker
-from extensions.live_trading.models import ScheduleReport
+from extensions.trading.crypto.live.scheduler import TradingScheduler, FAST_TRACK_DIMS, ENHANCED_DIMS
+from extensions.trading.crypto.live.exchange import MockExchange
+from extensions.trading.crypto.live.position_tracker import PositionTracker
+from extensions.trading.crypto.models import ScheduleReport
 
 
 @pytest.fixture
@@ -81,7 +81,7 @@ class TestTradingEnabled:
 
 class TestBTCConduction:
     def test_lock_long_returns_empty(self, exchange: MockExchange, positions: PositionTracker) -> None:
-        with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="LOCK_LONG"):
+        with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="LOCK_LONG"):
             scheduler = TradingScheduler(exchange, positions, trading_enabled=True)
             report = scheduler.run_once()
             assert report.rankings == []
@@ -89,20 +89,20 @@ class TestBTCConduction:
             assert report.btc_status == "LOCK_LONG"
 
     def test_lock_short_returns_empty(self, exchange: MockExchange, positions: PositionTracker) -> None:
-        with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="LOCK_SHORT"):
+        with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="LOCK_SHORT"):
             scheduler = TradingScheduler(exchange, positions, trading_enabled=True)
             report = scheduler.run_once()
             assert report.btc_status == "LOCK_SHORT"
             assert len(report.phase2_requests) == 0
 
     def test_conduction_ok_proceeds(self, exchange: MockExchange, positions: PositionTracker) -> None:
-        with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
+        with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
             scheduler = TradingScheduler(exchange, positions)
             report = scheduler.run_once()
             assert report.btc_status == "CONDUCTION_OK"
 
     def test_conduction_error_fallback(self, exchange: MockExchange, positions: PositionTracker) -> None:
-        with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", side_effect=RuntimeError("fail")):
+        with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", side_effect=RuntimeError("fail")):
             scheduler = TradingScheduler(exchange, positions)
             report = scheduler.run_once()
             assert report.btc_status == "CONDUCTION_OK"  # graceful fallback
@@ -192,7 +192,7 @@ class TestIntegration:
         ex = MockExchange(seed_price=100.0)
         pos = PositionTracker(account_balance=10000.0, persist_dir=tmp)
         scheduler = TradingScheduler(ex, pos, trading_enabled=True)
-        with patch("extensions.live_trading.engine.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
+        with patch("extensions.trading.crypto.live.scheduler.check_btc_conduction", return_value="CONDUCTION_OK"):
             report = scheduler.run_once()
         assert isinstance(report, ScheduleReport)
         assert report.btc_status == "CONDUCTION_OK"

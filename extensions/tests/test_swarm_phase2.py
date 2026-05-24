@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import time
 
-from extensions.live_trading.engine.swarm_phase2 import (
+from extensions.trading.crypto.live.swarm_phase2 import (
     SWARM_CAUTION,
     SWARM_CONFIRMED,
     SWARM_DANGER,
@@ -23,7 +23,7 @@ from extensions.live_trading.engine.swarm_phase2 import (
     run_consensus,
     swarm_to_phase2_consensus,
 )
-from extensions.live_trading.models import Phase2Request
+from extensions.trading.crypto.models import Phase2Request
 
 
 class TestRunConsensus:
