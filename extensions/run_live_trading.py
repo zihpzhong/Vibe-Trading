@@ -363,6 +363,33 @@ def main() -> int:
              config.de_risk.level3_loss_pct, config.de_risk.level3_sell_fraction * 100,
              config.de_risk.doom_loss_pct)
 
+    # ---- 回溯补挂交易所止盈止损单 ----
+    # 重启后 SQLite 恢复的持仓 sl_order_id/tp_order_id 为 None，
+    # 需为这些旧仓补挂 exchange bracket 条件单。
+    if config.use_exchange_bracket_orders and not args.mock:
+        from extensions.live_trading.engine.exchange_brackets import (
+            has_bracket_support,
+            place_bracket_orders,
+        )
+
+        if has_bracket_support(exchange):
+            for pos in positions.get_active_positions():
+                if pos.sl_order_id is not None:
+                    continue
+                if pos.stop_loss is None or pos.stop_loss <= 0:
+                    continue
+                log.info("Restro bracket for %s %s SL=%.4f TP=%s",
+                         pos.symbol, pos.direction, pos.stop_loss,
+                         f"{pos.take_profit:.4f}" if pos.take_profit else "N/A")
+                sl_id, tp_id = place_bracket_orders(exchange, pos)
+                positions.set_bracket_order_ids(pos.symbol, sl_id, tp_id)
+                if sl_id or tp_id:
+                    log.info("  → SL=%s TP=%s", sl_id or "-", tp_id or "-")
+                else:
+                    log.warning("  → bracket placement returned no order IDs")
+        else:
+            log.info("Exchange lacks bracket support — skip retroactive bracket placement")
+
     # ---- 日亏损熔断 ----
     # ---- 日亏损熔断 ----
     class DailyRiskTracker:
