@@ -266,6 +266,8 @@ class TestAlgoOrderApi:
 
         ex = RealExchange()
         monkeypatch.setattr(ex, "_round_qty", lambda _sym, amt: amt)
+        monkeypatch.setattr(ex, "_round_price", lambda _sym, p: p)
+        monkeypatch.setattr(ex, "_format_decimal", lambda v: str(v))
         monkeypatch.setattr(ex, "_algo_trade_request", fake_algo)
 
         result = ex.create_stop_loss_order("BTCUSDT", "sell", 0.01, 59000.0)
@@ -290,6 +292,8 @@ class TestAlgoOrderApi:
 
         ex = RealExchange()
         monkeypatch.setattr(ex, "_round_qty", lambda _sym, amt: amt)
+        monkeypatch.setattr(ex, "_round_price", lambda _sym, p: p)
+        monkeypatch.setattr(ex, "_format_decimal", lambda v: str(v))
         monkeypatch.setattr(ex, "_algo_trade_request", fake_algo)
 
         result = ex.create_take_profit_order("ETHUSDT", "buy", 0.05, 1800.0)
@@ -318,3 +322,11 @@ class TestAlgoOrderApi:
         assert captured["endpoint"] == "/fapi/v1/algoOrder"
         assert captured["params"]["algoId"] == "12345"
         assert result["order_id"] == "12345"
+
+    def test_round_price_uses_tick_size(self, monkeypatch) -> None:
+        from extensions.live_trading.engine._real_exchange import RealExchange
+
+        ex = RealExchange()
+        ex._tick_sizes["LTCUSDT"] = 0.01
+        assert ex._round_price("LTCUSDT", 47.651999999999994) == 47.65
+        assert ex._format_decimal(47.65) == "47.65"
