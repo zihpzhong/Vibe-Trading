@@ -42,10 +42,10 @@ def place_bracket_orders(
         (sl_order_id, tp_order_id) as strings; either may be None on partial failure.
     """
     side = close_side(pos.direction)
-    sl_id: Optional[str] = None
-    tp_id: Optional[str] = None
+    sl_id: Optional[str] = pos.sl_order_id
+    tp_id: Optional[str] = pos.tp_order_id
 
-    if pos.stop_loss and pos.stop_loss > 0:
+    if not sl_id and pos.stop_loss and pos.stop_loss > 0:
         try:
             sl = exchange.create_stop_loss_order(
                 pos.symbol, side, pos.quantity, pos.stop_loss,
@@ -58,7 +58,7 @@ def place_bracket_orders(
         except Exception as exc:
             logger.error("Exchange SL failed for %s: %s", pos.symbol, exc)
 
-    if pos.take_profit and pos.take_profit > 0:
+    if not tp_id and pos.take_profit and pos.take_profit > 0:
         try:
             tp = exchange.create_take_profit_order(
                 pos.symbol, side, pos.quantity, pos.take_profit,

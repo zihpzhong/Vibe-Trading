@@ -374,7 +374,7 @@ def main() -> int:
 
         if has_bracket_support(exchange):
             for pos in positions.get_active_positions():
-                if pos.sl_order_id is not None:
+                if pos.sl_order_id is not None and pos.tp_order_id is not None:
                     continue
                 if pos.stop_loss is None or pos.stop_loss <= 0:
                     continue
