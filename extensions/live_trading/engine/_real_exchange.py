@@ -445,24 +445,69 @@ class RealExchange(ExchangeBase):
                 "status": raw.get("status"),
             }
 
-    def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
-        """Place a stop-loss (market on trigger) order via direct HTTP.
+    def _algo_trade_request(self, endpoint: str, params: dict) -> dict:
+        """Send a signed POST request to the Binance Algo Order API (futures).
 
-        Spot: STOP_LOSS type. Futures: STOP_MARKET type.
-        Triggers a market order when stopPrice is reached.
+        Binance deprecated STOP_MARKET/TAKE_PROFIT_MARKET on the regular
+        /fapi/v1/order endpoint; these now require /fapi/v1/algo/order/new.
+        """
+        self._require_auth("algo_trade")
+        base = "https://fapi.binance.com"
+        url = f"{base}{endpoint}"
+        data = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
+        data.update(params)
+        query_string = urlencode(sorted(data.items()))
+        signature = hmac.new(
+            self._ccxt.secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        query_string += f"&signature={signature}"
+        resp = requests.post(
+            url,
+            data=query_string,
+            headers={"X-MBX-APIKEY": self._ccxt.apiKey},
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            raise RuntimeError(f"Algo trade auth failed: {resp.text}")
+        if not resp.ok:
+            raise RuntimeError(f"Algo trade failed ({resp.status_code}): {resp.text}")
+        raw = resp.json()
+        if isinstance(raw, dict) and "code" in raw and raw["code"] < 0:
+            raise RuntimeError(f"Binance error {raw['code']}: {raw.get('msg', '')}")
+        return raw
+
+    def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
+        """Place a stop-loss (market on trigger) order via Binance Algo Order API.
+
+        Futures: uses /fapi/v1/algo/order/new with STOP_MARKET + reduceOnly.
+        Spot: uses /api/v3/order with STOP_LOSS (regular endpoint).
         """
         qty = self._round_qty(symbol, amount)
-        order_type = "STOP_MARKET" if self._market_type == "future" else "STOP_LOSS"
-        params: dict[str, str] = {
-            "symbol": symbol, "side": self._binance_side(side), "type": order_type,
-            "quantity": str(qty), "stopPrice": str(stop_price),
-        }
-        if self._market_type == "future":
-            params["reduceOnly"] = "true"
         with self._lock:
-            raw = _retry(f"stop_loss({symbol},{side},{qty},{stop_price})", self._trade_request, "/api/v3/order", params)
+            if self._market_type == "future":
+                # Binance Algo Order API — reduceOnly handles direction
+                bs = self._binance_side(side)
+                params: dict[str, str] = {
+                    "symbol": symbol, "side": bs, "type": "STOP_MARKET",
+                    "quantity": str(qty), "stopPrice": str(stop_price), "reduceOnly": "true",
+                }
+                raw = _retry(
+                    f"stop_loss({symbol},{side},{qty},{stop_price})",
+                    self._algo_trade_request, "/fapi/v1/algo/order/new", params,
+                )
+                order_id = str(raw.get("algoId") or raw.get("clientAlgoId") or "")
+            else:
+                params = {
+                    "symbol": symbol, "side": self._binance_side(side),
+                    "type": "STOP_LOSS", "quantity": str(qty),
+                    "stopPrice": str(stop_price),
+                }
+                raw = _retry(f"stop_loss({symbol},{side},{qty},{stop_price})", self._trade_request, "/api/v3/order", params)
+                order_id = str(raw.get("orderId", ""))
             return {
-                "order_id": raw.get("orderId"),
+                "order_id": order_id,
                 "symbol": raw.get("symbol"),
                 "side": raw.get("side"),
                 "type": raw.get("type"),
@@ -473,23 +518,34 @@ class RealExchange(ExchangeBase):
             }
 
     def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
-        """Place a take-profit (market on trigger) order via direct HTTP.
+        """Place a take-profit (market on trigger) order via Binance Algo Order API.
 
-        Spot: TAKE_PROFIT type. Futures: TAKE_PROFIT_MARKET type.
-        Triggers a market order when stopPrice is reached.
+        Futures: uses /fapi/v1/algo/order/new with TAKE_PROFIT_MARKET + reduceOnly.
+        Spot: uses /api/v3/order with TAKE_PROFIT (regular endpoint).
         """
         qty = self._round_qty(symbol, amount)
-        order_type = "TAKE_PROFIT_MARKET" if self._market_type == "future" else "TAKE_PROFIT"
-        params: dict[str, str] = {
-            "symbol": symbol, "side": self._binance_side(side), "type": order_type,
-            "quantity": str(qty), "stopPrice": str(tp_price),
-        }
-        if self._market_type == "future":
-            params["reduceOnly"] = "true"
         with self._lock:
-            raw = _retry(f"take_profit({symbol},{side},{qty},{tp_price})", self._trade_request, "/api/v3/order", params)
+            if self._market_type == "future":
+                bs = self._binance_side(side)
+                params: dict[str, str] = {
+                    "symbol": symbol, "side": bs, "type": "TAKE_PROFIT_MARKET",
+                    "quantity": str(qty), "stopPrice": str(tp_price), "reduceOnly": "true",
+                }
+                raw = _retry(
+                    f"take_profit({symbol},{side},{qty},{tp_price})",
+                    self._algo_trade_request, "/fapi/v1/algo/order/new", params,
+                )
+                order_id = str(raw.get("algoId") or raw.get("clientAlgoId") or "")
+            else:
+                params = {
+                    "symbol": symbol, "side": self._binance_side(side),
+                    "type": "TAKE_PROFIT", "quantity": str(qty),
+                    "stopPrice": str(tp_price),
+                }
+                raw = _retry(f"take_profit({symbol},{side},{qty},{tp_price})", self._trade_request, "/api/v3/order", params)
+                order_id = str(raw.get("orderId", ""))
             return {
-                "order_id": raw.get("orderId"),
+                "order_id": order_id,
                 "symbol": raw.get("symbol"),
                 "side": raw.get("side"),
                 "type": raw.get("type"),

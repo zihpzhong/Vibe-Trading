@@ -1,4 +1,4 @@
-# 全流程自动扫描+自动交易 — 实施方案（更新版 2026-05-21）
+# 全流程自动扫描+自动交易 — 实施方案（更新版 2026-05-23）
 
 ## Context
 
@@ -13,11 +13,14 @@
 - `execution_gate.py` — 5 项 Gate 校验（流动性、资金费率、盘口冲击、R:R、仓位上限；白名单模式下额外 **whitelist** 硬拒绝）+ 硬失败直接 REJECT
 - `btc_conduction.py` — BTC 4h 趋势联动锁定 + 1h 短期趋势检查
 - `atr_stop.py` — Wilder 平滑 ATR(14) 动态止损计算
-- `phase2.py` — Phase 2 LLM 分析，SkillsLoader + ChatLLM **10 维**评分（含 dim9 宏观/ETF + dim10 行为/监管）
-- `config.py` — 完整配置体系（DeRisk + DCA + ATR + Gate + BTC + Funding + 模式预设）
-- `run_live_trading.py` — 主入口（默认 **Top50 白名单** `with_top50_whitelist()` + 日亏损熔断 + 余额同步+暴跌保护 + 50% crash guard + 可用余额开仓上限）
+- `phase2.py` — Phase 2 LLM 分析，SkillsLoader + ChatLLM **10 维**评分（含 dim9 宏观/ETF + dim10 行为/监管），Alpha 因子上下文注入
+- `swarm_phase2.py` — **Swarm Phase 2** 并行维度分析 + 代码共识（P0 shadow 模式，enhanced tier 后台线程对比分析）
+- `exchange_brackets.py` — 交易所原生 SL/TP 条件单挂载/撤销（开仓后自动挂，软件 TPSL 介入时先撤）
+- `reconcile.py` — 交易所 ↔ Tracker 持仓对账（ghost 仓位清理 + orphan 仓位收养）
+- `config.py` — 完整配置体系（DeRisk + DCA + ATR + Gate + BTC + Funding + 模式预设 + exchange bracket orders 开关）
+- `run_live_trading.py` — 主入口（默认 **Top50 白名单** `with_top50_whitelist()` + 日亏损熔断 + 余额同步+暴跌保护 + 50% crash guard + 可用余额开仓上限 + Swarm shadow + Enhanced strict 模式）
 - `whitelist.py` + `whitelist.json` — Top50 币种三档白名单（Agent/Scanner/Gate 三层强制）
-- 扩展测试覆盖 Gate、ATR、Scheduler、Phase2、PositionTracker、TPSLMonitor、RealExchange 与入口安全
+- 扩展测试覆盖 Gate、ATR、Scheduler、Phase2、PositionTracker、TPSLMonitor、RealExchange、入口安全、Swarm Phase 2
 
 ### 部署架构 vs 原方案差异
 
@@ -46,6 +49,12 @@
 | 余额同步         | 无                                      | 每轮同步实际余额，**50% 暴跌保护**、可用余额开仓上限                                                                                       |
 | 闲置告警         | 无                                      | 连续 12 次无开仓+无持仓 → IDLE ALERT 日志告警                                                                                     |
 | DeRisk 入场保护  | 无                                      | `entry_grace_minutes=5.0` 新开仓保护期内不触发 DE-RISK                                                                         |
+| Alpha 上下文注入 Phase 2 | 无                                      | `format_alpha_context_block()` → LLM prompt 注入 alpha_signal + 各因子值                                                         |
+| Swarm Phase 2     | 无                                      | **SwarmPhase2Engine** (ThreadPoolExecutor max 5, shadow 模式, JSONL 日志), enhanced tier 后台并发对比分析                             |
+| Exchange Bracket  | 无                                      | 开仓后自动挂 `STOP_MARKET` + `TAKE_PROFIT_MARKET`, 软件 TPSL 介入时先撤销                                                              |
+| 持仓对账    | 无                                      | `reconcile_positions()` — 启动时比对交易所持仓快照, ghost/orphan 清理收养                                                               |
+| Enhanced strict  | 无                                      | `--phase2-enhanced-strict` 标志: enhanced 档需 ≥2 维 PASS, 否则 SKIP                                                                |
+| Phase 2 回测 Swarm | 无                                      | `Phase2ReplayStore` 新增 `swarm_verdict()` / `allows_entry_swarm()` / `allows_entry_swarm_as_phase2()`                         |
 
 
 ## 完整交易流程图
@@ -592,6 +601,8 @@ class Position:
     first_entry_cost: float = 0.0    # 首次入场价（不变参照系）
     first_entry_quantity: float = 0.0  # 首次数量（不变参照系）
     de_risk_level: int = 0      # 已触发最高 de-risk 级别 (0-4)
+    sl_order_id: Optional[str] = None  # 交易所止损单 ID
+    tp_order_id: Optional[str] = None  # 交易所止盈单 ID
 ```
 
 `__post_init__` 确保 `first_entry_cost/quantity` 向后兼容旧数据。
@@ -677,6 +688,222 @@ DIM_SKILL_MAP: dict[str, list[str]] = {
 
 
 `--no-phase2` 或 `Phase2Analyzer` 不可用时：`watch_only=False`，仅依赖 Phase 1 + Gate。
+
+### Alpha 上下文注入 (新)
+
+`format_alpha_context_block()` (`phase2.py:64`) 将 Phase 1 的 Alpha 因子值注入 Phase 2 LLM prompt：
+
+- `alpha_signal` 聚合值 + 方向判断（bullish / bearish / neutral）
+- 各因子值按字母顺序排列
+- 注入在 "## Live Market Context" 和 "## Required Dimensions" 之间
+- 无 Alpha 数据时注入空字符串，不影响 prompt 结构
+
+调用链路：`run_live_trading.py` → `extract_alpha_context(ranking)` → `Phase2Analyzer.analyze(alpha_context=...)` → `_build_prompt(alpha_context=...)` → `{alpha_block}`
+
+## Swarm Phase 2 (P0) — 并行维度分析 + 代码共识
+
+`swarm_phase2.py` 实现了与单体 Phase 2 平行的多智能体分析通道。**P0 只做 shadow 模式**（不影响开仓，仅记录对比日志），为后续 Swarm 替代单体 Phase 2 积累数据。
+
+### 架构
+
+```mermaid
+flowchart LR
+    subgraph MONO["单体 Phase 2 (现有)"]
+        M1["Phase2Analyzer.analyze()<br>单 LLM call, 全 dim 打捆"] --> M2["consensus: PASS/NEUTRAL/FAIL"]
+        M2 --> GATE["Gate → 开仓/跳过"]
+    end
+
+    subgraph SWARM["Swarm Phase 2 (P0 Shadow)"]
+        S0["SwarmPhase2Engine.submit_shadow()"] --> POOL["ThreadPoolExecutor (max 5)"]
+        POOL --> S1["Worker: dim1 技术面"]
+        POOL --> S3["Worker: dim3 合约"]
+        POOL --> S5["Worker: dim5 波动率"]
+        POOL --> S6["Worker: dim6 稳定币"]
+        POOL --> S7["Worker: dim7 风险"]
+        S1 & S3 & S5 & S6 & S7 --> CONS["run_consensus()"]
+        CONS --> LOG["JSONL append<br>含 diverged 对比字段"]
+    end
+
+    MONO -.->|enhanced tier<br>后台线程, 不阻塞| SWARM
+    SWARM -.->|仅记录| LOG
+```
+
+### SwarmPhase2Config
+
+```python
+@dataclass
+class SwarmPhase2Config:
+    enabled: bool = False
+    shadow_only: bool = True                          # P0: 仅 shadow
+    dims: list[str] = FAST_TRACK_DIMS                 # 默认 5 维 (1/3/5/6/7)
+    worker_timeout: float = 60.0                      # 单维超时
+    worker_max_iterations: int = 1
+    result_ttl_seconds: float = 300.0
+    consensus_min_workers: int = 3                    # 至少 3 维成功才出共识
+    max_parallel_workers: int = 5                     # 并发上限
+    shadow_log_path: Path = ~/.vibe-trading/logs/swarm_shadow.jsonl
+```
+
+### SwarmDimAnalyzer.analyze_dim()
+
+每个维度 worker 独立 LLM 调用：
+
+```python
+分析维度: {DIM_LABELS[dim]}
+Signal: Symbol/Direction/Score/Entry/RSI/24h Change
+Skill Content: load_skill() 内容
+Return JSON: {"verdict": "PASS"|"NEUTRAL"|"FAIL",
+              "confidence": 0.0-1.0,
+              "reasoning": "...",
+              "suggested_action": "proceed"|"reduce_size"|"tighten_sl"|"abort"}
+```
+
+- 无 skill 数据 → 直接 NEUTRAL（不走 LLM）
+- JSON parse 失败 → ERROR verdict
+- 异常捕获 → ERROR verdict + error 截断 200 字符
+
+### 共识规则 (run_consensus)
+
+5 种 Swarm 共识标签（不同于单体 Phase 2 的 PASS/NEUTRAL/FAIL）：
+
+| 条件 | 标签 | 含义 |
+|---|---|---|
+| all dims PASS | CONFIRMED | 强一致通过 |
+| ≥3 PASS, no FAIL | CONFIRMED | 多数通过 |
+| 1 FAIL among ≥3 PASS | CONFIRMED | 单维分歧，总体可信 |
+| 1 FAIL with some PASS | CAUTION | 存在风险信号 |
+| 1 FAIL, no PASS | CAUTION | 仅单维看空/看多 |
+| ≥2 FAIL | DANGER | 多维对齐危险 |
+| all dims NEUTRAL | UNCLEAR | 数据不足 |
+| 其他混合 | UNCLEAR | 方向不明确 |
+| < min_workers 成功 | DEGRADED | 系统降级 |
+
+### Swarm → Phase2 映射
+
+`swarm_to_phase2_consensus()` 将 Swarm 标签映射到单体 Phase 2 词汇：
+
+- CONFIRMED → PASS
+- CAUTION / UNCLEAR / DEGRADED → NEUTRAL
+- DANGER → FAIL
+
+### Shadow 日志 JSONL 格式
+
+`~/.vibe-trading/logs/swarm_shadow.jsonl` 每行一条:
+
+```json
+{
+  "ts": "ISO8601",
+  "symbol": "BTCUSDT",
+  "direction": "LONG",
+  "score": 8,
+  "tier": "enhanced",
+  "mono_consensus": "PASS",
+  "mono_dims": {"dim1":"PASS", "dim3":"NEUTRAL", ...},
+  "swarm_consensus": "CONFIRMED",
+  "swarm_reason": "all 5 dims PASS",
+  "phase2_equivalent": "PASS",
+  "swarm_dims": {"dim1":"PASS", ...},
+  "swarm_detail": {"dim1": {"verdict":"PASS", "confidence":0.85, ...}},
+  "worker_success_count": 5,
+  "diverged": false
+}
+```
+
+`diverged` 字段表示 Swarm 共识的 Phase2 映射与单体 Phase2 是否不同。
+
+### 调用条件
+
+```python
+# 仅 enhanced tier 触发 (submit_shadow 内检查)
+if swarm_shadow_engine and req.tier == "enhanced":
+    swarm_shadow_engine.submit_shadow(req, ticker, ...)
+```
+
+- fast_track 不触发 Swarm shadow
+- 不阻塞主循环（daemon 线程）
+- Docker compose 已默认启用 `--swarm-phase2-shadow`
+
+### 回测 Swarm Replay (crypto_backtest/phase2_replay.py)
+
+`Phase2ReplayStore` 新增 Swarm 查询方法：
+
+| 方法 | 说明 |
+|---|---|
+| `record(ts, symbol)` | 返回完整 JSONL row |
+| `swarm_verdict(ts, symbol)` | 返回 Swarm 原始共识标签 |
+| `dim_verdicts(ts, symbol, source="mono"|"swarm")` | 返回单维 verdict 字典 |
+| `allows_entry_swarm(ts, symbol, block_caution=True)` | 用 Swarm 标签门控入场 |
+| `allows_entry_swarm_as_phase2(ts, symbol)` | 映射为 Phase2 语义后门控 |
+
+`allows_entry_swarm_as_phase2()` 逻辑：`CONFIRMED→entry`, `DANGER→block`, `CAUTION/UNCLEAR→pass through`。
+
+## Exchange Bracket Orders (exchange_brackets.py)
+
+开仓后自动在交易所挂载原生条件单（STOP_MARKET + TAKE_PROFIT_MARKET），为软件 TPSL 提供硬件级兜底保护。
+
+### 设计原则
+
+- **开仓后立即挂** — `place_bracket_orders()` 在 `create_market_order()` 成功后调用
+- **软件 TPSL 优先** — Trailing stop / DCA / DeRisk 等路径先撤销交易所条件单，再发市价单
+- **非关键路径** — 挂单失败不阻止开仓（error log 级别）
+- **TP 失败时清理 SL** — 若 TP 挂单失败，自动撤销已挂的 SL 条件单
+
+### 核心函数
+
+```python
+def place_bracket_orders(exchange, pos) -> (sl_order_id, tp_order_id):
+    """挂 STOP_MARKET + TAKE_PROFIT_MARKET，返回订单 ID"""
+def cancel_bracket_orders(exchange, pos, sl=True, tp=True):
+    """撤销交易所条件单（软件 TPSL 介入前调用）"""
+def cancel_exchange_sl_order(exchange, pos):
+    """仅撤销 SL（trailing 前调用）"""
+def has_bracket_support(exchange) -> bool:
+    """检查交易所是否支持条件单"""
+```
+
+### 配置
+
+```python
+@dataclass
+class LiveTradingConfig:
+    use_exchange_bracket_orders: bool = True  # 开仓后挂交易所 SL/TP 条件单
+```
+
+### 与 Position Tracker 集成
+
+`Position` 数据模型新增字段：
+
+```python
+@dataclass
+class Position:
+    ...
+    sl_order_id: Optional[str] = None  # 交易所止损单 ID
+    tp_order_id: Optional[str] = None  # 交易所止盈单 ID
+```
+
+- 开仓时（`open_position()`）传入 `sl_order_id` / `tp_order_id`
+- TPSL 平仓/减仓前调用 `cancel_bracket_orders()` 撤销条件单
+- 撤销失败仅 DEBUG 日志（条件单可能已被交易所成交）
+
+## Reconcile — 交易所 ↔ Tracker 持仓对账 (reconcile.py)
+
+### 用途
+
+启动时将 `PositionTracker` 的本地状态与 Binance `positionRisk` 快照对齐。
+
+### 处理场景
+
+| 场景 | 检测 | 动作 |
+|---|---|---|
+| 本地有仓位，交易所无 | `_positions - exchange_positions` | `close_position(reason="RECONCILE_GONE")` |
+| 交易所持仓，本地无 | `exchange_positions - _positions` | `open_position()` 收养，止损设为 `entry ± 8%` |
+| 双方一致 | 交集计数 | 记录 unchanged |
+
+### 关键细节
+
+- `_ADOPT_STOP_PCT = 8.0` — orphan 仓位收养时默认止损距离
+- 使用 `price_lookup` 回调获取幽灵平仓的退出价（优先 mark price）
+- 在 `tracker._lock` 保护下执行
 
 ## 止盈止损守护 (tpsl_monitor.py)
 
@@ -764,10 +991,19 @@ DIM_SKILL_MAP: dict[str, list[str]] = {
   │   ├─ can_open_new + is_in_cooldown
   │   ├─ BTC 1h 强制 Gate (WEAKNESS+LONG→SKIP, STRENGTH+SHORT→SKIP)
   │   ├─ 获取 ticker + orderbook + 同步 entry_price
+  │   ├─ 提取 Alpha 上下文: extract_alpha_context(ranking) → alpha_context
   │   ├─ Phase 2 LLM (score≥5 均调用；--no-phase2 时跳过)
+  │   │   │ 注入 alpha_context → format_alpha_context_block() → prompt
   │   │   PASS→继续 / FAIL→跳过
   │   │   NEUTRAL→fast_track 放过；enhanced 全维 NEUTRAL 放过，混合 NEUTRAL 降级
   │   │   ERROR→watch_only
+  │   │
+  │   ├─ [Swarm Shadow] enhanced + --swarm-phase2-shadow:
+  │   │   └─ submit_shadow() 后台 daemon 线程 (不阻塞)
+  │   │
+  │   ├─ [Enhanced Strict] --phase2-enhanced-strict + enhanced:
+  │   │   └─ PASS 维数 < 2 → SKIP 跳过
+  │   │
   │   ├─ ATR stop (3%-8% 距离约束) + 动态 R:R (Score≥8→4:1, ≥7→3:1, ≥6→2.5:1)
   │   ├─ 获取资金费率
   │   ├─ 计算下单量: leverage (Score≥7→max, 5-6→max//2)
@@ -776,9 +1012,11 @@ DIM_SKILL_MAP: dict[str, list[str]] = {
   │   ├─ Execution Gate (5 项；白名单模式 + whitelist 硬检查)
   │   ├─ Phase 2 override: watch_only_flag 且 Gate PASS → 强制 WATCH_ONLY
   │   ├─ 名义价值 ≥ $20, dry-run 跳过, live 开仓
-  │   ├─ set_leverage + set_margin(ISOLATED) + market_order
+  │   ├─ set_leverage + set_margin(ISOLATED) + market_order (使用 fill price)
   │   ├─ 订单 NEW/PARTIAL → 2s 等待 → 仍 NEW → cancel
-  │   └─ open_position() 记录持仓
+  │   ├─ open_position() 记录持仓 (含 sl_order_id/tp_order_id)
+  │   └─ [Bracket Orders] use_exchange_bracket_orders:
+  │       └─ place_bracket_orders() 挂交易所 SL/TP 条件单
   │
   ├─ 极端指标监控 (每 3 轮): RSI<20 或 RSI>80 告警
   └─ 绩效报告 (每 10 轮): 交易数/胜率/获利因子/夏普/回撤/分档统计
@@ -793,9 +1031,11 @@ DIM_SKILL_MAP: dict[str, list[str]] = {
 | 默认 / `--dry-run`                           | 扫描评估但不执行订单                                                                        |
 | `--live --confirm-live I_UNDERSTAND`       | 显式启用真实下单 (`LIVE_CONFIRM_PHRASE="I_UNDERSTAND"`)                                   |
 | `--no-phase2`                              | 跳过 LLM 分析，仅 Phase 1 + Gate                                                        |
-| `--mode [default|conservative|aggressive]` | 风控模式预设                                                                            |
+| `--mode [default\|conservative\|aggressive]` | 风控模式预设                                                                            |
 | `--pairs BTC ETH SOL`                      | 覆盖 Top50，指定交易对白名单（也支持 `TRADING_PAIRS` 环境变量）                                       |
 | `--interval N`                             | 主循环间隔（分钟），**默认 10**（`LiveTradingConfig.default_scan_interval_minutes` 为 5，仅配置类默认） |
+| `--swarm-phase2-shadow`                    | enhanced 档后台并行 Swarm 分析 (shadow, 不影响开仓)                                           |
+| `--phase2-enhanced-strict`                 | enhanced 档需 ≥2 维 PASS 才继续 (否则 SKIP)                                                |
 
 
 **默认标的池**：未传 `--pairs` 时使用 `with_top50_whitelist()`（约 50 个合约币种，见 `extensions/live_trading/whitelist.json`）。
@@ -834,13 +1074,18 @@ class DailyRiskTracker:
 | `extensions/live_trading/engine/atr_stop.py`         | ✅   | Wilder ATR(14) 动态止损 (3%-8% 距离约束)                                            |
 | `extensions/live_trading/engine/execution_gate.py`   | ✅   | 5 项 Gate + 白名单硬检查 (硬失败分层 + 盘口冲击模拟)                                          |
 | `extensions/live_trading/whitelist.py`               | ✅   | Top50 白名单加载 (`whitelist.json` / `TOP_50` 回退)                                |
-| `extensions/live_trading/engine/phase2.py`           | ✅   | Phase 2 LLM 分析 (10 维, SkillsLoader + ChatLLM)                               |
+| `extensions/live_trading/engine/phase2.py`           | ✅   | Phase 2 LLM 分析 (10 维, SkillsLoader + ChatLLM, alpha context 注入)                |
+| `extensions/live_trading/engine/swarm_phase2.py`     | ✅   | Swarm Phase 2 并行维度分析 + 代码共识 (P0 shadow 模式)                                  |
+| `extensions/live_trading/engine/exchange_brackets.py`| ✅   | 交易所原生 SL/TP 条件单 (STOP_MARKET + TAKE_PROFIT_MARKET)                            |
+| `extensions/live_trading/engine/reconcile.py`        | ✅   | 交易所 ↔ Tracker 持仓对账 (ghost/orphan 清理收养)                                       |
+| `extensions/live_trading/engine/migration.py`        | ✅   | positions.json → trading.db 单次迁移                                                     |
 | `extensions/live_trading/engine/btc_conduction.py`   | ✅   | BTC 4h 联动 + 1h 趋势检查                                                         |
 | `extensions/live_trading/__init__.py`                | ✅   | 包导出                                                                         |
 | `extensions/live_trading/models.py`                  | ✅   | 核心数据模型 (Gate/Signal/Phase2Request/ScheduleReport)                           |
-| `extensions/live_trading/config.py`                  | ✅   | 完整配置 (DeRisk+DCA+ATR+Gate+BTC+Funding+模式预设+validate)                        |
+| `extensions/live_trading/config.py`                  | ✅   | 完整配置 (DeRisk+DCA+ATR+Gate+BTC+Funding+模式预设+validate+exchange bracket)       |
 | `extensions/tools/live_trading_tool.py`              | ✅   | 8 actions (Agent 工具集成)                                                      |
-| `extensions/run_live_trading.py`                     | ✅   | 入口脚本 (日亏损熔断+余额同步+暴跌保护+可用余额上限+信号处理)                                          |
+| `extensions/run_live_trading.py`                     | ✅   | 入口脚本 (日亏损熔断+余额同步+暴跌保护+可用余额上限+信号处理+Swarm shadow+Enhanced strict)                 |
+| `extensions/live_trading/crypto_backtest/phase2_replay.py` | ✅ | Phase 2 / Swarm 回测 replay (含 swarm_verdict/allows_entry_swarm)                   |
 | `extensions/tests/test_live_trading_e2e.py`          | ✅   | 端到端集成测试                                                                     |
 | `extensions/tests/test_market_scanner.py`            | ✅   | 评分规则单元测试 (12+)                                                              |
 | `extensions/tests/test_execution_gate.py`            | ✅   | Gate 校验测试                                                                   |
@@ -849,7 +1094,9 @@ class DailyRiskTracker:
 | `extensions/tests/test_scheduler.py`                 | ✅   | 调度器测试                                                                       |
 | `extensions/tests/test_real_exchange.py`             | ✅   | RealExchange 直连测试                                                           |
 | `extensions/tests/test_phase2.py`                    | ✅   | Phase2 prompt 数据字段测试                                                        |
+| `extensions/tests/test_swarm_phase2.py`              | ✅   | Swarm 共识/映射/Alpha 上下文/并行分析/入口覆盖 (13 测试)                                    |
 | `extensions/tests/test_run_live_trading_safety.py`   | ✅   | 实盘入口安全测试                                                                    |
+| `extensions/tests/test_crypto_backtest/test_phase2_replay.py` | ✅ | 回测 Phase 2 / Swarm replay 测试                                              |
 
 
 ## 验证计划 — 当前状态
@@ -873,6 +1120,14 @@ class DailyRiskTracker:
 17. ✅ **闲置扫描告警**: 12 次连续无开仓告警
 18. ✅ **DeRisk 入场保护期**: 5 分钟内不触发 de-risk
 19. ✅ **Alpha Factor Zoo 集成**: 12 因子加权聚合 → scoring 贡献
+20. ✅ **Alpha 上下文注入 Phase 2**: Phase 1 Alpha 因子值注入 LLM prompt
+21. ✅ **Swarm Phase 2 shadow**: 并行维度分析 + 代码共识, JSONL 记录 diverged
+22. ✅ **Exchange Bracket Orders**: 开仓后自动挂交易所原生 SL/TP 条件单
+23. ✅ **Reconcile 持仓对账**: 启动时比对交易所快照, ghost/orphan 清理收养
+24. ✅ **Swarm 回测 Replay**: Phase2ReplayStore 支持 swarm_verdict / allows_entry_swarm
+25. ✅ **Enhanced Strict 模式**: `--phase2-enhanced-strict` 需 ≥2 维 PASS
+26. ✅ **Docker Swarm 默认启用**: docker-compose.yml 已添加 `--swarm-phase2-shadow`
+27. ✅ **使用 fill price 开仓**: market_order 返回实际成交价, 非预设 entry_price
 
 ## 待办事项
 
@@ -898,4 +1153,6 @@ class DailyRiskTracker:
 - 多币种相关性风险（同一板块多个持仓的聚合敞口）
 - 交易所故障转移（Binance 不可用时自动切换）
 - Alpha 因子参数自适应（不同市场状态下调权/去噪）
+- **Swarm Phase 2 晋升 P1** — 积累足够 diverged 数据后, 用 Swarm 替代单体 Phase 2 作为主要裁决
+- **Bracket Order 自适应** — 软件 TPSL 介入时按需撤销部分条件单（而非全撤），减少交易所通信延迟
 
