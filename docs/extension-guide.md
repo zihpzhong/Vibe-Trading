@@ -30,7 +30,11 @@ Vibe-Trading/
 │   ├── trading/                         # 交易业务包
 │   │   ├── crypto/                      # 加密货币
 │   │   │   ├── config.py, models.py, schema.py, whitelist.*
-│   │   │   ├── live/                    # 实盘引擎（scheduler / gate / TPSL …）
+│   │   │   ├── live/                    # 实盘引擎（scheduler / gate / TPSL / exchange brackets）
+│   │   │   ├── exchange.py          # ExchangeBase + create_exchange() 工厂
+│   │   │   ├── _real_exchange.py    # Binance 直连 HTTP
+│   │   │   ├── _bitget_exchange.py  # Bitget ccxt 封装
+│   │   │   └── exchange_brackets.py # 交易所原生 SL/TP 条件单
 │   │   │   └── backtest/                # 加密回测引擎
 │   │   └── astock/                      # A 股
 │   │       ├── config.py, models.py
@@ -48,6 +52,7 @@ Vibe-Trading/
 │   │   └── *.py                         # ext_bridge 自动发现
 │   ├── tests/                           # 扩展测试
 │   └── config/
+│       ├── config.json           # ~50 参数集中管理（ATR/DeRisk/DCA/Gate/BTC 等）
 │       ├── .env.local.example
 │       └── .env.local                   # 已 gitignore
 │

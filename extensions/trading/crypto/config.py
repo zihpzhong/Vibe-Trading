@@ -1,13 +1,15 @@
 """Live trading configuration.
 
 Default values aligned with crypto-entry-analysis SKILL.md guardrails.
-Override via environment variables or by creating a local config instance.
+Override via environment variables, config.json, or by creating a local config instance.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from typing import Optional, List
+from pathlib import Path
+from typing import Any, ClassVar, Optional, List
 
 
 @dataclass
@@ -94,6 +96,9 @@ class LiveTradingConfig:
         config = LiveTradingConfig()
         # override individual fields as needed
         config.execution_gate.min_liquidity_usdt = 500_000
+
+    JSON loading:
+        config = LiveTradingConfig.load_from_json("extensions/config/config.json")
     """
 
     funding_rate: FundingRateConfig = field(default_factory=FundingRateConfig)
@@ -107,6 +112,71 @@ class LiveTradingConfig:
     default_scan_interval_minutes: int = 5  # 闪电模式默认间隔
     pair_whitelist: List[str] = field(default_factory=list)  # 白名单，空=Top-N模式
     use_exchange_bracket_orders: bool = True  # 开仓后挂交易所 SL/TP 条件单
+    exchange_name: str = "binance"  # 交易所: "binance" 或 "bitget"
+
+    _NESTED_SECTIONS: ClassVar[dict[str, str]] = {
+        "execution_gate": "ExecutionGateConfig",
+        "atr_stop": "ATRStopConfig",
+        "funding_rate": "FundingRateConfig",
+        "btc_conduction": "BTCConductionConfig",
+        "de_risk": "DeRiskConfig",
+        "dca": "DCAConfig",
+    }
+    """Mapping from config.json section names to dataclass types."""
+
+    @classmethod
+    def load_from_json(cls, path: str | Path, **overrides: object) -> LiveTradingConfig:
+        """Create LiveTradingConfig from a JSON file, merged with code defaults.
+
+        Args:
+            path: Path to config.json. Missing file → code defaults only.
+            **overrides: Additional keyword overrides applied after JSON loading.
+
+        Returns:
+            LiveTradingConfig with values from JSON (if available) overlaid on
+            dataclass defaults.
+        """
+        cfg = cls()
+
+        raw: dict[str, Any] = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, PermissionError):
+            pass  # 缺失或无效 → 使用代码默认值
+
+        # --- 嵌套 dataclass 覆盖 ---
+        for section, type_name in cls._NESTED_SECTIONS.items():
+            data = raw.get(section)
+            if not isinstance(data, dict):
+                continue
+            target = getattr(cfg, section, None)
+            if target is None:
+                continue
+            for field_name, value in data.items():
+                if hasattr(target, field_name):
+                    setattr(target, field_name, value)
+
+        # --- 顶层字段覆盖 ---
+        flat_fields: dict[str, str] = {
+            "scan_top_n": "exchange",
+            "scan_batch_size": "exchange",
+            "pair_whitelist": "exchange",
+            "use_exchange_bracket_orders": "exchange",
+            "exchange_name": "exchange",
+            "default_scan_interval_minutes": "trading",
+        }
+        for field_name, section in flat_fields.items():
+            value = raw.get(section, {}).get(field_name)
+            if value is not None and hasattr(cfg, field_name):
+                setattr(cfg, field_name, value)
+
+        # --- 显式 overrides ---
+        for k, v in overrides.items():
+            if hasattr(cfg, k) and v is not None:
+                setattr(cfg, k, v)
+
+        return cfg
 
     @classmethod
     def with_top50_whitelist(cls, **overrides: object) -> LiveTradingConfig:

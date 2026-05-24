@@ -1,0 +1,200 @@
+{
+  "//_说明": "Vibe Trading 实盘交易系统集中配置。加载优先级: CLI参数 > 环境变量 > config.json > 代码默认值。API Key等敏感凭证保留在.env中。",
+
+  "exchange": {
+    "//exchange_name": "交易所选择: binance 或 bitget。也可通过 CRYPTO_EXCHANGE 环境变量或 --exchange CLI 参数设置",
+    "exchange_name": "binance",
+
+    "//use_exchange_bracket_orders": "开仓后挂交易所原生 SL/TP 条件单。false=回退到软件 TPSL 守护线程。Bitget 不支持原生 bracket",
+    "use_exchange_bracket_orders": true,
+
+    "//scan_top_n": "Phase 1 扫描币种数量。0=仅用 pair_whitelist",
+    "scan_top_n": 20,
+
+    "//scan_batch_size": "扫描请求并发批次大小",
+    "scan_batch_size": 5,
+
+    "//pair_whitelist": "交易对白名单。空数组=Top-N 模式。也可通过 TRADING_PAIRS 环境变量或 --pairs CLI 参数设置",
+    "pair_whitelist": []
+  },
+
+  "trading": {
+    "//position_size_pct": "单次开仓保证金比例(占账户余额百分比)。0.12=12%。也可通过 --position-size 设置",
+    "position_size_pct": 0.12,
+
+    "//reward_risk_ratio": "目标 R:R 止盈比。2.0=止盈距离是止损距离的2倍。也可通过 --rr 设置",
+    "reward_risk_ratio": 2.0,
+
+    "//max_positions": "最大同时持仓数量",
+    "max_positions": 3,
+
+    "//max_same_direction": "同一方向(LONG/SHORT)的最大持仓数",
+    "max_same_direction": 2,
+
+    "//min_entry_score": "Phase 1 最低开仓评分。评分<5不进 Phase 2",
+    "min_entry_score": 5,
+
+    "//score_tier_half_size": "评分等于此值时仓位减半",
+    "score_tier_half_size": 5,
+
+    "//max_daily_loss_pct": "当日已实现亏损熔断阈值(占账户余额比例)。0.05=5%",
+    "max_daily_loss_pct": 0.05,
+
+    "//max_rolling_drawdown_pct": "24h滚动峰值回撤熔断阈值。0.05=5%",
+    "max_rolling_drawdown_pct": 0.05,
+
+    "//cooldown_hours": "熔断后冷却时间(小时)",
+    "cooldown_hours": 4.0,
+
+    "//max_exposure_pct": "总敞口上限(名义价值/账户余额)。3.0=300%",
+    "max_exposure_pct": 3.0,
+
+    "//default_scan_interval_minutes": "默认扫描间隔(分钟)。也可通过 --interval 设置",
+    "default_scan_interval_minutes": 5
+  },
+
+  "execution_gate": {
+    "//min_liquidity_usdt": "最小24h交易量(USDT)。低于此值不交易",
+    "min_liquidity_usdt": 1000000,
+
+    "//max_orderbook_impact_pct": "最大盘口冲击百分比。模拟吃单后VWAP偏离度",
+    "max_orderbook_impact_pct": 0.5,
+
+    "//min_risk_reward_ratio": "最低 R:R 比。低于此值不交易",
+    "min_risk_reward_ratio": 1.0,
+
+    "//max_position_pct": "单币仓位上限(占资金比例%)。此为硬上限,与 trading.position_size_pct 区别",
+    "max_position_pct": 20.0,
+
+    "//signal_cooldown_minutes": "同币种重复信号冷却时间(分钟)",
+    "signal_cooldown_minutes": 30
+  },
+
+  "atr_stop": {
+    "//multiplier_default": "默认 ATR 乘数: 止损距离 = ATR x multiplier",
+    "multiplier_default": 2.0,
+
+    "//multiplier_conservative": "保守模式 ATR 乘数(--mode conservative 时使用)",
+    "multiplier_conservative": 1.5,
+
+    "//period": "ATR 计算周期(Wilder 平滑)",
+    "period": 14,
+
+    "//min_stop_distance_pct": "最小止损距离(%)。低波动时防止止损过近被噪音触发",
+    "min_stop_distance_pct": 5.0,
+
+    "//max_stop_distance_pct": "最大止损距离(%)。防止 R:R 扩展推远止损到不合理位置",
+    "max_stop_distance_pct": 8.0
+  },
+
+  "funding_rate": {
+    "//max_long_funding": "多头最大允许资金费率。>0.10%时禁止开多头",
+    "max_long_funding": 0.0010,
+
+    "//min_short_funding": "空头最小允许资金费率。< -0.05%时禁止开空头(负值=空头付费)",
+    "min_short_funding": -0.0005
+  },
+
+  "btc_conduction": {
+    "//ema_periods_short": "BTC 4h 短期 EMA 周期",
+    "ema_periods_short": 12,
+
+    "//ema_periods_mid": "BTC 4h 中期 EMA 周期",
+    "ema_periods_mid": 26,
+
+    "//ema_periods_long": "BTC 4h 长期 EMA 周期(需 >= 此值根数 K 线)",
+    "ema_periods_long": 50,
+
+    "//price_change_threshold_pct": "BTC 24h 涨跌超此值+EMA排列确认→锁定对应方向",
+    "price_change_threshold_pct": 3.0,
+
+    "//lookback_hours": "回顾窗口(小时)",
+    "lookback_hours": 4
+  },
+
+  "de_risk": {
+    "//level1_loss_pct": "Level 1 触发亏损阈值(参照首次入场成本)",
+    "level1_loss_pct": 5.0,
+
+    "//level1_sell_fraction": "Level 1 卖出仓位比例",
+    "level1_sell_fraction": 0.15,
+
+    "//level2_loss_pct": "Level 2 触发亏损阈值",
+    "level2_loss_pct": 8.0,
+
+    "//level2_sell_fraction": "Level 2 卖出仓位比例",
+    "level2_sell_fraction": 0.30,
+
+    "//level3_loss_pct": "Level 3 触发亏损阈值",
+    "level3_loss_pct": 12.0,
+
+    "//level3_sell_fraction": "Level 3 卖出仓位比例",
+    "level3_sell_fraction": 0.50,
+
+    "//doom_loss_pct": "Doom 全平阈值。亏损 >= 此值平掉整个仓位",
+    "doom_loss_pct": 18.0,
+
+    "//entry_grace_minutes": "新开仓保护期(分钟)，期内不触发 DE-RISK",
+    "entry_grace_minutes": 5.0
+  },
+
+  "dca": {
+    "//enabled": "DCA 功能总开关",
+    "enabled": true,
+
+    "//max_dca_count": "最大 DCA 加仓次数",
+    "max_dca_count": 3,
+
+    "//trigger_loss_pct": "触发 DCA 的亏损阈值(相对首次入场成本)",
+    "trigger_loss_pct": 5.0,
+
+    "//dca_multipliers": "阶梯仓位乘数。第1/2/3次 DCA 分别乘以此系数",
+    "dca_multipliers": [1.25, 1.5, 1.75],
+
+    "//dca_leverage_halved": "DCA 是否使用减半杠杆(降低风险)",
+    "dca_leverage_halved": true,
+
+    "//max_account_loss_pct": "该仓位累计未实现亏损超过此比例(占账户)则跳过 DCA",
+    "max_account_loss_pct": 8.0,
+
+    "//dca_min_notional_usdt": "DCA 最小名义价值(交易所最小下单约束)",
+    "dca_min_notional_usdt": 20.0
+  },
+
+  "tpsl_monitor": {
+    "//stale_position_hours": "持仓超此时长且 PnL 在 ±stale_position_pnl_pct 内→自动平仓",
+    "stale_position_hours": 24,
+
+    "//stale_position_pnl_pct": "僵尸仓位判定 PnL 浮动范围(%)",
+    "stale_position_pnl_pct": 3.0,
+
+    "//de_risk_extended_cooldown_minutes": "DE-RISK/DOOM 后同币种冷却时间(分钟)。1440=24小时",
+    "de_risk_extended_cooldown_minutes": 1440,
+
+    "//poll_interval_seconds": "TPSL 轮询间隔(秒)",
+    "poll_interval_seconds": 5.0,
+
+    "//trailing_activation_pct": "移动止损激活利润阈值(%)。PnL 超此值时激活",
+    "trailing_activation_pct": 3.0,
+
+    "//trail_distance_pct": "移动止损跟踪距离(%)。从峰值回撤此距离时触发",
+    "trail_distance_pct": 1.5,
+
+    "//retry_backoff_seconds": "订单执行失败的重试退避间隔(秒)",
+    "retry_backoff_seconds": [1, 2, 4],
+
+    "//max_retries": "最大重试次数",
+    "max_retries": 3
+  },
+
+  "market_scanner": {
+    "//min_volume_24h_usdt": "最小24h成交量(USDT)。低于此值从扫描过滤",
+    "min_volume_24h_usdt": 1000000,
+
+    "//min_score": "最低评分阈值。低于此值进 watchlist 而非 rankings",
+    "min_score": 3,
+
+    "//vol_ratio_high_score_threshold": "高分信号所需最低成交量比(当前量/均值)。趋势市可调低至1.2",
+    "vol_ratio_high_score_threshold": 1.5
+  }
+}

@@ -58,6 +58,12 @@ class TPSLMonitor(Thread):
         position_size_pct: float = 0.05,
         status_log_interval: float = 60.0,
         use_exchange_brackets: bool = True,
+        # Configurable module-level constants
+        stale_position_hours: int = 24,
+        stale_position_pnl_pct: float = 3.0,
+        de_risk_extended_cooldown_minutes: int = 1440,
+        max_retries: int = 3,
+        retry_backoff: tuple[float, ...] = (1, 2, 4),
     ) -> None:
         super().__init__(daemon=True, name="TPSLMonitor")
         self._exchange = exchange
@@ -76,6 +82,12 @@ class TPSLMonitor(Thread):
         self._use_exchange_brackets = use_exchange_brackets
         self._status_poll_counter = 0
         self._status_poll_threshold = max(1, int(status_log_interval / poll_interval))
+        # Configurable module-level constants
+        self._stale_position_hours = stale_position_hours
+        self._stale_position_pnl_pct = stale_position_pnl_pct
+        self._de_risk_extended_cooldown_minutes = de_risk_extended_cooldown_minutes
+        self._max_retries = max_retries
+        self._retry_backoff = retry_backoff
         # Track trailing stop levels per position (symbol → adjusted_stop_loss)
         self._trailing_stops: dict[str, float] = {}
         # Track peak prices for trailing stop calculation
@@ -271,7 +283,8 @@ class TPSLMonitor(Thread):
     # ------------------------------------------------------------------
 
     def _check_stale_positions(self, active: list[Position], prices: dict[str, float]) -> bool:
-        """Close positions that have been open > 24h with PnL stuck within ±3%.
+        """Close positions that have been open longer than configured
+        stale_position_hours with PnL stuck within stale_position_pnl_pct.
 
         Returns True if at least one stale position was closed.
         """
@@ -283,7 +296,7 @@ class TPSLMonitor(Thread):
             except (ValueError, OSError):
                 continue
             age_hours = (now - opened_ts) / 3600
-            if age_hours < STALE_POSITION_HOURS:
+            if age_hours < self._stale_position_hours:
                 continue
 
             price = prices.get(pos.symbol, 0)
@@ -295,7 +308,7 @@ class TPSLMonitor(Thread):
             else:
                 pnl_pct = (pos.entry_price - price) / pos.entry_price * 100
 
-            if abs(pnl_pct) <= STALE_POSITION_PNL_PCT:
+            if abs(pnl_pct) <= self._stale_position_pnl_pct:
                 side = "sell" if pos.direction == "LONG" else "buy"
                 logger.warning(
                     "STALE position %s %s (%dh old, PnL=%+.1f%%): closing to release margin",
@@ -576,7 +589,7 @@ class TPSLMonitor(Thread):
                 pos, side, pos.quantity, current_price,
                 reason="DOOM", is_de_risk=True, de_risk_level=4,
             )
-            self._positions.set_extended_cooldown(pos.symbol, pos.direction, DE_RISK_EXTENDED_COOLDOWN_MINUTES)
+            self._positions.set_extended_cooldown(pos.symbol, pos.direction, self._de_risk_extended_cooldown_minutes)
             return True
 
         return False
@@ -602,7 +615,7 @@ class TPSLMonitor(Thread):
                 pos, side, pos.quantity, current_price,
                 reason=f"DE_RISK_{level}", is_de_risk=False, de_risk_level=level,
             )
-            self._positions.set_extended_cooldown(pos.symbol, pos.direction, DE_RISK_EXTENDED_COOLDOWN_MINUTES)
+            self._positions.set_extended_cooldown(pos.symbol, pos.direction, self._de_risk_extended_cooldown_minutes)
             return True
 
         side = "sell" if pos.direction == "LONG" else "buy"
@@ -610,7 +623,7 @@ class TPSLMonitor(Thread):
             pos, side, sell_qty, current_price,
             reason=f"DE_RISK_{level}", is_de_risk=True, de_risk_level=level,
         )
-        self._positions.set_extended_cooldown(pos.symbol, pos.direction, DE_RISK_EXTENDED_COOLDOWN_MINUTES)
+        self._positions.set_extended_cooldown(pos.symbol, pos.direction, self._de_risk_extended_cooldown_minutes)
         return True
 
     def _cancel_exchange_brackets(self, pos: Position) -> None:
@@ -644,7 +657,7 @@ class TPSLMonitor(Thread):
         )
 
         last_err: Optional[Exception] = None
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(self._max_retries):
             try:
                 order = self._exchange.create_market_order(pos.symbol, side, qty, reduce_only=True)
                 filled = order.get("filled", 0) or 0
@@ -699,12 +712,12 @@ class TPSLMonitor(Thread):
                         self._positions.close_position(pos.symbol, exit_price=price, reason=reason)
                     return
                 last_err = exc
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF[attempt]
-                    logger.warning("%s retry %d/%d in %.1fs: %s", reason, attempt + 1, MAX_RETRIES, delay, exc)
+                if attempt < self._max_retries - 1:
+                    delay = self._retry_backoff[attempt]
+                    logger.warning("%s retry %d/%d in %.1fs: %s", reason, attempt + 1, self._max_retries, delay, exc)
                     time.sleep(delay)
 
-        logger.error("%s failed after %d attempts for %s: %s", reason, MAX_RETRIES, pos.symbol, last_err)
+        logger.error("%s failed after %d attempts for %s: %s", reason, self._max_retries, pos.symbol, last_err)
         if self._on_error:
             assert last_err is not None
             self._on_error(last_err)
@@ -774,7 +787,7 @@ class TPSLMonitor(Thread):
         logger.info("TP triggered: %s %s @ %.4f (TP=%.4f)", pos.symbol, pos.direction, price, pos.take_profit)
 
         last_err: Optional[Exception] = None
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(self._max_retries):
             try:
                 order = self._exchange.create_market_order(pos.symbol, side, pos.quantity, reduce_only=True)
                 filled = order.get("filled", 0) or 0
@@ -811,12 +824,12 @@ class TPSLMonitor(Thread):
                     self._peak_prices.pop(pos.symbol, None)
                     return
                 last_err = exc
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF[attempt]
-                    logger.warning("TP retry %d/%d in %.1fs: %s", attempt + 1, MAX_RETRIES, delay, exc)
+                if attempt < self._max_retries - 1:
+                    delay = self._retry_backoff[attempt]
+                    logger.warning("TP retry %d/%d in %.1fs: %s", attempt + 1, self._max_retries, delay, exc)
                     time.sleep(delay)
 
-        logger.error("TP execution failed after %d attempts for %s: %s", MAX_RETRIES, pos.symbol, last_err)
+        logger.error("TP execution failed after %d attempts for %s: %s", self._max_retries, pos.symbol, last_err)
         if self._on_error:
             assert last_err is not None
             self._on_error(last_err)
@@ -831,7 +844,7 @@ class TPSLMonitor(Thread):
         )
 
         last_err: Optional[Exception] = None
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(self._max_retries):
             try:
                 order = self._exchange.create_market_order(pos.symbol, side, pos.quantity, reduce_only=True)
                 filled = order.get("filled", 0) or 0
@@ -868,12 +881,12 @@ class TPSLMonitor(Thread):
                     self._peak_prices.pop(pos.symbol, None)
                     return
                 last_err = exc
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF[attempt]
-                    logger.warning("SL retry %d/%d in %.1fs: %s", attempt + 1, MAX_RETRIES, delay, exc)
+                if attempt < self._max_retries - 1:
+                    delay = self._retry_backoff[attempt]
+                    logger.warning("SL retry %d/%d in %.1fs: %s", attempt + 1, self._max_retries, delay, exc)
                     time.sleep(delay)
 
-        logger.error("SL execution failed after %d attempts for %s: %s", MAX_RETRIES, pos.symbol, last_err)
+        logger.error("SL execution failed after %d attempts for %s: %s", self._max_retries, pos.symbol, last_err)
         if self._on_error:
             assert last_err is not None
             self._on_error(last_err)

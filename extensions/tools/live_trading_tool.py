@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from typing import Any, Optional
 
 from src.agent.tools import BaseTool
@@ -112,22 +113,30 @@ class LiveTradingTool(BaseTool):
                 "type": "boolean",
                 "description": "Use mock exchange (default: true). Set to false for real trading.",
             },
+            "exchange_name": {
+                "type": "string",
+                "enum": ["binance", "bitget"],
+                "description": "Exchange to use (default: binance). Only used when mock=False.",
+            },
         },
         "required": ["action"],
     }
     is_readonly = False
 
-    def __init__(self, mock: bool = True, pair_whitelist: Optional[list[str]] = None) -> None:
+    def __init__(self, mock: bool = True, pair_whitelist: Optional[list[str]] = None, exchange_name: Optional[str] = None) -> None:
         self._mock = mock
+        self._exchange_name = exchange_name or os.environ.get("CRYPTO_EXCHANGE", "binance")
         self._whitelist: Optional[list[str]] = pair_whitelist
         self._exchange: Optional[Any] = None
         self._positions: Optional[PositionTracker] = None
         self._monitor: Optional[TPSLMonitor] = None
 
     def _get_exchange(self):
-        """Lazy-init exchange instance (RealExchange or MockExchange based on _mock flag)."""
+        """Lazy-init exchange instance."""
         if self._exchange is None:
-            self._exchange = create_exchange(mock=self._mock)
+            self._exchange = create_exchange(mock=self._mock, exchange_name=self._exchange_name)
+            if self._exchange_name != "binance" and hasattr(self._exchange, "validate_symbols") and self._whitelist:
+                self._whitelist = self._exchange.validate_symbols(self._whitelist)
         return self._exchange
 
     @classmethod
