@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from extensions.live_trading.engine.alpha_factors import (
+from extensions.trading.crypto.live.alpha_factors import (
     aggregate_signal,
     compute_all,
     corr_price_volume,
@@ -21,7 +21,6 @@ from extensions.live_trading.engine.alpha_factors import (
     ts_argmin_decay,
     ts_rank_close,
     ts_rank_high_low,
-    ts_rank_volume,
     volatility_regime,
     volume_price_trend,
     zscore_price,
@@ -302,7 +301,7 @@ class TestAlphaScoreIntegration:
 
     def test_positive_alpha_boosts_long_score(self) -> None:
         """Strong bullish alpha signal → +1 to LONG score."""
-        from extensions.live_trading.engine.market_scanner import MarketScanner
+        from extensions.trading.crypto.live.market_scanner import MarketScanner
         from extensions.tests.test_market_scanner import _base_indicators
 
         ind_base = _base_indicators(rsi_1h=50.0, rsi_15m=50.0, change_24h=0.0)
@@ -313,7 +312,7 @@ class TestAlphaScoreIntegration:
 
     def test_negative_alpha_reduces_long_score(self) -> None:
         """Strong bearish alpha signal → -1 to LONG score."""
-        from extensions.live_trading.engine.market_scanner import MarketScanner
+        from extensions.trading.crypto.live.market_scanner import MarketScanner
         from extensions.tests.test_market_scanner import _base_indicators
 
         ind_base = _base_indicators(rsi_1h=50.0, rsi_15m=50.0, change_24h=0.0)
@@ -324,7 +323,7 @@ class TestAlphaScoreIntegration:
 
     def test_negative_alpha_boosts_short_score(self) -> None:
         """Strong bearish alpha signal → +1 to SHORT score."""
-        from extensions.live_trading.engine.market_scanner import MarketScanner
+        from extensions.trading.crypto.live.market_scanner import MarketScanner
         from extensions.tests.test_market_scanner import _base_indicators
 
         ind_base = _base_indicators(rsi_1h=50.0, rsi_15m=50.0, change_24h=0.0)
@@ -335,7 +334,7 @@ class TestAlphaScoreIntegration:
 
     def test_positive_alpha_reduces_short_score(self) -> None:
         """Strong bullish alpha signal → -1 to SHORT score."""
-        from extensions.live_trading.engine.market_scanner import MarketScanner
+        from extensions.trading.crypto.live.market_scanner import MarketScanner
         from extensions.tests.test_market_scanner import _base_indicators
 
         ind_base = _base_indicators(rsi_1h=50.0, rsi_15m=50.0, change_24h=0.0)
@@ -346,7 +345,7 @@ class TestAlphaScoreIntegration:
 
     def test_weak_alpha_no_effect(self) -> None:
         """|alpha_signal| < 0.3 has no effect on scores."""
-        from extensions.live_trading.engine.market_scanner import MarketScanner
+        from extensions.trading.crypto.live.market_scanner import MarketScanner
         from extensions.tests.test_market_scanner import _base_indicators
 
         ind = _base_indicators(rsi_1h=50.0, rsi_15m=50.0, change_24h=0.0, alpha_signal=0.2)
@@ -355,7 +354,7 @@ class TestAlphaScoreIntegration:
 
     def test_alpha_in_compute_indicators(self) -> None:
         """compute_indicators() includes alpha_signal and alpha_* keys."""
-        from extensions.live_trading.engine.market_scanner import MarketScanner
+        from extensions.trading.crypto.live.market_scanner import MarketScanner
 
         ticker = {"symbol": "BTCUSDT", "last": 65000.0, "volume24h": 2_000_000_000.0, "change24h": 0.0}
         kline_1h = pd.DataFrame({

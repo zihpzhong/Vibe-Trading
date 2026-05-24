@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from extensions.live_trading.astock.data import (
+from extensions.trading.astock.live.data import (
     DataChain,
     MockDataBackend,
     infer_board,

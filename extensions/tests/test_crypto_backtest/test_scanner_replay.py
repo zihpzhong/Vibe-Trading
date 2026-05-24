@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import pandas as pd
 
-from extensions.live_trading.crypto_backtest.exchange import CryptoBacktestExchange
-from extensions.live_trading.engine.market_scanner import MarketScanner
-from extensions.run_crypto_backtest import _synthetic_ohlcv
+from extensions.trading.crypto.backtest.exchange import CryptoBacktestExchange
+from extensions.trading.crypto.live.market_scanner import MarketScanner
+from extensions.cli.run_crypto_backtest import _synthetic_ohlcv
 
 
 def test_backtest_exchange_indicators_match_direct_compute():
@@ -16,19 +15,13 @@ def test_backtest_exchange_indicators_match_direct_compute():
 
     ex = CryptoBacktestExchange({sym: df}, [sym])
     ex.set_current_bar(ts)
-    ticker_ex = ex.get_ticker(sym)
+    ticker = ex.get_ticker(sym)
     k1h_ex = ex.get_kline(sym, "1h", 200)
     k15m_ex = ex.get_kline(sym, "15m", 20)
-    ind_ex = MarketScanner.compute_indicators(ticker_ex, k1h_ex, k15m_ex)
+    ind_ex = MarketScanner.compute_indicators(ticker, k1h_ex, k15m_ex)
 
     hist = df.loc[df.index <= ts].tail(200)
-    ticker_manual = {
-        "symbol": sym,
-        "last": float(hist["close"].iloc[-1]),
-        "change24h": 0.0,
-        "volume24h": float(hist["volume"].tail(24).sum() * hist["close"].iloc[-1]),
-    }
-    ind_manual = MarketScanner.compute_indicators(ticker_manual, hist, hist.tail(20))
+    ind_manual = MarketScanner.compute_indicators(ticker, hist, hist.tail(20))
 
     for key in ("rsi_1h", "rsi_15m", "bb_pct", "vol_ratio", "price_in_8h_pct"):
         assert abs(ind_ex[key] - ind_manual[key]) < 1e-6, key

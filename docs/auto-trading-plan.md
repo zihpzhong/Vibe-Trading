@@ -31,7 +31,7 @@
 | 批量行情         | `ccxt.fetch_tickers()`                 | futures 默认 `/fapi/v1/ticker/24hr`，spot 模式 `/api/v3/ticker/24hr`                                                      |
 | K线数据         | ccxt `fetch_ohlcv()`                   | `/api/v3/klines` 直连，futures 不可用时自动 fallback 到 spot                                                                   |
 | 签名方式         | ccxt 内置                                | **HMAC-SHA256** 自实现，无第三方依赖                                                                                           |
-| 部署方式         | 未指定                                    | **本地/服务器**: `python extensions/run_live_trading.py`；**Docker**: `docker compose up -d live-trading`（`compose` 挂载数据卷） |
+| 部署方式         | 未指定                                    | **本地/服务器**: `python extensions/cli/run_live_trading.py`；**Docker**: `docker compose up -d live-trading`（`compose` 挂载数据卷） |
 | Phase 1 标的池  | Top-N 成交量扫描                            | **默认 Top50 白名单**（`with_top50_whitelist()`，`scan_top_n=0`）；`--pairs` 或 `scan_top_n=20` 可切回 Top-N                      |
 | Phase 2 分析   | 8 个独立 Skill 文件                         | **Phase2Analyzer** (SkillsLoader + ChatLLM, **10** dim→skill 映射, JSON verdict 输出)                                    |
 | Alpha 因子     | 无                                      | 12 个公式化因子 → `alpha_signal` 贡献 ±1 分给 LONG/SHORT 评分                                                                    |
@@ -470,8 +470,8 @@ flowchart TD
 | 闲置扫描告警         | `TradingScheduler._consecutive_idle_scans` (12 次阈值)                                               | 代码      | ✅         |
 | 余额同步+暴跌保护      | 每轮 `get_account_balance()` → 50% 崩盘保护                                                             | 代码      | ✅         |
 | 主循环集成          | `run_live_trading.py` 主循环 → Phase2Analyzer → ATR → Gate → 下单                                      | 代码      | ✅         |
-| 启动             | `python extensions/run_live_trading.py --balance 50 --interval 10`                                | dry-run | ✅ 默认观察模式  |
-| 实盘启动           | `python extensions/run_live_trading.py --live --confirm-live I_UNDERSTAND ...`                    | live    | ✅ 显式确认    |
+| 启动             | `python extensions/cli/run_live_trading.py --balance 50 --interval 10`                                | dry-run | ✅ 默认观察模式  |
+| 实盘启动           | `python extensions/cli/run_live_trading.py --live --confirm-live I_UNDERSTAND ...`                    | live    | ✅ 显式确认    |
 
 
 ## 配置体系 (config.py)
@@ -1038,7 +1038,7 @@ class Position:
 | `--phase2-enhanced-strict`                 | enhanced 档需 ≥2 维 PASS 才继续 (否则 SKIP)                                                |
 
 
-**默认标的池**：未传 `--pairs` 时使用 `with_top50_whitelist()`（约 50 个合约币种，见 `extensions/live_trading/whitelist.json`）。
+**默认标的池**：未传 `--pairs` 时使用 `with_top50_whitelist()`（约 50 个合约币种，见 `extensions/trading/whitelist.json`）。
 
 启动时会估算 `balance × min(position_size, max_position_pct) × max_leverage` 的最大初始名义价值。若低于 Binance $20 最小名义价值，dry-run 仅告警继续，live 模式直接退出。
 
@@ -1065,27 +1065,27 @@ class DailyRiskTracker:
 
 | 文件                                                   | 状态  | 说明                                                                          |
 | ---------------------------------------------------- | --- | --------------------------------------------------------------------------- |
-| `extensions/live_trading/engine/_real_exchange.py`   | ✅   | Binance 直连 HTTP (默认 futures, fapi ticker/depth, HMAC-SHA256, urllib3 Retry) |
-| `extensions/live_trading/engine/market_scanner.py`   | ✅   | Phase 1 扫描 (7 指标+12 Alpha 因子+10分制+极值cap+成交量守卫)                              |
-| `extensions/live_trading/engine/alpha_factors.py`    | ✅   | 12 个精选 Alpha 因子 (动量/反转/波动率/量价)                                              |
-| `extensions/live_trading/engine/position_tracker.py` | ✅   | 持仓管理 (SQLite WAL + JSON 迁移 + mark/equity + DeRisk + 分档胜率 + trailing)        |
-| `extensions/live_trading/engine/tpsl_monitor.py`     | ✅   | TP/SL 守护 (SL优先 + DCA Gate + 时间衰减TP + DeRisk + 入场保护期 + STALE)                |
-| `extensions/live_trading/engine/scheduler.py`        | ✅   | 调度引擎 (BTC→Phase1→分级决策+闲置告警)                                                 |
-| `extensions/live_trading/engine/atr_stop.py`         | ✅   | Wilder ATR(14) 动态止损 (3%-8% 距离约束)                                            |
-| `extensions/live_trading/engine/execution_gate.py`   | ✅   | 5 项 Gate + 白名单硬检查 (硬失败分层 + 盘口冲击模拟)                                          |
-| `extensions/live_trading/whitelist.py`               | ✅   | Top50 白名单加载 (`whitelist.json` / `TOP_50` 回退)                                |
-| `extensions/live_trading/engine/phase2.py`           | ✅   | Phase 2 LLM 分析 (10 维, SkillsLoader + ChatLLM, alpha context 注入)                |
-| `extensions/live_trading/engine/swarm_phase2.py`     | ✅   | Swarm Phase 2 并行维度分析 + 代码共识 (P0 shadow 模式)                                  |
-| `extensions/live_trading/engine/exchange_brackets.py`| ✅   | 交易所原生 SL/TP 条件单 (STOP_MARKET + TAKE_PROFIT_MARKET)                            |
-| `extensions/live_trading/engine/reconcile.py`        | ✅   | 交易所 ↔ Tracker 持仓对账 (ghost/orphan 清理收养)                                       |
-| `extensions/live_trading/engine/migration.py`        | ✅   | positions.json → trading.db 单次迁移                                                     |
-| `extensions/live_trading/engine/btc_conduction.py`   | ✅   | BTC 4h 联动 + 1h 趋势检查                                                         |
-| `extensions/live_trading/__init__.py`                | ✅   | 包导出                                                                         |
-| `extensions/live_trading/models.py`                  | ✅   | 核心数据模型 (Gate/Signal/Phase2Request/ScheduleReport)                           |
-| `extensions/live_trading/config.py`                  | ✅   | 完整配置 (DeRisk+DCA+ATR+Gate+BTC+Funding+模式预设+validate+exchange bracket)       |
+| `extensions/trading/engine/_real_exchange.py`   | ✅   | Binance 直连 HTTP (默认 futures, fapi ticker/depth, HMAC-SHA256, urllib3 Retry) |
+| `extensions/trading/engine/market_scanner.py`   | ✅   | Phase 1 扫描 (7 指标+12 Alpha 因子+10分制+极值cap+成交量守卫)                              |
+| `extensions/trading/engine/alpha_factors.py`    | ✅   | 12 个精选 Alpha 因子 (动量/反转/波动率/量价)                                              |
+| `extensions/trading/engine/position_tracker.py` | ✅   | 持仓管理 (SQLite WAL + JSON 迁移 + mark/equity + DeRisk + 分档胜率 + trailing)        |
+| `extensions/trading/engine/tpsl_monitor.py`     | ✅   | TP/SL 守护 (SL优先 + DCA Gate + 时间衰减TP + DeRisk + 入场保护期 + STALE)                |
+| `extensions/trading/engine/scheduler.py`        | ✅   | 调度引擎 (BTC→Phase1→分级决策+闲置告警)                                                 |
+| `extensions/trading/engine/atr_stop.py`         | ✅   | Wilder ATR(14) 动态止损 (3%-8% 距离约束)                                            |
+| `extensions/trading/engine/execution_gate.py`   | ✅   | 5 项 Gate + 白名单硬检查 (硬失败分层 + 盘口冲击模拟)                                          |
+| `extensions/trading/whitelist.py`               | ✅   | Top50 白名单加载 (`whitelist.json` / `TOP_50` 回退)                                |
+| `extensions/trading/engine/phase2.py`           | ✅   | Phase 2 LLM 分析 (10 维, SkillsLoader + ChatLLM, alpha context 注入)                |
+| `extensions/trading/engine/swarm_phase2.py`     | ✅   | Swarm Phase 2 并行维度分析 + 代码共识 (P0 shadow 模式)                                  |
+| `extensions/trading/engine/exchange_brackets.py`| ✅   | 交易所原生 SL/TP 条件单 (STOP_MARKET + TAKE_PROFIT_MARKET)                            |
+| `extensions/trading/engine/reconcile.py`        | ✅   | 交易所 ↔ Tracker 持仓对账 (ghost/orphan 清理收养)                                       |
+| `extensions/trading/engine/migration.py`        | ✅   | positions.json → trading.db 单次迁移                                                     |
+| `extensions/trading/engine/btc_conduction.py`   | ✅   | BTC 4h 联动 + 1h 趋势检查                                                         |
+| `extensions/trading/__init__.py`                | ✅   | 包导出                                                                         |
+| `extensions/trading/models.py`                  | ✅   | 核心数据模型 (Gate/Signal/Phase2Request/ScheduleReport)                           |
+| `extensions/trading/config.py`                  | ✅   | 完整配置 (DeRisk+DCA+ATR+Gate+BTC+Funding+模式预设+validate+exchange bracket)       |
 | `extensions/tools/live_trading_tool.py`              | ✅   | 8 actions (Agent 工具集成)                                                      |
-| `extensions/run_live_trading.py`                     | ✅   | 入口脚本 (日亏损熔断+余额同步+暴跌保护+可用余额上限+信号处理+Swarm shadow+Enhanced strict)                 |
-| `extensions/live_trading/crypto_backtest/phase2_replay.py` | ✅ | Phase 2 / Swarm 回测 replay (含 swarm_verdict/allows_entry_swarm)                   |
+| `extensions/cli/run_live_trading.py`                     | ✅   | 入口脚本 (日亏损熔断+余额同步+暴跌保护+可用余额上限+信号处理+Swarm shadow+Enhanced strict)                 |
+| `extensions/trading/crypto_backtest/phase2_replay.py` | ✅ | Phase 2 / Swarm 回测 replay (含 swarm_verdict/allows_entry_swarm)                   |
 | `extensions/tests/test_live_trading_e2e.py`          | ✅   | 端到端集成测试                                                                     |
 | `extensions/tests/test_market_scanner.py`            | ✅   | 评分规则单元测试 (12+)                                                              |
 | `extensions/tests/test_execution_gate.py`            | ✅   | Gate 校验测试                                                                   |

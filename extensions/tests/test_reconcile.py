@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from extensions.live_trading.engine.position_tracker import PositionTracker
-from extensions.live_trading.engine.reconcile import reconcile_positions
+from extensions.trading.crypto.live.position_tracker import PositionTracker
+from extensions.trading.crypto.live.reconcile import reconcile_positions
 
 
 @pytest.fixture

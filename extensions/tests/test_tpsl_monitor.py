@@ -8,10 +8,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from extensions.live_trading.config import DeRiskConfig
-from extensions.live_trading.engine.position_tracker import PositionTracker
-from extensions.live_trading.engine.tpsl_monitor import TPSLMonitor
-from extensions.live_trading.engine.exchange import MockExchange
+from extensions.trading.crypto.config import DeRiskConfig
+from extensions.trading.crypto.live.position_tracker import PositionTracker
+from extensions.trading.crypto.live.tpsl_monitor import TPSLMonitor
+from extensions.trading.crypto.live.exchange import MockExchange
 
 
 @pytest.fixture
@@ -173,7 +173,7 @@ class TestStopLoss:
 
     def test_stop_loss_has_priority_over_dca(self, exchange: MockExchange, tracker: PositionTracker) -> None:
         """SL 已击穿时应先止损，不能先 DCA 扩大亏损仓位."""
-        from extensions.live_trading.config import DCAConfig
+        from extensions.trading.crypto.config import DCAConfig
 
         tracker.open_position("LONGUSDT", "LONG", 100.0, 1.0, 95.0)
         exchange.get_tickers = MagicMock(return_value=[
@@ -194,8 +194,8 @@ class TestStopLoss:
         self, exchange: MockExchange, tracker: PositionTracker,
     ) -> None:
         """DCA 前重跑 Gate，funding 缺失时不加仓."""
-        from extensions.live_trading.config import DCAConfig
-        from extensions.live_trading.engine.execution_gate import ExecGateEngine
+        from extensions.trading.crypto.config import DCAConfig
+        from extensions.trading.crypto.live.execution_gate import ExecGateEngine
 
         # qty=2.0 确保 15% de-risk 部分减持 notional = 0.3 * 94 = $28.2 >= $20
         tracker.open_position("LONGUSDT", "LONG", 100.0, 2.0, 80.0, take_profit=120.0)

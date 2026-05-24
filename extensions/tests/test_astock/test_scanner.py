@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from extensions.live_trading.astock.scanner import score_buy, _rsi
+from extensions.trading.astock.live.scanner import score_buy, _rsi
 
 
 def test_score_buy_mid_rsi() -> None:

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from extensions.live_trading.astock.config import AStockTradingConfig
-from extensions.live_trading.astock.exchange import create_astock_exchange
-from extensions.live_trading.astock.gate import AStockGateEngine
-from extensions.live_trading.astock.models import AStockSignal, GateStatus
+from extensions.trading.astock.config import AStockTradingConfig
+from extensions.trading.astock.live.exchange import create_astock_exchange
+from extensions.trading.astock.live.gate import AStockGateEngine
+from extensions.trading.astock.models import AStockSignal, GateStatus
 
 
 def _mk_exchange():
@@ -120,7 +120,7 @@ def test_gate_rejects_low_liquidity() -> None:
 
 
 def test_gate_execution_gate_result_add_check() -> None:
-    from extensions.live_trading.astock.models import ExecutionGateResult, GateStatus
+    from extensions.trading.astock.models import ExecutionGateResult, GateStatus
 
     r = ExecutionGateResult(symbol="600519.SH", status=GateStatus.PASS)
     r.add_check("test_check", True, "ok")

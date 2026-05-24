@@ -5,16 +5,16 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from extensions.live_trading.engine.execution_gate import ExecGateEngine
-from extensions.live_trading.engine.btc_conduction import ConductionStatus, check_btc_conduction
-from extensions.live_trading.engine.atr_stop import calculate_atr, calculate_atr_stop
-from extensions.live_trading.engine.exchange import MockExchange, create_exchange
-from extensions.live_trading.config import (
+from extensions.trading.crypto.live.execution_gate import ExecGateEngine
+from extensions.trading.crypto.live.btc_conduction import ConductionStatus, check_btc_conduction
+from extensions.trading.crypto.live.atr_stop import calculate_atr, calculate_atr_stop
+from extensions.trading.crypto.live.exchange import MockExchange, create_exchange
+from extensions.trading.crypto.config import (
     LiveTradingConfig,
     ATRStopConfig,
     BTCConductionConfig,
 )
-from extensions.live_trading.models import (
+from extensions.trading.crypto.models import (
     GateStatus,
     LiveSignal,
     SignalDirection,
@@ -482,7 +482,7 @@ class TestExchange:
     def test_create_exchange_mock(self) -> None:
         """create_exchange(mock=True) 返回 MockExchange."""
         ex = create_exchange(mock=True)
-        from extensions.live_trading.engine.exchange import MockExchange
+        from extensions.trading.crypto.live.exchange import MockExchange
         assert isinstance(ex, MockExchange)
 
     def test_mock_exchange_seed_price(self) -> None:

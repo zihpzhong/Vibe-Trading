@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time as dt_time
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pytest
 
-from extensions.live_trading.astock.config import AStockTradingConfig
-from extensions.live_trading.astock.exchange import create_astock_exchange
-from extensions.live_trading.astock.scheduler import AStockScheduler, trading_session
+from extensions.trading.astock.config import AStockTradingConfig
+from extensions.trading.astock.live.exchange import create_astock_exchange
+from extensions.trading.astock.live.scheduler import AStockScheduler, trading_session
 
 
 def _dt(hour: int, minute: int = 0, weekday: int = 0) -> datetime:
@@ -74,8 +73,8 @@ class TestAStockScheduler:
         assert report.market_status in ("OK", "CAUTION", "STRONG", "LOCK_ALL")
 
     def test_active_positions_reported(self) -> None:
-        from extensions.live_trading.astock.position import AStockPositionTracker
-        from extensions.live_trading.astock.models import AStockPosition
+        from extensions.trading.astock.live.position import AStockPositionTracker
+        from extensions.trading.astock.models import AStockPosition
 
         cfg = AStockTradingConfig(data_sources=["mock"])
         ex = create_astock_exchange("mock", cfg)

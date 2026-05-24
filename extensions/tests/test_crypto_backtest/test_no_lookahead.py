@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from extensions.live_trading.crypto_backtest.exchange import CryptoBacktestExchange
+from extensions.trading.crypto.backtest.exchange import CryptoBacktestExchange
 
 
 def test_ticker_unchanged_when_future_mutated():

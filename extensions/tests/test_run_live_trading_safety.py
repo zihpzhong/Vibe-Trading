@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from unittest.mock import patch
 
-from extensions import run_live_trading
+from extensions.cli import run_live_trading
 
 
 class TestRunLiveTradingArgs:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from extensions.live_trading.crypto_backtest.exchange import CryptoBacktestExchange, normalize_symbol
+from extensions.trading.crypto.backtest.exchange import CryptoBacktestExchange, normalize_symbol
 
 
 def _make_df(n: int = 100) -> pd.DataFrame:

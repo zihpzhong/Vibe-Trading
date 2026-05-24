@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-from threading import Event
 from unittest.mock import MagicMock
 
-import pytest
 
-from extensions.live_trading.astock.config import AStockDeRiskConfig, AStockTradingConfig
-from extensions.live_trading.astock.exchange import MockAStockExchange
-from extensions.live_trading.astock.models import AStockPosition
-from extensions.live_trading.astock.position import AStockPositionTracker
-from extensions.live_trading.astock.tpsl_monitor import AStockTPSLMonitor
+from extensions.trading.astock.config import AStockDeRiskConfig, AStockTradingConfig
+from extensions.trading.astock.live.exchange import MockAStockExchange
+from extensions.trading.astock.models import AStockPosition
+from extensions.trading.astock.live.position import AStockPositionTracker
+from extensions.trading.astock.live.tpsl_monitor import AStockTPSLMonitor
 
 
 def _setup(

@@ -74,7 +74,7 @@ py-modules = ["api_server", "mcp_server"]
 
 [tool.setuptools.packages.find]
 where = ["agent", "extensions"]
-include = ["src*", "backtest*", "cli*", "live_trading*", "tools*", "ext_backtest*"]
+include = ["src*", "backtest*", "cli*", "trading*", "tools*"]
 
 [tool.setuptools.package-data]
 "src" = [
@@ -108,7 +108,7 @@ markers = [
 [tool.ruff]
 target-version = "py311"
 line-length = 120
-src = ["agent"]
+src = ["agent", "extensions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
@@ -119,3 +119,5 @@ ignore = ["E501"]
 # to match research-paper formulas. F401 (unused-import) is noise here;
 # F841 (unused-local-variable) stays active to catch real formula bugs.
 "agent/src/factors/zoo/**/*.py" = ["F401"]
+# CLI 入口需先设置 sys.path 再 import / CLI sets sys.path before imports
+"extensions/cli/*.py" = ["E402"]

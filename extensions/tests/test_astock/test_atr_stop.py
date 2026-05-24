@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from extensions.live_trading.astock.atr_stop import calculate_astock_stop
-from extensions.live_trading.astock.config import AStockStopConfig
+from extensions.trading.astock.live.atr_stop import calculate_astock_stop
+from extensions.trading.astock.config import AStockStopConfig
 
 
 def _mock_kline(length: int = 30, base: float = 100.0) -> pd.DataFrame:
