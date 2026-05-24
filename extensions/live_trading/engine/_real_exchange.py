@@ -456,8 +456,11 @@ class RealExchange(ExchangeBase):
         *,
         op: str,
     ) -> dict:
-        """Send a signed request to the Binance Algo Order API (futures).
+        """向 Binance 合约 Algo Order API 发送签名请求。
+        Send a signed request to the Binance Algo Order API (futures).
 
+        Binance 已将 STOP_MARKET/TAKE_PROFIT_MARKET 从 /fapi/v1/order 迁出；
+        条件单须使用 /fapi/v1/algoOrder（POST/DELETE）。
         Binance deprecated STOP_MARKET/TAKE_PROFIT_MARKET on /fapi/v1/order;
         conditional orders must use /fapi/v1/algoOrder (POST/DELETE).
         """
@@ -489,20 +492,23 @@ class RealExchange(ExchangeBase):
         return raw
 
     def _algo_trade_request(self, endpoint: str, params: dict) -> dict:
-        """POST to Binance Algo Order API."""
+        """POST 至 Binance Algo Order API / POST to Binance Algo Order API."""
         return self._algo_signed_request("POST", endpoint, params, op="trade")
 
     def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
-        """Place a stop-loss (market on trigger) order via Binance Algo Order API.
+        """通过 Binance Algo Order API 下止损（触发后市价）单。
+        Place a stop-loss (market on trigger) order via Binance Algo Order API.
 
+        合约：/fapi/v1/algoOrder + STOP_MARKET + reduceOnly。
         Futures: uses /fapi/v1/algoOrder with STOP_MARKET + reduceOnly.
+        现货：/api/v3/order + STOP_LOSS。
         Spot: uses /api/v3/order with STOP_LOSS (regular endpoint).
         """
         qty = self._round_qty(symbol, amount)
         trigger = self._format_decimal(self._round_price(symbol, stop_price))
         with self._lock:
             if self._market_type == "future":
-                # Binance Algo Order API — reduceOnly handles direction
+                # 合约 Algo API；reduceOnly 表示只减仓 / Futures Algo API; reduceOnly closes only
                 bs = self._binance_side(side)
                 params: dict[str, str] = {
                     "algoType": "CONDITIONAL",
@@ -535,9 +541,12 @@ class RealExchange(ExchangeBase):
             }
 
     def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
-        """Place a take-profit (market on trigger) order via Binance Algo Order API.
+        """通过 Binance Algo Order API 下止盈（触发后市价）单。
+        Place a take-profit (market on trigger) order via Binance Algo Order API.
 
+        合约：/fapi/v1/algoOrder + TAKE_PROFIT_MARKET + reduceOnly。
         Futures: uses /fapi/v1/algoOrder with TAKE_PROFIT_MARKET + reduceOnly.
+        现货：/api/v3/order + TAKE_PROFIT。
         Spot: uses /api/v3/order with TAKE_PROFIT (regular endpoint).
         """
         qty = self._round_qty(symbol, amount)
@@ -576,7 +585,9 @@ class RealExchange(ExchangeBase):
             }
 
     def cancel_order(self, order_id: str, symbol: str) -> dict:
-        """Cancel an open order (regular or algo conditional)."""
+        """取消挂单（普通单或 Algo 条件单）。
+        Cancel an open order (regular or algo conditional).
+        """
         with self._lock:
             self._require_auth("cancel_order")
             if self._market_type == "future":
@@ -592,7 +603,7 @@ class RealExchange(ExchangeBase):
                         "status": raw.get("msg", "CANCELED"),
                     }
                 except RuntimeError:
-                    pass  # fall through to regular order cancel
+                    pass  # 回退普通撤单 / fall back to regular order cancel
             query_string = urlencode(sorted({
                 "symbol": symbol,
                 "orderId": order_id,
@@ -614,6 +625,23 @@ class RealExchange(ExchangeBase):
             resp.raise_for_status()
             raw = resp.json()
             return {"order_id": raw.get("orderId", order_id), "status": raw.get("status")}
+
+    def fetch_algo_order(self, algo_id: str) -> dict[str, Any]:
+        """查询 Algo 条件单状态 / Query algo conditional order status."""
+        with self._lock:
+            self._require_auth("fetch_algo_order")
+            resp = self._signed_request(
+                f"{self._fapi_url()}/fapi/v1", "/algoOrder", {"algoId": algo_id},
+            )
+            if not resp.ok:
+                raise RuntimeError(f"fetch_algo_order failed ({resp.status_code}): {resp.text}")
+            raw = resp.json()
+            return {
+                "algo_id": str(raw.get("algoId", algo_id)),
+                "status": raw.get("algoStatus"),
+                "symbol": raw.get("symbol"),
+                "order_type": raw.get("orderType"),
+            }
 
     def fetch_order(self, order_id: str, symbol: str) -> dict:
         """Query order status via direct HTTP GET."""
@@ -827,7 +855,7 @@ class RealExchange(ExchangeBase):
         return result
 
     def _round_price(self, symbol: str, price: float) -> float:
-        """Round price to the symbol's PRICE_FILTER tickSize."""
+        """按 PRICE_FILTER tickSize 舍入价格 / Round price to PRICE_FILTER tickSize."""
         tick = self._tick_sizes.get(symbol)
         if tick is None or tick <= 0:
             return round(price, 8)
@@ -838,7 +866,9 @@ class RealExchange(ExchangeBase):
 
     @staticmethod
     def _format_decimal(value: float) -> str:
-        """Format a float for Binance API without excess precision."""
+        """格式化为 Binance API 所需精度（无多余小数位）。
+        Format float for Binance API without excess precision.
+        """
         return format(Decimal(str(value)).normalize(), "f")
 
     def _fapi_post(self, path: str, params: dict) -> dict:
