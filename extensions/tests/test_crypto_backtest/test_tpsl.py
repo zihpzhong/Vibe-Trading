@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 
 from extensions.trading.crypto.backtest.engine import CryptoLiveBacktestEngine, _NullSignalEngine
-from extensions.cli.run_crypto_backtest import _synthetic_ohlcv, filter_universe_by_coverage
+from extensions.ext_cli.run_crypto_backtest import _synthetic_ohlcv, filter_universe_by_coverage
 
 
 def test_tpsl_flags_run():

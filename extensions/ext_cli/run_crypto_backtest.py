@@ -1,9 +1,9 @@
 """Run CryptoLiveBacktestEngine — scanner-based crypto backtest.
 
 Usage:
-    python extensions/cli/run_crypto_backtest.py
-    python extensions/cli/run_crypto_backtest.py --fetch-only
-    python extensions/cli/run_crypto_backtest.py --synthetic --start 2024-01-01 --end 2024-06-01
+    python extensions/ext_cli/run_crypto_backtest.py
+    python extensions/ext_cli/run_crypto_backtest.py --fetch-only
+    python extensions/ext_cli/run_crypto_backtest.py --synthetic --start 2024-01-01 --end 2024-06-01
 """
 
 from __future__ import annotations

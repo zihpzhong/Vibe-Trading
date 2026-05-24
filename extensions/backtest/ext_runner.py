@@ -1,7 +1,7 @@
 """Extension-only backtest runner for ``astock`` / ``crypto_live`` engines.
 
 Per docs/extension-guide.md: do not patch ``agent/backtest/runner.py``.
-Use this entry from ``extensions/cli/run_*_backtest.py --runner`` instead.
+Use this entry from ``extensions/ext_cli/run_*_backtest.py --runner`` instead.
 """
 
 from __future__ import annotations

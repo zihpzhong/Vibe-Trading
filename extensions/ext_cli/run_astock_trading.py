@@ -2,9 +2,9 @@
 """A-share live trading entry — scan, gate, mock/dry-run execution.
 
 Usage:
-    python extensions/cli/run_astock_trading.py --mock
-    python extensions/cli/run_astock_trading.py --dry-run --interval 30
-    python extensions/cli/run_astock_trading.py --live --confirm-live I_UNDERSTAND
+    python extensions/ext_cli/run_astock_trading.py --mock
+    python extensions/ext_cli/run_astock_trading.py --dry-run --interval 30
+    python extensions/ext_cli/run_astock_trading.py --live --confirm-live I_UNDERSTAND
 """
 
 from __future__ import annotations

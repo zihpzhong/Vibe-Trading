@@ -1,9 +1,9 @@
 """Crypto live-trading parameter optimization via grid / 1D sweep.
 
 Usage:
-    python extensions/cli/optimize_crypto.py --synthetic --sweep position_size_pct
-    python extensions/cli/optimize_crypto.py --synthetic --sweep min_score
-    python extensions/cli/optimize_crypto.py --synthetic --grid quick
+    python extensions/ext_cli/optimize_crypto.py --synthetic --sweep position_size_pct
+    python extensions/ext_cli/optimize_crypto.py --synthetic --sweep min_score
+    python extensions/ext_cli/optimize_crypto.py --synthetic --grid quick
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ for _p in (_PROJECT_ROOT, _AGENT_ROOT):
 
 from extensions.trading.crypto.backtest.config import CryptoBacktestConfig
 from extensions.trading.crypto.backtest.engine import CryptoLiveBacktestEngine, _NullSignalEngine
-from extensions.cli.run_crypto_backtest import (
+from extensions.ext_cli.run_crypto_backtest import (
     CACHE_DIR,
     _apply_proxy_env,
     _synthetic_ohlcv,

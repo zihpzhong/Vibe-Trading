@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from extensions.trading.crypto.backtest.exchange import CryptoBacktestExchange
 from extensions.trading.crypto.live.market_scanner import MarketScanner
-from extensions.cli.run_crypto_backtest import _synthetic_ohlcv
+from extensions.ext_cli.run_crypto_backtest import _synthetic_ohlcv
 
 
 def test_backtest_exchange_indicators_match_direct_compute():
