@@ -10,8 +10,16 @@ import pytest
 
 from extensions.trading.crypto.config import DeRiskConfig
 from extensions.trading.crypto.live.position_tracker import PositionTracker
-from extensions.trading.crypto.live.tpsl_monitor import TPSLMonitor
+from extensions.trading.crypto.live.tpsl_monitor import TPSLMonitor, stale_reentry_cooldown_minutes
 from extensions.trading.crypto.live.exchange import MockExchange
+
+
+class TestStaleReentryCooldown:
+    def test_stale_reentry_cooldown_minutes(self) -> None:
+        assert stale_reentry_cooldown_minutes(15) == 60
+        assert stale_reentry_cooldown_minutes(30) == 60
+        assert stale_reentry_cooldown_minutes(60) == 60
+        assert stale_reentry_cooldown_minutes(90) == 90
 
 
 @pytest.fixture

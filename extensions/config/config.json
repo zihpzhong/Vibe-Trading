@@ -66,7 +66,7 @@
     "//max_position_pct": "单币仓位上限(占资金比例%)。此为硬上限,与 trading.position_size_pct 区别",
     "max_position_pct": 20.0,
 
-    "//signal_cooldown_minutes": "同币种重复信号冷却时间(分钟)",
+    "//signal_cooldown_minutes": "同币种重复信号冷却(分钟)。平仓基础冷却=该值；STALE延长冷却=max(该值,60)",
     "signal_cooldown_minutes": 30
   },
 
