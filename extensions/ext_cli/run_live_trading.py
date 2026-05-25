@@ -441,6 +441,7 @@ def main() -> int:
     if config.use_exchange_bracket_orders and not args.mock:
         from extensions.trading.crypto.live.exchange_brackets import (
             cancel_orphan_exchange_brackets,
+            cancel_symbol_bracket_algos,
             has_bracket_support,
             place_bracket_orders,
             sanitize_bracket_order_ids,
@@ -457,6 +458,14 @@ def main() -> int:
                     positions.set_bracket_order_ids(pos.symbol, clean_sl, clean_tp)
                     pos.sl_order_id = clean_sl
                     pos.tp_order_id = clean_tp
+                keep_ids = frozenset(x for x in (clean_sl, clean_tp) if x)
+                deduped = cancel_symbol_bracket_algos(exchange, pos.symbol, keep_ids=keep_ids)
+                if deduped:
+                    log.info(
+                        "Startup dedupe: removed %d extra bracket order(s) for %s",
+                        deduped,
+                        pos.symbol,
+                    )
                 needs_sl = bool(pos.stop_loss and pos.stop_loss > 0)
                 needs_tp = bool(pos.take_profit and pos.take_profit > 0)
                 sl_ok = not needs_sl or bool(clean_sl)
