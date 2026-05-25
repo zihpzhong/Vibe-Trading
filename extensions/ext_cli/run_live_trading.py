@@ -659,6 +659,7 @@ def main() -> int:
     interval_seconds = args.interval * 60
     cycle_count = 0
     total_orders = 0
+    logged_close_watermark = ""  # 避免每轮重复 log 同一条平仓记录 / avoid re-logging same closes each cycle
 
     console.print()
     console.print(Panel.fit(
@@ -779,10 +780,15 @@ def main() -> int:
                         f"PnL={pnl_str}USDT ({c.pnl_pct:+.2f}%) "
                         f"{c.reason}[/]"
                     )
-                    log.info(
-                        "CLOSE %s %s exit=%.4f PnL=%s USDT (%.2f%%) %s",
-                        c.symbol, c.direction, c.exit_price, pnl_str, c.pnl_pct, c.reason,
-                    )
+                    if c.closed_at > logged_close_watermark:
+                        log.info(
+                            "CLOSE %s %s exit=%.4f PnL=%s USDT (%.2f%%) %s",
+                            c.symbol, c.direction, c.exit_price, pnl_str, c.pnl_pct, c.reason,
+                        )
+                logged_close_watermark = max(
+                    logged_close_watermark,
+                    max(c.closed_at for c in closed_records),
+                )
 
             if report.rankings:
                 top = report.rankings[:5]

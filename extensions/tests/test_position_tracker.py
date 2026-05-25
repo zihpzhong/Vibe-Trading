@@ -581,3 +581,24 @@ class TestSQLite:
         assert state["trailing_stops"].get("BTCUSDT") == 76000.0
         assert state["peak_prices"].get("BTCUSDT") == 78000.0
         t2.clear()
+
+
+class TestCloseAfterMarketFill:
+    def test_partial_fill_dust_merged_into_one_close_record(self, tracker: PositionTracker) -> None:
+        tracker.open_position("INJUSDT", "LONG", 5.246, 4.616633, 4.9)
+        tracker.close_after_market_fill("INJUSDT", 4.6, 5.089, "STALE", min_qty=0.1)
+
+        assert tracker.get_position("INJUSDT") is None
+        closed = tracker.get_recent_closed(1)[0]
+        assert closed.reason == "STALE"
+        assert closed.quantity == pytest.approx(4.616633)
+        assert closed.pnl_usdt == pytest.approx((5.089 - 5.246) * 4.616633, rel=1e-4)
+
+    def test_close_position_refreshes_cooldown(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=10_000.0, persist_dir=tmp, cooldown_minutes=30)
+        t.open_position("INJUSDT", "LONG", 5.0, 1.0, 4.5)
+        assert t.is_in_cooldown("INJUSDT", "LONG") is True
+        t.close_position("INJUSDT", exit_price=5.1, reason="TP")
+        assert t.is_in_cooldown("INJUSDT", "LONG") is True
