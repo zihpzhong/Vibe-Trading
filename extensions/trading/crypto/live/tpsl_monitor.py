@@ -21,11 +21,19 @@ logger = logging.getLogger(__name__)
 
 STALE_POSITION_HOURS = 24  # 持仓超过此时长且 PnL 在 ±3% 内视为僵尸仓位
 STALE_POSITION_PNL_PCT = 3.0  # 僵尸仓位 PnL 浮动范围
-STALE_REENTRY_COOLDOWN_MINUTES = 120  # STALE 平仓后禁止同向再入场（分钟）
+STALE_REENTRY_MIN_MINUTES = 60  # STALE 延长冷却下限（分钟）/ floor for STALE extended cooldown
 DE_RISK_EXTENDED_COOLDOWN_MINUTES = 1440  # de-risk 后延长冷却 24 小时（原 4h，防止反复做空/做多同一币种）
 
 RETRY_BACKOFF = (1, 2, 4)
 MAX_RETRIES = 3
+
+
+def stale_reentry_cooldown_minutes(signal_cooldown_minutes: int) -> int:
+    """STALE 平仓后 extended cooldown = max(signal_cooldown, floor).
+
+    与 execution_gate.signal_cooldown_minutes 联动；aggressive(15) 仍至少 60 分钟。
+    """
+    return max(int(signal_cooldown_minutes), STALE_REENTRY_MIN_MINUTES)
 
 
 class TPSLMonitor(Thread):
@@ -62,6 +70,7 @@ class TPSLMonitor(Thread):
         # Configurable module-level constants
         stale_position_hours: int = 24,
         stale_position_pnl_pct: float = 3.0,
+        stale_reentry_cooldown_minutes: int = STALE_REENTRY_MIN_MINUTES,
         de_risk_extended_cooldown_minutes: int = 1440,
         max_retries: int = 3,
         retry_backoff: tuple[float, ...] = (1, 2, 4),
@@ -86,6 +95,7 @@ class TPSLMonitor(Thread):
         # Configurable module-level constants
         self._stale_position_hours = stale_position_hours
         self._stale_position_pnl_pct = stale_position_pnl_pct
+        self._stale_reentry_cooldown_minutes = stale_reentry_cooldown_minutes
         self._de_risk_extended_cooldown_minutes = de_risk_extended_cooldown_minutes
         self._max_retries = max_retries
         self._retry_backoff = retry_backoff
@@ -694,7 +704,7 @@ class TPSLMonitor(Thread):
 
                 if reason == "STALE":
                     self._positions.set_extended_cooldown(
-                        pos.symbol, pos.direction, STALE_REENTRY_COOLDOWN_MINUTES,
+                        pos.symbol, pos.direction, self._stale_reentry_cooldown_minutes,
                     )
                 elif reason == "TP" and self._on_take_profit:
                     self._on_take_profit(pos)

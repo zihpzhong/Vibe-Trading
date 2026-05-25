@@ -258,7 +258,7 @@ def main() -> int:
     from extensions.trading.crypto.live.exchange import create_exchange
     from extensions.trading.crypto.live.position_tracker import PositionTracker
     from extensions.trading.crypto.live.scheduler import TradingScheduler
-    from extensions.trading.crypto.live.tpsl_monitor import TPSLMonitor
+    from extensions.trading.crypto.live.tpsl_monitor import TPSLMonitor, stale_reentry_cooldown_minutes
     from extensions.trading.crypto.live.atr_stop import calculate_atr_stop
     from extensions.trading.crypto.live.execution_gate import ExecGateEngine
     from extensions.trading.crypto.live.phase2 import Phase2Analyzer
@@ -379,11 +379,14 @@ def main() -> int:
     _max_pos = int(_get_cfg("trading", "max_positions", DEFAULT_MAX_POSITIONS))  # type: ignore[arg-type]
     _max_dir = int(_get_cfg("trading", "max_same_direction", DEFAULT_MAX_SAME_DIRECTION))  # type: ignore[arg-type]
     _max_exp = float(_get_cfg("trading", "max_exposure_pct", 3.0))  # type: ignore[arg-type]
+    _signal_cooldown = int(config.execution_gate.signal_cooldown_minutes)
+    _stale_reentry_cd = stale_reentry_cooldown_minutes(_signal_cooldown)
     positions = PositionTracker(
         account_balance=effective_balance,
         max_positions=_max_pos,
         max_same_direction=_max_dir,
         max_exposure_pct=_max_exp,
+        cooldown_minutes=_signal_cooldown,
     )
     # 确保 _load() 不覆盖构造函数传入的交易所真实余额
     if actual_usdt_balance is not None:
@@ -427,13 +430,19 @@ def main() -> int:
         max_leverage=args.max_leverage,
         position_size_pct=args.position_size,
         use_exchange_brackets=config.use_exchange_bracket_orders and not args.mock,
+        stale_reentry_cooldown_minutes=_stale_reentry_cd,
     )
     monitor.start()
-    log.info("TPSL Monitor started (de-risk: [%.0f%%:%.0f%%, %.0f%%:%.0f%%, %.0f%%:%.0f%%], doom=%.0f%%)",
-             config.de_risk.level1_loss_pct, config.de_risk.level1_sell_fraction * 100,
-             config.de_risk.level2_loss_pct, config.de_risk.level2_sell_fraction * 100,
-             config.de_risk.level3_loss_pct, config.de_risk.level3_sell_fraction * 100,
-             config.de_risk.doom_loss_pct)
+    log.info(
+        "TPSL Monitor started (signal_cooldown=%dm, stale_reentry=%dm, de-risk: "
+        "[%.0f%%:%.0f%%, %.0f%%:%.0f%%, %.0f%%:%.0f%%], doom=%.0f%%)",
+        _signal_cooldown,
+        _stale_reentry_cd,
+        config.de_risk.level1_loss_pct, config.de_risk.level1_sell_fraction * 100,
+        config.de_risk.level2_loss_pct, config.de_risk.level2_sell_fraction * 100,
+        config.de_risk.level3_loss_pct, config.de_risk.level3_sell_fraction * 100,
+        config.de_risk.doom_loss_pct,
+    )
 
     # ---- 回溯补挂交易所止盈止损单 / Retroactive exchange bracket placement ----
     # 重启后 SQLite 恢复的持仓可能缺 sl_order_id/tp_order_id，需补挂条件单。
