@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 # 交易所仍有效的 Algo 单状态 / Algo order statuses considered active on exchange
 _ACTIVE_ALGO_STATUSES = frozenset({"NEW", "TRIGGERED"})
+# Bracket 条件单类型 / Bracket conditional order types
+_BRACKET_ORDER_TYPES = frozenset({"STOP_MARKET", "TAKE_PROFIT_MARKET"})
 
 
 def has_bracket_support(exchange: ExchangeBase) -> bool:
@@ -93,6 +95,93 @@ def sanitize_bracket_order_ids(
     return sl_id, tp_id
 
 
+def _fetch_open_bracket_algos(
+    exchange: ExchangeBase,
+    symbol: Optional[str] = None,
+) -> list[dict]:
+    """Return active STOP/TP algo orders from exchange (best-effort)."""
+    fetch = getattr(exchange, "fetch_open_algo_orders", None)
+    if not callable(fetch):
+        return []
+    try:
+        raw = fetch(symbol)
+    except Exception as exc:
+        logger.warning(
+            "fetch_open_algo_orders failed for %s: %s",
+            symbol or "*",
+            exc,
+        )
+        return []
+    if not isinstance(raw, list):
+        return []
+    result: list[dict] = []
+    for item in raw:
+        order_type = str(item.get("orderType") or item.get("type") or "").upper()
+        if order_type not in _BRACKET_ORDER_TYPES:
+            continue
+        status = str(item.get("algoStatus") or item.get("status") or "").upper()
+        if status not in _ACTIVE_ALGO_STATUSES:
+            continue
+        algo_id = str(item.get("algoId") or item.get("order_id") or "")
+        sym = str(item.get("symbol") or symbol or "")
+        if not algo_id or not sym:
+            continue
+        result.append({"algoId": algo_id, "symbol": sym, "orderType": order_type})
+    return result
+
+
+def cancel_symbol_bracket_algos(
+    exchange: ExchangeBase,
+    symbol: str,
+    *,
+    keep_ids: Optional[frozenset[str]] = None,
+    order_types: Optional[frozenset[str]] = None,
+) -> int:
+    """Cancel open SL/TP algo orders for one symbol (best-effort).
+    取消某交易对交易所上所有 SL/TP 条件单（可保留 keep_ids）。
+
+    Returns:
+        Number of orders cancelled.
+    """
+    if not hasattr(exchange, "cancel_order"):
+        return 0
+    keep = keep_ids or frozenset()
+    allowed_types = order_types or _BRACKET_ORDER_TYPES
+    cancelled = 0
+    for item in _fetch_open_bracket_algos(exchange, symbol):
+        algo_id = item["algoId"]
+        if algo_id in keep:
+            continue
+        if item["orderType"] not in allowed_types:
+            continue
+        _safe_cancel(exchange, algo_id, symbol, label=item["orderType"])
+        cancelled += 1
+    return cancelled
+
+
+def cancel_orphan_exchange_brackets(
+    exchange: ExchangeBase,
+    active_symbols: set[str],
+) -> list[tuple[str, str]]:
+    """Cancel bracket algos on symbols with no open local position.
+    清理无本地持仓交易对上的孤儿 SL/TP 条件单。
+    """
+    orphans: list[tuple[str, str]] = []
+    for item in _fetch_open_bracket_algos(exchange, None):
+        sym = item["symbol"]
+        if sym in active_symbols:
+            continue
+        _safe_cancel(exchange, item["algoId"], sym, label=item["orderType"])
+        orphans.append((sym, item["algoId"]))
+    if orphans:
+        logger.warning(
+            "Cancelled %d orphan exchange bracket order(s): %s",
+            len(orphans),
+            ", ".join(f"{s}:{oid}" for s, oid in orphans),
+        )
+    return orphans
+
+
 def place_bracket_orders(
     exchange: ExchangeBase,
     pos: Position,
@@ -108,6 +197,18 @@ def place_bracket_orders(
     sl_id: Optional[str] = pos.sl_order_id
     tp_id: Optional[str] = pos.tp_order_id
     placed_sl_this_call: Optional[str] = None
+
+    need_sl = not sl_id and bool(pos.stop_loss and pos.stop_loss > 0)
+    need_tp = not tp_id and bool(pos.take_profit and pos.take_profit > 0)
+    if need_sl or need_tp:
+        keep = frozenset(x for x in (sl_id, tp_id) if x)
+        removed = cancel_symbol_bracket_algos(exchange, pos.symbol, keep_ids=keep)
+        if removed:
+            logger.info(
+                "Removed %d stale bracket algo order(s) for %s before placement",
+                removed,
+                pos.symbol,
+            )
 
     if not sl_id and pos.stop_loss and pos.stop_loss > 0:
         try:
@@ -149,19 +250,38 @@ def cancel_bracket_orders(
     sl: bool = True,
     tp: bool = True,
 ) -> None:
-    """Cancel open exchange SL/TP orders for a position (best-effort)."""
+    """Cancel open exchange SL/TP orders for a position (best-effort).
+    撤销 DB 记录及交易所上同 symbol 的全部 bracket 条件单（可只撤 SL 或 TP）。
+    """
     if not hasattr(exchange, "cancel_order"):
         return
-    if sl and pos.sl_order_id:
-        _safe_cancel(exchange, pos.sl_order_id, pos.symbol, label="SL")
-    if tp and pos.tp_order_id:
-        _safe_cancel(exchange, pos.tp_order_id, pos.symbol, label="TP")
+    keep: set[str] = set()
+    if not sl and pos.sl_order_id:
+        keep.add(str(pos.sl_order_id))
+    if not tp and pos.tp_order_id:
+        keep.add(str(pos.tp_order_id))
+    allowed_types: frozenset[str] = _BRACKET_ORDER_TYPES
+    if not sl and tp:
+        allowed_types = frozenset({"TAKE_PROFIT_MARKET"})
+    elif sl and not tp:
+        allowed_types = frozenset({"STOP_MARKET"})
+    cancel_symbol_bracket_algos(
+        exchange,
+        pos.symbol,
+        keep_ids=frozenset(keep),
+        order_types=allowed_types,
+    )
 
 
 def cancel_exchange_sl_order(exchange: ExchangeBase, pos: Position) -> None:
     """Cancel only the exchange stop-loss order (e.g. before trailing software SL)."""
-    if pos.sl_order_id:
-        _safe_cancel(exchange, pos.sl_order_id, pos.symbol, label="SL")
+    keep = frozenset({str(pos.tp_order_id)}) if pos.tp_order_id else frozenset()
+    cancel_symbol_bracket_algos(
+        exchange,
+        pos.symbol,
+        keep_ids=keep,
+        order_types=frozenset({"STOP_MARKET"}),
+    )
 
 
 def _safe_cancel(

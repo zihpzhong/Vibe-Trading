@@ -51,6 +51,14 @@ def reconcile_positions(
             pos = tracker._positions.get(sym)
             if not pos:
                 continue
+            if exchange:
+                try:
+                    from .exchange_brackets import cancel_bracket_orders, has_bracket_support
+
+                    if has_bracket_support(exchange):
+                        cancel_bracket_orders(exchange, pos)
+                except Exception:
+                    logger.exception("Failed to cancel exchange brackets for %s on reconcile remove", sym)
             mark = price_lookup(sym) if price_lookup else None
             exit_price = mark if mark and mark > 0 else pos.entry_price
             tracker.close_position(sym, exit_price=exit_price, reason="RECONCILE_GONE")
@@ -116,6 +124,9 @@ def _place_adopted_brackets(
             pos = tracker.get_position(sym)
             if not pos or (pos.stop_loss is None or pos.stop_loss <= 0):
                 continue
+            from .exchange_brackets import cancel_symbol_bracket_algos
+
+            cancel_symbol_bracket_algos(exchange, sym)
             sl_id, tp_id = place_bracket_orders(exchange, pos)
             tracker.set_bracket_order_ids(sym, sl_id, tp_id)
     except Exception:

@@ -48,8 +48,12 @@ def test_cancel_bracket_orders() -> None:
         sl_order_id="111",
         tp_order_id="222",
     )
+    ex._open_algo_orders = [
+        {"algoId": "111", "symbol": "ETHUSDT", "orderType": "STOP_MARKET", "algoStatus": "NEW"},
+        {"algoId": "222", "symbol": "ETHUSDT", "orderType": "TAKE_PROFIT_MARKET", "algoStatus": "NEW"},
+    ]
     cancel_bracket_orders(ex, pos)
-    assert ex.cancel_order.call_count == 2 if hasattr(ex.cancel_order, "call_count") else True
+    assert ex.fetch_open_algo_orders("ETHUSDT") == []
 
 
 def test_has_bracket_support() -> None:
