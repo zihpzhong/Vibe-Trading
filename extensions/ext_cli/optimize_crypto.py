@@ -37,7 +37,41 @@ from extensions.ext_cli.run_crypto_backtest import (
     normalize_symbol,
 )
 
-RESULTS_FILE = CACHE_DIR / "optimization_results.csv"
+RESULTS_FILE = CACHE_DIR / "optimization_results_long.csv"
+RESULTS_LEGACY = CACHE_DIR / "optimization_results.csv"
+_active_results: Path = RESULTS_FILE
+
+
+def _set_results_path(path: Path) -> None:
+    """切换结果 CSV 路径（并行 worker 各写各的文件）。
+    Switch results CSV path (one file per parallel worker).
+    """
+    global _active_results
+    _active_results = path
+
+
+def merge_result_csvs(out: Path | None = None) -> int:
+    """合并 parallel sweep 产物 CSV。
+    Merge per-worker CSV shards from parallel sweeps.
+    """
+    pattern = "optimization_results_*.csv"
+    shards = sorted(CACHE_DIR.glob(pattern))
+    shards = [p for p in shards if p.name != (out or RESULTS_FILE).name]
+    if not shards:
+        print(f"No shard files matching {CACHE_DIR}/{pattern}")
+        return 1
+    frames = [pd.read_csv(p) for p in shards]
+    merged = pd.concat(frames, ignore_index=True)
+    dest = out or RESULTS_FILE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(dest, index=False)
+    print(f"Merged {len(shards)} files → {dest} ({len(merged)} rows)")
+    return 0
+
+# Phase B+ 推荐组合 / Recommended combo presets for validation
+COMBO_PRESETS: dict[tuple[str, ...], dict[str, Any]] = {
+    ("reward_risk", "stale_pnl_pct"): {"stale_pnl_pct": 2.5, "reward_risk_ratio": 2.0},
+}
 
 SWEEPS = {
     "position_size_pct": {
@@ -64,6 +98,18 @@ SWEEPS = {
         "param": "scan_every_n_bars",
         "values": [1, 4, 12, 24],
     },
+    "stale_hours": {
+        "param": "stale_hours",
+        "values": [16, 18, 20, 24],
+    },
+    "stale_pnl_pct": {
+        "param": "stale_pnl_pct",
+        "values": [2.0, 2.5, 3.0],
+    },
+    "max_positions": {
+        "param": "max_positions",
+        "values": [3, 4, 5],
+    },
 }
 
 QUICK_GRID = {
@@ -78,17 +124,17 @@ def _param_key(params: dict[str, Any]) -> str:
 
 
 def _load_cache() -> list[dict[str, Any]]:
-    if not RESULTS_FILE.exists():
+    if not _active_results.exists():
         return []
-    return pd.read_csv(RESULTS_FILE).to_dict("records")
+    return pd.read_csv(_active_results).to_dict("records")
 
 
 def _save_results(rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    header = not RESULTS_FILE.exists()
-    with open(RESULTS_FILE, "a", newline="") as f:
+    _active_results.parent.mkdir(parents=True, exist_ok=True)
+    header = not _active_results.exists()
+    with open(_active_results, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         if header:
             w.writeheader()
@@ -181,19 +227,81 @@ def run_grid(
     _save_results(rows)
 
 
+def run_combo(
+    names: list[str],
+    data_map: dict[str, pd.DataFrame],
+    base: dict[str, Any],
+) -> None:
+    """Run a fixed multi-param combo backtest (Phase B+).
+    运行多参数组合回测（Phase B+ 验证）。
+    """
+    key = tuple(sorted(names))
+    overrides: dict[str, Any] = {}
+    for name in names:
+        spec = SWEEPS.get(name)
+        if not spec:
+            print(f"Unknown sweep for combo: {name}. Available: {', '.join(SWEEPS)}")
+            return
+        param = spec["param"]
+        preset = COMBO_PRESETS.get(key, {}).get(param)
+        if preset is None:
+            # 默认取候选中间值 / default to middle candidate value
+            vals = spec["values"]
+            preset = vals[len(vals) // 2]
+        overrides[param] = preset
+
+    print(f"\nCombo backtest: {overrides}")
+    t0 = time.time()
+    m = run_single(overrides, data_map, base)
+    row = {"combo": "+".join(names), **overrides, **m}
+    print(
+        f"  ret={m['total_return']:+.2%} sharpe={m['sharpe']:.2f} "
+        f"dd={m['max_drawdown']:.2%} trades={m['trade_count']} ({time.time() - t0:.1f}s)"
+    )
+    _save_results([row])
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--start", default="2024-01-01")
-    p.add_argument("--end", default="2024-04-01")
+    p.add_argument("--end", default="2026-05-01")
     p.add_argument("--synthetic", action="store_true")
     p.add_argument("--top50", action="store_true", help="Use Top50 whitelist")
-    p.add_argument("--max-symbols", type=int, default=0, help="Top50 cap (0 = full whitelist)")
+    p.add_argument("--max-symbols", type=int, default=20, help="Top50 cap (0 = full whitelist)")
     p.add_argument("--proxy", default=None, help="HTTP proxy for CCXT (e.g. 7897)")
     p.add_argument("--codes", nargs="*", default=None)
     p.add_argument("--sweep", default=None)
     p.add_argument("--grid", choices=["quick"], default=None)
+    p.add_argument(
+        "--combo",
+        nargs="+",
+        metavar="SWEEP",
+        help="Phase B+ combo backtest (e.g. --combo stale_pnl_pct reward_risk)",
+    )
     p.add_argument("--scan-every", type=int, default=12, help="Default scan_every_n_bars for runs")
+    p.add_argument(
+        "--initial-cash",
+        type=float,
+        default=1000.0,
+        help="Starting equity (must allow score 5–6 notional ≥ min_notional 20)",
+    )
+    p.add_argument(
+        "--results-file",
+        default=None,
+        help="Per-worker results CSV (parallel sweeps); default optimization_results_long.csv",
+    )
+    p.add_argument(
+        "--merge-results",
+        action="store_true",
+        help="Merge optimization_results_*.csv shards into optimization_results_long.csv",
+    )
     args = p.parse_args()
+
+    if args.merge_results:
+        return merge_result_csvs()
+
+    if args.results_file:
+        _set_results_path(Path(args.results_file))
 
     _apply_proxy_env(args.proxy or os.environ.get("CCXT_PROXY") or os.environ.get("CCXT_PROXY_PORT"))
 
@@ -221,14 +329,18 @@ def main() -> int:
         start=args.start,
         end=args.end,
         interval="1h",
-        initial_cash=1000.0,
+        initial_cash=args.initial_cash,
         no_whitelist=not args.top50,
+        replay_phase2=False,
+        replay_swarm=False,
     )
     base = build_config(ns, codes_list)
     base["scan_every_n_bars"] = args.scan_every
 
     cache = _load_cache()
-    if args.sweep:
+    if args.combo:
+        run_combo(args.combo, data_map, base)
+    elif args.sweep:
         run_sweep(args.sweep, data_map, base, cache)
     elif args.grid == "quick":
         run_grid(QUICK_GRID, data_map, base)

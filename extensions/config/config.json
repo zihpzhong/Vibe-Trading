@@ -165,8 +165,8 @@
     "//stale_position_hours": "持仓超此时长且 PnL 在 ±stale_position_pnl_pct 内→自动平仓",
     "stale_position_hours": 24,
 
-    "//stale_position_pnl_pct": "僵尸仓位判定 PnL 浮动范围(%)",
-    "stale_position_pnl_pct": 3.0,
+    "//stale_position_pnl_pct": "僵尸仓位判定 PnL 浮动范围(%)。回测 sweep 2026-05-25: 2.5 优于 3.0",
+    "stale_position_pnl_pct": 2.5,
 
     "//de_risk_extended_cooldown_minutes": "DE-RISK/DOOM 后同币种冷却时间(分钟)。1440=24小时",
     "de_risk_extended_cooldown_minutes": 1440,
@@ -185,6 +185,18 @@
 
     "//max_retries": "最大重试次数",
     "max_retries": 3
+  },
+
+  "profiles": {
+    "//_说明": "分档预设（文档化；加载器未实现前请手动同步到上方各段）",
+    "low_volatility": {
+      "min_entry_score": 5,
+      "vol_ratio_high_score_threshold": 1.2,
+      "reward_risk_ratio": 1.5,
+      "stale_position_hours": 18,
+      "stale_position_pnl_pct": 2.5,
+      "trailing_activation_pct": 2.5
+    }
   },
 
   "market_scanner": {

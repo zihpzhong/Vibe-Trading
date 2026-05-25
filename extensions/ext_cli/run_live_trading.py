@@ -810,6 +810,30 @@ def main() -> int:
                         f"RSI_1h={r.get('rsi_1h',50):.1f} "
                         f"24h={r.get('change_24h',0):+.1f}%"
                     )
+            elif report.watchlist:
+                top_w = sorted(
+                    report.watchlist,
+                    key=lambda x: (x.get("score", 0), x.get("rsi_extremity", 0)),
+                    reverse=True,
+                )[:3]
+                console.print("[dim]Watchlist TOP3 (score 3-4, 未达开仓线):[/dim]")
+                parts = [
+                    f"{r.get('symbol','')} {r.get('direction','')} score={r.get('score',0)}"
+                    for r in top_w
+                ]
+                log.info("Phase1 watchlist top3: %s", "; ".join(parts))
+                for r in top_w:
+                    console.print(
+                        f"  {r.get('symbol',''):12s} "
+                        f"score={r.get('score',0):2d} "
+                        f"{r.get('direction','LONG'):5s} "
+                        f"RSI_1h={r.get('rsi_1h',50):.1f}"
+                    )
+            else:
+                log.info(
+                    "Phase1: rankings=0 watchlist=0 (filtered=%s)",
+                    getattr(report, "filtered_count", "?"),
+                )
 
             # ================================================================
             # STEP 2: 自动交易 — 对每个 Phase2Request 执行 Gate → 开仓

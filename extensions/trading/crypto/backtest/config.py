@@ -20,7 +20,7 @@ from extensions.trading.crypto.config import (
 class CryptoBacktestConfig:
     """Backtest-specific settings for CryptoLiveBacktestEngine."""
 
-    initial_cash: float = 50.0
+    initial_cash: float = 1000.0
     leverage: int = 5
     max_leverage: int = 5
     position_size_pct: float = 0.12

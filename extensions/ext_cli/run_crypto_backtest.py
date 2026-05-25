@@ -38,7 +38,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end", default="2024-06-01")
     p.add_argument("--interval", default="1h", choices=["1h", "4h", "1D"])
     p.add_argument("--codes", nargs="*", default=None, help="Symbols e.g. BTCUSDT ETHUSDT")
-    p.add_argument("--initial-cash", type=float, default=50.0)
+    # 1000 USDT：score 5–6 半杠杆名义 ≥20，与 min_notional 及单测一致
+    # 1000 USDT: half-leverage score 5–6 notional ≥20, matches min_notional & unit tests
+    p.add_argument("--initial-cash", type=float, default=1000.0)
     p.add_argument("--fetch-only", action="store_true")
     p.add_argument("--synthetic", action="store_true", help="Use synthetic OHLCV (no network)")
     p.add_argument("--no-whitelist", action="store_true", help="Set enforce_whitelist=false in config")
@@ -51,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-symbols",
         type=int,
-        default=8,
+        default=20,
         help="Cap universe when using --top50 (0 = all whitelist symbols)",
     )
     p.add_argument(

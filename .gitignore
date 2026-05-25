@@ -42,8 +42,12 @@ data/.duckdb_tmp/
 data/parquet/
 data/backup/
 
-# Internal docs (plans, specs)
-docs/
+# Internal docs (plans, specs) — docs/* 保留目录以便 ! 例外生效 / keep dir for negation rules
+docs/*
+!docs/auto-trading-plan.md
+!docs/extension-guide.md
+!docs/project-overview.md
+!docs/crypto-live-optimization-plan.md
 !wiki/docs/
 !wiki/docs/**
 docs/screenshots/agent-run.png
