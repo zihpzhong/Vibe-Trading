@@ -440,12 +440,15 @@ def main() -> int:
     # After restart, restored positions may lack sl_order_id/tp_order_id; place missing brackets.
     if config.use_exchange_bracket_orders and not args.mock:
         from extensions.trading.crypto.live.exchange_brackets import (
+            cancel_orphan_exchange_brackets,
             has_bracket_support,
             place_bracket_orders,
             sanitize_bracket_order_ids,
         )
 
         if has_bracket_support(exchange):
+            active_syms = {p.symbol for p in positions.get_active_positions()}
+            cancel_orphan_exchange_brackets(exchange, active_syms)
             for pos in positions.get_active_positions():
                 if pos.stop_loss is None or pos.stop_loss <= 0:
                     continue

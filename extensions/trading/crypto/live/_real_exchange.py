@@ -643,6 +643,27 @@ class RealExchange(ExchangeBase):
                 "order_type": raw.get("orderType"),
             }
 
+    def fetch_open_algo_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+        """List open algo conditional orders (futures)."""
+        with self._lock:
+            self._require_auth("fetch_open_algo_orders")
+            params: dict[str, Any] = {}
+            if symbol:
+                params["symbol"] = symbol
+            resp = self._signed_request(
+                f"{self._fapi_url()}/fapi/v1",
+                "/openAlgoOrders",
+                params,
+            )
+            if not resp.ok:
+                raise RuntimeError(
+                    f"fetch_open_algo_orders failed ({resp.status_code}): {resp.text}",
+                )
+            raw = resp.json()
+            if not isinstance(raw, list):
+                return []
+            return raw
+
     def fetch_order(self, order_id: str, symbol: str) -> dict:
         """Query order status via direct HTTP GET."""
         with self._lock:

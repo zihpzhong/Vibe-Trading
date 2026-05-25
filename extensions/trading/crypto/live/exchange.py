@@ -135,6 +135,8 @@ class MockExchange(ExchangeBase):
     def __init__(self, seed_price: Optional[float] = None) -> None:
         self._seed_price = seed_price
         self._base_time = datetime.now()
+        self._open_algo_orders: list[dict[str, Any]] = []
+        self._algo_seq = 0
 
     def get_kline(self, symbol: str = "BTCUSDT", timeframe: str = "1h", limit: int = 50) -> pd.DataFrame:
         base_price = self._seed_price or self.BASE_PRICES.get(symbol, 100.0)
@@ -210,23 +212,53 @@ class MockExchange(ExchangeBase):
         }
 
     def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
+        self._algo_seq += 1
+        order_id = f"mock_sl_{self._algo_seq}"
+        self._open_algo_orders.append({
+            "algoId": order_id,
+            "symbol": symbol,
+            "orderType": "STOP_MARKET",
+            "algoStatus": "NEW",
+        })
         return {
-            "order_id": f"mock_sl_{random.randint(1000, 9999)}",
+            "order_id": order_id,
             "symbol": symbol, "side": side, "type": "STOP_MARKET",
             "amount": amount, "stop_price": stop_price,
             "filled": 0, "status": "NEW",
         }
 
     def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
+        self._algo_seq += 1
+        order_id = f"mock_tp_{self._algo_seq}"
+        self._open_algo_orders.append({
+            "algoId": order_id,
+            "symbol": symbol,
+            "orderType": "TAKE_PROFIT_MARKET",
+            "algoStatus": "NEW",
+        })
         return {
-            "order_id": f"mock_tp_{random.randint(1000, 9999)}",
+            "order_id": order_id,
             "symbol": symbol, "side": side, "type": "TAKE_PROFIT_MARKET",
             "amount": amount, "tp_price": tp_price,
             "filled": 0, "status": "NEW",
         }
 
     def cancel_order(self, order_id: str, symbol: str) -> dict:
+        self._open_algo_orders = [
+            o for o in self._open_algo_orders if str(o.get("algoId")) != str(order_id)
+        ]
         return {"order_id": order_id, "status": "CANCELED"}
+
+    def fetch_open_algo_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+        if symbol:
+            return [o for o in self._open_algo_orders if o.get("symbol") == symbol]
+        return list(self._open_algo_orders)
+
+    def fetch_algo_order(self, algo_id: str) -> dict[str, Any]:
+        for item in self._open_algo_orders:
+            if str(item.get("algoId")) == str(algo_id):
+                return {"status": item.get("algoStatus", "NEW")}
+        return {"status": "CANCELED"}
 
     def fetch_order(self, order_id: str, symbol: str) -> dict:
         return {"order_id": order_id, "status": "FILLED", "filled": 0}
