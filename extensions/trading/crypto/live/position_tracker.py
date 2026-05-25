@@ -330,10 +330,64 @@ class PositionTracker:
 
                 self._persist()
                 self._record_equity_snapshot_unlocked()
+                # 平仓后刷新冷却，防止刚平又开 / Refresh cooldown on close to block immediate re-entry
+                key = f"{symbol}:{pos.direction}"
+                self._cooldowns[key] = time.time()
                 logger.info(
                     "Position closed: %s %s %s PnL=%.2fUSDT (%.2f%%)",
                     symbol, pos.direction, reason, pnl_usdt, pnl_pct,
                 )
+            return pos
+
+    def close_after_market_fill(
+        self,
+        symbol: str,
+        filled: float,
+        exit_price: float,
+        reason: str,
+        *,
+        min_qty: float = 0.0,
+    ) -> Optional[Position]:
+        """Apply a reduce-only market fill when closing (handles partial fill + dust).
+
+        部分成交时合并为一笔平仓记录；剩余 dust 低于 min_qty 时按全仓记账。
+        Records one close when dust remains below exchange min_qty after partial fill.
+        """
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if not pos:
+                return None
+            if filled <= 0:
+                return self.close_position(symbol, exit_price=exit_price, reason=reason)
+
+            remaining = pos.quantity - filled
+            if remaining <= 0 or (min_qty > 0 and 0 < remaining < min_qty):
+                close_qty = pos.quantity
+                popped = self._positions.pop(symbol, None)
+                if not popped:
+                    return None
+                pnl_usdt, pnl_pct = self._calculate_pnl_unlocked(popped, exit_price, close_qty)
+                self._append_close_record_unlocked(
+                    popped, exit_price, close_qty, pnl_usdt, pnl_pct, reason,
+                )
+                self._persist()
+                self._record_equity_snapshot_unlocked()
+                key = f"{symbol}:{popped.direction}"
+                self._cooldowns[key] = time.time()
+                logger.info(
+                    "Position closed: %s %s %s PnL=%.2fUSDT (%.2f%%) qty=%.4f",
+                    symbol, popped.direction, reason, pnl_usdt, pnl_pct, close_qty,
+                )
+                return popped
+
+            pnl_usdt, pnl_pct = self._calculate_pnl_unlocked(pos, exit_price, filled)
+            self._append_close_record_unlocked(pos, exit_price, filled, pnl_usdt, pnl_pct, reason)
+            pos.quantity -= filled
+            self._persist()
+            logger.info(
+                "Position reduced: %s -%.4f @ %.4f, remaining qty=%.4f (%s)",
+                symbol, filled, exit_price, pos.quantity, reason,
+            )
             return pos
 
     def _calculate_pnl_unlocked(

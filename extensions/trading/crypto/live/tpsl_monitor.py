@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 STALE_POSITION_HOURS = 24  # 持仓超过此时长且 PnL 在 ±3% 内视为僵尸仓位
 STALE_POSITION_PNL_PCT = 3.0  # 僵尸仓位 PnL 浮动范围
+STALE_REENTRY_COOLDOWN_MINUTES = 120  # STALE 平仓后禁止同向再入场（分钟）
 DE_RISK_EXTENDED_COOLDOWN_MINUTES = 1440  # de-risk 后延长冷却 24 小时（原 4h，防止反复做空/做多同一币种）
 
 RETRY_BACKOFF = (1, 2, 4)
@@ -677,24 +678,25 @@ class TPSLMonitor(Thread):
                                     pos.symbol, de_risk_level, remaining, price,
                                 )
                 else:
-                    # Full close (TP, SL, DOOM, partial fill cleanup)
+                    # Full close (TP, SL, DOOM, STALE, partial fill cleanup)
                     if filled < qty:
-                        remaining = qty - filled
                         logger.warning(
                             "%s partial fill for %s: filled=%.4f of %.4f",
                             reason, pos.symbol, filled, qty,
                         )
-                        self._positions.reduce_position(pos.symbol, filled or qty, price)
-                        min_qty = self._exchange.get_min_qty(pos.symbol)
-                        if min_qty > 0 and remaining < min_qty:
-                            self._positions.close_position(pos.symbol, exit_price=price, reason=reason)
-                    else:
-                        self._positions.close_position(pos.symbol, exit_price=price, reason=reason)
+                    min_qty = self._exchange.get_min_qty(pos.symbol)
+                    self._positions.close_after_market_fill(
+                        pos.symbol, filled or 0, price, reason, min_qty=min_qty,
+                    )
 
                 self._trailing_stops.pop(pos.symbol, None)
                 self._peak_prices.pop(pos.symbol, None)
 
-                if reason == "TP" and self._on_take_profit:
+                if reason == "STALE":
+                    self._positions.set_extended_cooldown(
+                        pos.symbol, pos.direction, STALE_REENTRY_COOLDOWN_MINUTES,
+                    )
+                elif reason == "TP" and self._on_take_profit:
                     self._on_take_profit(pos)
                 elif reason in ("SL", "DOOM") and self._on_stop_loss:
                     self._on_stop_loss(pos)
@@ -792,21 +794,14 @@ class TPSLMonitor(Thread):
                 order = self._exchange.create_market_order(pos.symbol, side, pos.quantity, reduce_only=True)
                 filled = order.get("filled", 0) or 0
                 if filled < pos.quantity:
-                    remaining = pos.quantity - filled
                     logger.warning(
                         "TP partial fill for %s: filled=%.4f of %.4f, remaining=%.4f",
-                        pos.symbol, filled, pos.quantity, remaining,
+                        pos.symbol, filled, pos.quantity, pos.quantity - filled,
                     )
-                    self._positions.reduce_position(pos.symbol, filled or pos.quantity, price)
-                    min_qty = self._exchange.get_min_qty(pos.symbol)
-                    if min_qty > 0 and remaining < min_qty:
-                        self._positions.close_position(pos.symbol, exit_price=price, reason="TP")
-                        logger.info(
-                            "TP dust cleanup: %s remaining=%.6f below minQty=%.6f, closed in tracker",
-                            pos.symbol, remaining, min_qty,
-                        )
-                else:
-                    self._positions.close_position(pos.symbol, exit_price=price, reason="TP")
+                min_qty = self._exchange.get_min_qty(pos.symbol)
+                self._positions.close_after_market_fill(
+                    pos.symbol, filled or 0, price, "TP", min_qty=min_qty,
+                )
                 self._trailing_stops.pop(pos.symbol, None)
                 self._peak_prices.pop(pos.symbol, None)
                 if self._on_take_profit:
@@ -849,21 +844,14 @@ class TPSLMonitor(Thread):
                 order = self._exchange.create_market_order(pos.symbol, side, pos.quantity, reduce_only=True)
                 filled = order.get("filled", 0) or 0
                 if filled < pos.quantity:
-                    remaining = pos.quantity - filled
                     logger.warning(
                         "SL partial fill for %s: filled=%.4f of %.4f, remaining=%.4f",
-                        pos.symbol, filled, pos.quantity, remaining,
+                        pos.symbol, filled, pos.quantity, pos.quantity - filled,
                     )
-                    self._positions.reduce_position(pos.symbol, filled or pos.quantity, price)
-                    min_qty = self._exchange.get_min_qty(pos.symbol)
-                    if min_qty > 0 and remaining < min_qty:
-                        self._positions.close_position(pos.symbol, exit_price=price, reason="SL")
-                        logger.info(
-                            "SL dust cleanup: %s remaining=%.6f below minQty=%.6f, closed in tracker",
-                            pos.symbol, remaining, min_qty,
-                        )
-                else:
-                    self._positions.close_position(pos.symbol, exit_price=price, reason="SL")
+                min_qty = self._exchange.get_min_qty(pos.symbol)
+                self._positions.close_after_market_fill(
+                    pos.symbol, filled or 0, price, "SL", min_qty=min_qty,
+                )
                 self._trailing_stops.pop(pos.symbol, None)
                 self._peak_prices.pop(pos.symbol, None)
                 if self._on_stop_loss:
