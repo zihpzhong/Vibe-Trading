@@ -46,10 +46,11 @@ def has_bracket_support(exchange: ExchangeBase) -> bool:
             return False
         except Exception:
             logger.warning(
-                "Exchange %s %s probe failed (bracket support assumed):",
+                "Exchange %s %s probe failed:",
                 type(exchange).__name__, method_name,
                 exc_info=True,
             )
+            return False
     logger.info(
         "Exchange %s supports bracket orders",
         type(exchange).__name__,
@@ -143,8 +144,8 @@ def cancel_symbol_bracket_algos(
     Returns:
         Number of orders cancelled.
     """
-    if not hasattr(exchange, "cancel_order"):
-        return 0
+    # hasattr 对继承自 ExchangeBase 的 NotImplementedError stub 也返回 True，跳过检查
+    # hasattr always True for ExchangeBase stubs; rely on _safe_cancel instead
     keep = keep_ids or frozenset()
     allowed_types = order_types or _BRACKET_ORDER_TYPES
     cancelled = 0

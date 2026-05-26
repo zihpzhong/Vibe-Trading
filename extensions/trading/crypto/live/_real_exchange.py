@@ -369,7 +369,7 @@ class RealExchange(ExchangeBase):
             hashlib.sha256,
         ).hexdigest()
         query_string += f"&signature={signature}"
-        resp = requests.post(
+        resp = self._session.post(
             url,
             data=query_string,
             headers={"X-MBX-APIKEY": self._ccxt.apiKey},
@@ -477,9 +477,9 @@ class RealExchange(ExchangeBase):
         query_string += f"&signature={signature}"
         headers = {"X-MBX-APIKEY": self._ccxt.apiKey}
         if method == "DELETE":
-            resp = requests.delete(f"{url}?{query_string}", headers=headers, timeout=10)
+            resp = self._session.delete(f"{url}?{query_string}", headers=headers, timeout=10)
         else:
-            resp = requests.post(url, data=query_string, headers=headers, timeout=10)
+            resp = self._session.post(url, data=query_string, headers=headers, timeout=10)
         if resp.status_code == 401:
             raise RuntimeError(f"Algo {op} auth failed: {resp.text}")
         if not resp.ok:
@@ -909,7 +909,7 @@ class RealExchange(ExchangeBase):
             hashlib.sha256,
         ).hexdigest()
         query_string += f"&signature={signature}"
-        resp = requests.post(
+        resp = self._session.post(
             url,
             data=query_string,
             headers={"X-MBX-APIKEY": self._ccxt.apiKey},

@@ -81,7 +81,7 @@ class Position:
             entry_price=float(d["entry_price"]),
             quantity=float(d["quantity"]),
             stop_loss=float(d.get("stop_loss", 0)),
-            take_profit=float(d["take_profit"]) if d.get("take_profit") else None,
+            take_profit=float(d["take_profit"]) if d.get("take_profit") is not None else None,
             opened_at=d.get("opened_at", ""),
             dca_count=int(d.get("dca_count", 0)),
             leverage=int(d.get("leverage", 1)),
@@ -771,7 +771,13 @@ class PositionTracker:
                         f"同向仓位已达上限 ({same_dir}/{self._max_same_direction} {dir_upper})"
                     )
             current_exp = self._get_exposure_unlocked()
-            post_exp = current_exp + (additional_notional / self._account_balance) if additional_notional > 0 else current_exp
+            if additional_notional > 0:
+                if self._account_balance > 0:
+                    post_exp = current_exp + (additional_notional / self._account_balance)
+                else:
+                    post_exp = float("inf")
+            else:
+                post_exp = current_exp
             if post_exp >= self._max_exposure_pct - 1e-9:
                 if additional_notional > 0:
                     return False, (

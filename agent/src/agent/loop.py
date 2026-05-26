@@ -310,6 +310,14 @@ class AgentLoop:
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
 
+    def set_session_service(self, service: Any) -> None:
+        """Allow SessionService to inject itself for goal continuation persistence.
+
+        Args:
+            service: SessionService instance with append_message method.
+        """
+        self._session_service = service
+
     def cancel(self) -> None:
         """Cancel the current loop.
 
@@ -323,7 +331,7 @@ class AgentLoop:
         Args:
             user_message: User message.
             history: Prior conversation messages.
-            session_id: Session ID.
+            session_id: Session ID (enables goal continuation persistence).
 
         Returns:
             Execution result dict.
@@ -332,6 +340,9 @@ class AgentLoop:
         self._cancelled = False
         self._called_ok = set()
         self._previous_summary = ""
+        # Store session_id for goal continuation persistence
+        self._session_id = session_id
+        self._session_service: Any = None  # Set by SessionService via setter if available
 
         state_store = RunStateStore()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -514,6 +525,22 @@ class AgentLoop:
                             )
                             goal_last_progress = current_progress
                             goal_continuations += 1
+                            # 持久化 goal 续写消息，防止会话恢复时丢失上下文
+                            if self._session_service and self._session_id:
+                                try:
+                                    self._session_service.append_message(
+                                        self._session_id, "assistant", final_content
+                                    )
+                                    self._session_service.append_message(
+                                        self._session_id,
+                                        "user",
+                                        format_goal_continuation_prompt(
+                                            continuation_snapshot,
+                                            previous_answer=final_content,
+                                        ),
+                                    )
+                                except Exception:
+                                    pass  # 静默失败，不阻塞交易
                             continue
 
                     trace.write({"type": "answer", "iter": iteration, "content": final_content[:2000]})

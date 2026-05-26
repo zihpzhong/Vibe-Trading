@@ -117,7 +117,8 @@ def _retry_ccxt(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
                     op_name, attempt + 1, _MAX_RETRIES, delay, exc,
                 )
                 time.sleep(delay)
-        except ccxt.RateLimitExceeded:
+        except ccxt.RateLimitExceeded as exc:
+            last_err = exc
             time.sleep(2)
             continue
         except Exception as exc:
