@@ -349,7 +349,7 @@ python3 extensions/ext_cli/analyze_phaseb_long.py
 | `tpsl_monitor.stale_position_hours` | 24 | **16** | **待部署** | — | — | Phase B fine 胜者 |
 | watchlist Top3 日志 | 无 | 有 | 2026-05-25 | — | — | 已部署 |
 
-**部署状态**：✅ 已 push origin dev (commit `488bf2c`)，108 已重建运行。
+**部署状态**：✅ 已 push origin dev (commit `47e3289`)；108 需执行下方 SSH 重建 live-trading。
 
 **108 部署指令**（SSH 执行）：
 
@@ -451,5 +451,6 @@ git push origin dev
 | 2026-05-26 | ext+docs | 6 agent 并行粗扫完成（10 sym）；fine phase 全 A3 运行中；§7.2 结果表+结论更新 | |
 | 2026-05-26 | fix | 发现 fine phase 键名 bug，修复 `run_phaseb_fast.py` + `_run_fine_single.py`，重新跑 fine | |
 | 2026-05-26 | docs+data | Phase B done；`analyze_phaseb_long.py` 合并 CSV（20 行 long）；coarse 去重；§六/§7.2/§7.4 状态更新 | |
-| 2026-05-26 | feat+config | Fine 完成：rr=1.5, mp=3, sp=2.5, sh=16（Sharpe 0.36, dd -17.5%）。更新 config.json，commit 488bf2c，push origin dev | 488bf2c |
+| 2026-05-26 | feat+config | Fine 完成：rr=1.5, mp=3, sp=2.5, sh=16（Sharpe 0.36, dd -17.5%）。更新 config.json，push origin dev | 488bf2c |
+| 2026-05-26 | ext+docs | Phase B CSV 合并脚本、optimize 增量落盘；rebase upstream/main；push dev | 47e3289 |
 
