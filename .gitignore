@@ -96,4 +96,4 @@ trading.db
 claudedocs/
 .deepseek/
 .cursor/
-.codegraph/
+.codegraph/uv.lock
