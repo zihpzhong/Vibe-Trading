@@ -121,10 +121,10 @@ flowchart TB
 |------|------|--------|------|
 | 文档建立 | done | 2026-05-25 | v1.0 |
 | A 基线回测 | done | 2026-05-25 | A3-syn-long 1636 笔，见 §7.1 |
-| B 参数扫描 | in_progress | | 长周期重扫中，见 §7.2 |
+| B 参数扫描 | coarse_done, fine_in_progress | 2026-05-26 | 6 agent 并行粗扫完成（10 sym）；精验 `run_phaseb_fast.py --fine-only` 全 A3 运行中；见 §7.2 |
 | C Phase2 反事实 | blocked | | 无 replay JSONL，见 §7.3 |
 | D 配置/可观测 | done | 2026-05-25 | stale_pnl 2.5 + watchlist 日志 |
-| E 生产验证 | deployed | 2026-05-25 | 108 live-trading，见 §7.4 |
+| E 生产验证 | pending | | deploy pending：待 commit/push/108 重建，见 §7.4 |
 
 ### Phase A — 回测基线
 
@@ -237,13 +237,63 @@ ssh server1 "cd /root/vibe-trading && git fetch origin && git reset --hard origi
 
 ### 7.2 参数扫描（Phase B）
 
+**计划转向（2026-05-26）**：终止 6-way 并行 + `run_phaseb_serial.py` 全量 A3 单扫（min_score 单值 ~19min）。采用 **方案 2 + 方案 1 精验步**：
+
+| 阶段 | 脚本 | 窗口 / 规模 | 扫参项 | 输出 CSV |
+|------|------|-------------|--------|----------|
+| 粗扫 | `run_phaseb_fast.py` | 2024-11-01~2026-05-01，10 sym，`scan_every=24` | `reward_risk` 1.5/2.0；`max_positions` 3/4；`stale_pnl_pct` 2.0/2.5 | `optimization_results_coarse.csv` |
+| 精验 | 同上 `--fine-only` 或自动续跑 | 2024-01-01~2026-05-01，20 sym，`scan_every=12`（A3） | Top 2–3 组合 + `stale_hours=16` 固定 | `optimization_results_long.csv` |
+
+**已跳过**：`min_score`、`trail_activation`（短样本已定）；**已保留**：`stale_hours` 长样本（1609 笔，`sweep_w4_stale_hours.csv` → long）。
+
 ⚠️ **样本量警告（已解决）**：A3 长基线 1636 笔。下方旧表（A1 对照 15 笔）**已作废**，长周期重扫结果写入 `optimization_results_long.csv`。
 
-**Top 候选（长周期重扫，待回填）**：
+**粗扫结果（2026-05-26，6 agent 并行，10 sym，scan_every=24）**：
+
+| param | value | return | sharpe | max_dd | trades | 合格(-19%)? | 备注 |
+|-------|-------|--------|--------|--------|--------|------------|------|
+| max_positions | 3 | +66.5% | **0.38** | -8.3% | 317 | ✅ | Sharpe 最高 |
+| max_positions | 4 | +39.7% | 0.24 | -14.7% | 328 | ✅ | |
+| reward_risk_ratio | 1.5 | +48.2% | 0.30 | -14.8% | 311 | ✅ | |
+| reward_risk_ratio | 2.0 | +41.6% | 0.22 | -12.2% | 362 | ✅ | 基线默认 |
+| stale_pnl_pct | 2.0 | +31.2% | 0.20 | **-22.6%** | 328 | ❌ | 超回撤上限 |
+| stale_pnl_pct | 2.5 | +26.2% | 0.16 | **-23.0%** | 340 | ❌ | 超回撤上限 |
+
+> Fine combos 推导（stale_pnl_pct 全超上限仍纳入组合验证）：
+> 1. rr=1.5, mp=3, sp=2.5, sh=16
+> 2. rr=1.5, mp=4, sp=2.5, sh=16
+> 3. rr=2.0, mp=3, sp=2.5, sh=16
+
+**精验第一轮（作废）**：3 agent 并行完成，但发现 **键名 bug**：`run_phaseb_fast.py` 和 `_run_fine_single.py` 用 `stale_hours`/`stale_pnl_pct`，config.json 实际键名为 `stale_position_hours`/`stale_position_pnl_pct`。覆盖未生效，实际跑了默认值（sh=24, sp=3.0）。
+
+| combo | return | sharpe | max_dd | 备注 |
+|-------|--------|--------|--------|------|
+| rr=1.5, mp=3, sp=2.5, sh=16 | +48.0% | 0.13 | **-44.6%** | 实际默认值 |
+| rr=1.5, mp=4, sp=2.5, sh=16 | +101.4% | 0.22 | **-21.2%** | 实际默认值 |
+| rr=2.0, mp=3, sp=2.5, sh=16 | +37.7% | 0.11 | **-26.8%** | 实际默认值 |
+
+已修复 `run_phaseb_fast.py` 和 `_run_fine_single.py` 键名。
+
+**精验第二轮（完成）**：3 agent 并行，正确键名。全 A3（20 sym，2024-01-01~2026-05-01，scan_every=12）。
+
+| combo | return | sharpe | max_dd | trades | 合格(-19%)? |
+|-------|--------|--------|--------|--------|------------|
+| **rr=1.5, mp=3, sp=2.5, sh=16** | **+237.2%** | **0.36** | **-17.5%** | 1294 | ✅ |
+| rr=1.5, mp=4, sp=2.5, sh=16 | +148.5% | 0.24 | -26.1% | 1656 | ❌ |
+| rr=2.0, mp=3, sp=2.5, sh=16 | +120.7% | 0.22 | -26.5% | 1402 | ❌ |
+
+**胜者**：`reward_risk_ratio=1.5`, `max_positions=3`, `stale_position_pnl_pct=2.5`, `stale_position_hours=16`。
+Sharpe 0.36，回撤 -17.5%（≤ 基线 -17.3% × 1.1 = -19.0%）。已更新 `extensions/config/config.json`。
+
+> 对比：键名错误的第一轮（实际跑默认值 sh=24, sp=3.0）全部 Sharpe 0.11–0.22 且 dd -21% ~ -45%。正确键名后结果与 coarse 方向一致。
+
+**旧候选（A1 短样本 15 笔，已作废）**：
 
 | rank | min_score | rr | trail_act | stale_h | stale_pnl% | sharpe | max_dd | trades | 备注 |
 |------|-----------|-----|-----------|---------|------------|--------|--------|--------|------|
-| — | — | — | — | — | — | — | — | — | 扫参进行中 |
+| 1 | 5 | 1.5 | 3.0 | 24 | 3.0 | 0.40 | -3.0% | 5 | 单扫 `reward_risk`；Sharpe 最高档 |
+| 2 | 5 | 2.0 | 3.0 | 24 | 2.5 | 0.36 | -6.2% | 14 | 单扫 `stale_pnl_pct`；收益/笔数更优 |
+| 3 | 5 | 2.0 | 3.0 | 24 | 2.0 | 0.35 | -6.2% | 14 | 单扫 `stale_pnl_pct`；次优 |
 
 **旧结果（A1 对照 15 笔，已作废）**：
 | 1 | 5 | 1.5 | 3.0 | 24 | 2.5 | 0.40 | -3.01% | 5 | 单扫 `reward_risk`；交易数少 |
@@ -252,13 +302,12 @@ ssh server1 "cd /root/vibe-trading && git fetch origin && git reset --hard origi
 
 ⚠️ **样本量警告**：A1 基线仅 15 笔，单扫后 trade_count 最低 5 笔。5 笔 Sharpe 0.40 的 95% CI 极宽，结论仅为方向性提示，非统计显著。Phase A 扩大样本后需重新 sweep。
 
-**结论（A1 对照，max_dd 基线 -7.76%，110% 上限 -8.54%）**
+**粗扫结论（coarse 10 sym，max_dd 上限 -19%）**
 
-- `min_score` 4–7 在本区间同结果，**勿降**。
-- `reward_risk` 1.5–3.0 显著改善回撤（-3%），Sharpe 0.40；trade_count 降至 5（⚠️ 样本量不足）。
-- `stale_pnl_pct` 2.5 提升收益（+11.45%）且 dd 合格；建议 Phase D 优先试此项。
-- `quick` grid 全负 Sharpe，**勿**采用组合格结果；参数间存在交互效应。
-- 推荐灰度组合（**必须经 Phase B+ 组合回测验证**）：`stale_pnl_pct=2.5` + 保持 `reward_risk_ratio=2.0`。
+- `max_positions=3` Sharpe 最高（0.38），return +66.5%，dd 仅 -8.3%。`max_positions=4` 次优（0.24）。
+- `reward_risk=1.5` Sharpe 0.30 > 2.0 的 0.22。rr 降低改善风险调整收益。
+- `stale_pnl_pct` 2.0/2.5 均超回撤上限（-22.6%/-23.0%），coarse 单体不合格；仍纳入 fine 组合验证看交互效应。
+- Fine 精验（全 A3）进行中，结果决定最终推荐组合。
 
 完整 CSV（长周期）：`extensions/ext_cli/.cache_crypto/optimization_results_long.csv`  
 旧 CSV（短样本，作废）：`extensions/ext_cli/.cache_crypto/optimization_results.csv`
@@ -277,11 +326,14 @@ ssh server1 "cd /root/vibe-trading && git fetch origin && git reset --hard origi
 
 ### 7.4 生产验证（Phase E）
 
+**状态**：**deploy pending** — 本地 `config.json` 已设 `stale_pnl_pct=2.5` + watchlist 日志；108 仍为 3.0，待 Phase B 长周期 Top3 确认后 commit → push → 108 重建。
+
 | 变更项 | 旧值 | 新值 | 开始日 | 2周PnL | STALE占比 | 备注 |
 |--------|------|------|--------|--------|-----------|------|
-| `tpsl_monitor.stale_position_pnl_pct` | 3.0 | **2.5** | **2026-05-25** | — | — | Phase B sweep 推荐；108 deploy 完成 |
+| `tpsl_monitor.stale_position_pnl_pct` | 3.0 | **2.5** | **待部署** | — | — | Phase B 短样本推荐；108 未更新 |
+| watchlist Top3 日志 | 无 | 有 | **待部署** | — | — | `run_live_trading.py` 已实现 |
 
-**部署检查清单**（Phase E，手动执行）：
+**部署检查清单**（Phase E，手动执行，当前 **pending**）：
 
 1. `git checkout dev` → commit `feat[ext]: stale pnl band 2.5% + watchlist log + optimization doc`
 2. `git push origin dev`
@@ -364,4 +416,8 @@ git push origin dev
 | 2026-05-25 | docs | 初版优化计划 v1.0 | |
 | 2026-05-25 | docs+ext | Phase A/B 结果；stale_pnl 2.5；watchlist 日志；optimize_crypto sweep 扩展 | |
 | 2026-05-25 | ext | 回测 initial_cash=1000；A3 长基线 1636 笔；Phase B 长周期重扫启动 | |
+| 2026-05-25 | docs | §7.2 Top3 回填（短样本 CSV）；进度表 6 agents 备注；§7.4 Phase E deploy pending；45min CSV 轮询 | |
+| 2026-05-26 | ext+docs | Phase B 转向：kill 并行/serial；`run_phaseb_fast.py` 粗扫+精验；§7.2 计划表；ETA ~1.5h | |
+| 2026-05-26 | ext+docs | 6 agent 并行粗扫完成（10 sym）；fine phase 全 A3 运行中；§7.2 结果表+结论更新 | |
+| 2026-05-26 | fix | 发现 fine phase 键名 bug：`stale_hours`→`stale_position_hours`，`stale_pnl_pct`→`stale_position_pnl_pct`。修复 `run_phaseb_fast.py` + `_run_fine_single.py`，重新跑 fine | |
 

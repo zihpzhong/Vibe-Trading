@@ -22,8 +22,8 @@
     "//position_size_pct": "单次开仓保证金比例(占账户余额百分比)。0.12=12%。也可通过 --position-size 设置",
     "position_size_pct": 0.12,
 
-    "//reward_risk_ratio": "目标 R:R 止盈比。2.0=止盈距离是止损距离的2倍。也可通过 --rr 设置",
-    "reward_risk_ratio": 2.0,
+    "//reward_risk_ratio": "目标 R:R 止盈比。2.0=止盈距离是止损距离的2倍。也可通过 --rr 设置。Phase B 回测最优: 1.5 (sharpe 0.36)",
+    "reward_risk_ratio": 1.5,
 
     "//max_positions": "最大同时持仓数量",
     "max_positions": 3,
@@ -162,8 +162,8 @@
   },
 
   "tpsl_monitor": {
-    "//stale_position_hours": "持仓超此时长且 PnL 在 ±stale_position_pnl_pct 内→自动平仓",
-    "stale_position_hours": 24,
+    "//stale_position_hours": "持仓超此时长且 PnL 在 ±stale_position_pnl_pct 内→自动平仓。Phase B 回测最优: 16",
+    "stale_position_hours": 16,
 
     "//stale_position_pnl_pct": "僵尸仓位判定 PnL 浮动范围(%)。回测 sweep 2026-05-25: 2.5 优于 3.0",
     "stale_position_pnl_pct": 2.5,
