@@ -169,17 +169,30 @@ def run_single(
     }
 
 
+def _parse_values(raw: str) -> list[int | float]:
+    """解析 --values 逗号列表 / Parse comma-separated --values."""
+    out: list[int | float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(float(part) if "." in part else int(part))
+    return out
+
+
 def run_sweep(
     name: str,
     data_map: dict[str, pd.DataFrame],
     base: dict[str, Any],
     cache: list[dict],
+    values_override: list[int | float] | None = None,
 ) -> None:
     spec = SWEEPS.get(name)
     if not spec:
         print(f"Unknown sweep: {name}. Available: {', '.join(SWEEPS)}")
         return
-    param, values = spec["param"], spec["values"]
+    param = spec["param"]
+    values = values_override if values_override is not None else spec["values"]
     cached = {_param_key({param: r.get("value")}) for r in cache if r.get("param") == param}
     new_rows: list[dict] = []
     print(f"\nSweep {name} ({param})")
@@ -193,13 +206,13 @@ def run_sweep(
             m = run_single({param: val}, data_map, base)
             row = {"param": param, "value": val, **m}
             new_rows.append(row)
+            _save_results([row])  # 逐条落盘，避免长 sweep 中断丢结果 / incremental save
             print(
                 f"  {val}: ret={m['total_return']:+.2%} sharpe={m['sharpe']:.2f} "
                 f"dd={m['max_drawdown']:.2%} trades={m['trade_count']} ({time.time() - t0:.1f}s)"
             )
         except Exception as exc:
             print(f"  {val}: ERROR {exc}")
-    _save_results(new_rows)
 
 
 def run_grid(
@@ -295,6 +308,18 @@ def main() -> int:
         action="store_true",
         help="Merge optimization_results_*.csv shards into optimization_results_long.csv",
     )
+    p.add_argument(
+        "--values",
+        default=None,
+        help="Coarse sweep subset, e.g. 1.5,2.0 (overrides SWEEPS values)",
+    )
+    p.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="KEY=VAL",
+        help="Fine validation: single combo run, e.g. reward_risk_ratio=2.0",
+    )
     args = p.parse_args()
 
     if args.merge_results:
@@ -338,10 +363,25 @@ def main() -> int:
     base["scan_every_n_bars"] = args.scan_every
 
     cache = _load_cache()
-    if args.combo:
+    if args.override:
+        overrides: dict[str, Any] = {}
+        for item in args.override:
+            key, val_s = item.split("=", 1)
+            overrides[key] = float(val_s) if "." in val_s else int(val_s)
+        print(f"\nOverride combo: {overrides}")
+        t0 = time.time()
+        m = run_single(overrides, data_map, base)
+        row = {"combo": "fine", **overrides, **m}
+        print(
+            f"  ret={m['total_return']:+.2%} sharpe={m['sharpe']:.2f} "
+            f"dd={m['max_drawdown']:.2%} trades={m['trade_count']} ({time.time() - t0:.1f}s)"
+        )
+        _save_results([row])
+    elif args.combo:
         run_combo(args.combo, data_map, base)
     elif args.sweep:
-        run_sweep(args.sweep, data_map, base, cache)
+        values_override = _parse_values(args.values) if args.values else None
+        run_sweep(args.sweep, data_map, base, cache, values_override=values_override)
     elif args.grid == "quick":
         run_grid(QUICK_GRID, data_map, base)
     else:

@@ -91,6 +91,7 @@ wiki/alpha-library/content/
 extensions/config/.env.local
 extensions/.cache_astock/
 extensions/.cache_crypto/
+extensions/ext_cli/.cache_crypto/
 trading.db
 claudedocs/
 .deepseek/

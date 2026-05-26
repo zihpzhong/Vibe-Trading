@@ -87,6 +87,9 @@ TIER_3: Final[list[str]] = [
     "SEI",    # Sei
     "THETA",  # Theta Network
     "JUP",    # Jupiter
+    "ZEC",    # Zcash
+    "WLD",    # Worldcoin
+    "TAO",    # Bittensor
 ]
 
 # ---------------------------------------------------------------------------

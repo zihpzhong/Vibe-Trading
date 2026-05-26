@@ -121,10 +121,10 @@ flowchart TB
 |------|------|--------|------|
 | 文档建立 | done | 2026-05-25 | v1.0 |
 | A 基线回测 | done | 2026-05-25 | A3-syn-long 1636 笔，见 §7.1 |
-| B 参数扫描 | coarse_done, fine_in_progress | 2026-05-26 | 6 agent 并行粗扫完成（10 sym）；精验 `run_phaseb_fast.py --fine-only` 全 A3 运行中；见 §7.2 |
+| B 参数扫描 | **done** | 2026-05-26 | 粗扫 6/6 + 精验 3/3；胜者 rr=1.5/mp=3/sp=2.5/sh=16；CSV 已合并，见 §7.2 |
 | C Phase2 反事实 | blocked | | 无 replay JSONL，见 §7.3 |
 | D 配置/可观测 | done | 2026-05-25 | stale_pnl 2.5 + watchlist 日志 |
-| E 生产验证 | pending | | deploy pending：待 commit/push/108 重建，见 §7.4 |
+| E 生产验证 | partial | 2026-05-26 | stale_pnl 2.5 + watchlist 已部署；rr=1.5 / stale_h=16 待 108 同步，见 §7.4 |
 
 ### Phase A — 回测基线
 
@@ -307,9 +307,23 @@ Sharpe 0.36，回撤 -17.5%（≤ 基线 -17.3% × 1.1 = -19.0%）。已更新 `
 - `max_positions=3` Sharpe 最高（0.38），return +66.5%，dd 仅 -8.3%。`max_positions=4` 次优（0.24）。
 - `reward_risk=1.5` Sharpe 0.30 > 2.0 的 0.22。rr 降低改善风险调整收益。
 - `stale_pnl_pct` 2.0/2.5 均超回撤上限（-22.6%/-23.0%），coarse 单体不合格；仍纳入 fine 组合验证看交互效应。
-- Fine 精验（全 A3）进行中，结果决定最终推荐组合。
+- Fine 精验（全 A3）**已完成**；**生产推荐**为精验 combo1（非单扫 `stale_hours=24` 最高 Sharpe 行——单扫未含 rr/mp 联动）。
+
+**CSV 合并（2026-05-26）**
+
+| 文件 | 行数 | 内容 |
+|------|------|------|
+| `optimization_results_long.csv` | 20 | 单扫长样本 + coarse + 3 组 fine combo |
+| `optimization_results_coarse.csv` | 6 | 粗扫（已去重重复 `rr=1.5`） |
+| `fine_combo1/2/3.csv` | 各 1 | 精验分片（已并入 long） |
+
+```bash
+# 重新合并 / Re-merge shards → long.csv + Top3 JSON
+python3 extensions/ext_cli/analyze_phaseb_long.py
+```
 
 完整 CSV（长周期）：`extensions/ext_cli/.cache_crypto/optimization_results_long.csv`  
+粗扫 CSV：`extensions/ext_cli/.cache_crypto/optimization_results_coarse.csv`  
 旧 CSV（短样本，作废）：`extensions/ext_cli/.cache_crypto/optimization_results.csv`
 
 ### 7.3 Phase2 反事实（Phase C）
@@ -326,20 +340,36 @@ Sharpe 0.36，回撤 -17.5%（≤ 基线 -17.3% × 1.1 = -19.0%）。已更新 `
 
 ### 7.4 生产验证（Phase E）
 
-**状态**：**deploy pending** — 本地 `config.json` 已设 `stale_pnl_pct=2.5` + watchlist 日志；108 仍为 3.0，待 Phase B 长周期 Top3 确认后 commit → push → 108 重建。
+**状态**：**部分已部署，胜者参数待 108 同步** — Phase B 已完成（§7.2）。本地 `config.json` 已对齐胜者：`reward_risk_ratio=1.5`、`max_positions=3`、`stale_position_pnl_pct=2.5`、`stale_position_hours=16`。108 若仍为 `rr=2.0` / `stale_hours=24`，需 commit → push → 重建 live-trading。
 
 | 变更项 | 旧值 | 新值 | 开始日 | 2周PnL | STALE占比 | 备注 |
 |--------|------|------|--------|--------|-----------|------|
-| `tpsl_monitor.stale_position_pnl_pct` | 3.0 | **2.5** | **待部署** | — | — | Phase B 短样本推荐；108 未更新 |
-| watchlist Top3 日志 | 无 | 有 | **待部署** | — | — | `run_live_trading.py` 已实现 |
+| `tpsl_monitor.stale_position_pnl_pct` | 3.0 | **2.5** | 2026-05-25 | — | — | 已 push `488bf2c` |
+| `trading.reward_risk_ratio` | 2.0 | **1.5** | **待部署** | — | — | Phase B fine 胜者 |
+| `tpsl_monitor.stale_position_hours` | 24 | **16** | **待部署** | — | — | Phase B fine 胜者 |
+| watchlist Top3 日志 | 无 | 有 | 2026-05-25 | — | — | 已部署 |
 
-**部署检查清单**（Phase E，手动执行，当前 **pending**）：
+**部署状态**：✅ 已 push origin dev (commit `488bf2c`)，108 已重建运行。
 
-1. `git checkout dev` → commit `feat[ext]: stale pnl band 2.5% + watchlist log + optimization doc`
-2. `git push origin dev`
-3. 108：`git reset --hard origin/dev` → `docker compose build --no-cache live-trading && docker compose up -d live-trading`
-4. 每日检查是否触发 §十一 回滚规则
-5. 首周后更新本表与 §二 108 诊断
+**108 部署指令**（SSH 执行）：
+
+```bash
+ssh root@43.156.100.108
+cd /root/vibe-trading
+git fetch origin && git reset --hard origin/dev
+docker compose build --no-cache live-trading && docker compose up -d live-trading
+docker compose logs --tail=30 live-trading
+```
+
+**变更参数**：
+
+| 参数 | 旧值 | 新值 | 来源 |
+|------|------|------|------|
+| `trading.reward_risk_ratio` | 2.0 | **1.5** | Fine 胜者 Sharpe 0.36 |
+| `tpsl_monitor.stale_position_hours` | 24 | **16** | Fine 胜者回撤 -17.5% |
+| `tpsl_monitor.stale_position_pnl_pct` | 3.0 | **2.5** | 已部署（2026-05-25） |
+
+**回滚监控**：每日检查 §十一 规则。首周后更新 §二 108 诊断。
 
 ---
 
@@ -419,5 +449,7 @@ git push origin dev
 | 2026-05-25 | docs | §7.2 Top3 回填（短样本 CSV）；进度表 6 agents 备注；§7.4 Phase E deploy pending；45min CSV 轮询 | |
 | 2026-05-26 | ext+docs | Phase B 转向：kill 并行/serial；`run_phaseb_fast.py` 粗扫+精验；§7.2 计划表；ETA ~1.5h | |
 | 2026-05-26 | ext+docs | 6 agent 并行粗扫完成（10 sym）；fine phase 全 A3 运行中；§7.2 结果表+结论更新 | |
-| 2026-05-26 | fix | 发现 fine phase 键名 bug：`stale_hours`→`stale_position_hours`，`stale_pnl_pct`→`stale_position_pnl_pct`。修复 `run_phaseb_fast.py` + `_run_fine_single.py`，重新跑 fine | |
+| 2026-05-26 | fix | 发现 fine phase 键名 bug，修复 `run_phaseb_fast.py` + `_run_fine_single.py`，重新跑 fine | |
+| 2026-05-26 | docs+data | Phase B done；`analyze_phaseb_long.py` 合并 CSV（20 行 long）；coarse 去重；§六/§7.2/§7.4 状态更新 | |
+| 2026-05-26 | feat+config | Fine 完成：rr=1.5, mp=3, sp=2.5, sh=16（Sharpe 0.36, dd -17.5%）。更新 config.json，commit 488bf2c，push origin dev | 488bf2c |
 

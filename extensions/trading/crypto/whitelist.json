@@ -1,9 +1,9 @@
 {
   "meta": {
     "name": "top50",
-    "description": "市值前50加密货币白名单（排除稳定币/衍生品）— 44个Binance永续合约可用币种",
-    "version": "2026-05-22",
-    "total": 44
+    "description": "市值前50加密货币白名单（排除稳定币/衍生品）— 47个Binance永续合约可用币种",
+    "version": "2026-05-26",
+    "total": 47
   },
   "tiers": {
     "blue_chip": {
@@ -43,7 +43,7 @@
     },
     "mid_cap": {
       "name": "中等市值",
-      "range": "24-44",
+      "range": "24-47",
       "coins": [
         {"rank": 24, "symbol": "AAVE",   "name": "Aave",         "sector": "DeFi"},
         {"rank": 25, "symbol": "HBAR",   "name": "Hedera",       "sector": "L1"},
@@ -65,7 +65,10 @@
         {"rank": 41, "symbol": "MINA",   "name": "Mina",         "sector": "L1"},
         {"rank": 42, "symbol": "SEI",    "name": "Sei",          "sector": "L1"},
         {"rank": 43, "symbol": "THETA",  "name": "Theta Network","sector": "Infra"},
-        {"rank": 44, "symbol": "JUP",    "name": "Jupiter",      "sector": "DeFi"}
+        {"rank": 44, "symbol": "JUP",    "name": "Jupiter",      "sector": "DeFi"},
+        {"rank": 45, "symbol": "ZEC",    "name": "Zcash",        "sector": "Privacy"},
+        {"rank": 46, "symbol": "WLD",    "name": "Worldcoin",    "sector": "AI"},
+        {"rank": 47, "symbol": "TAO",    "name": "Bittensor",    "sector": "AI"}
       ]
     }
   },

@@ -105,15 +105,17 @@ def merge_into_long(dest: Path, cache_dir: Path) -> int:
     if dest.exists():
         existing = pd.read_csv(dest)
         merged = pd.concat([existing, merged], ignore_index=True)
-    if "param" in merged.columns and "value" in merged.columns:
-        key_cols = ["param", "value"]
-        merged = merged.drop_duplicates(subset=key_cols, keep="last")
-    if "combo" in merged.columns:
-        combo = merged[merged["combo"].notna()]
-        non_combo = merged[merged["combo"].isna()] if merged["combo"].isna().any() else merged
-        if not combo.empty:
-            combo = combo.drop_duplicates(subset=["combo"], keep="last")
-        merged = pd.concat([non_combo, combo], ignore_index=True)
+    has_combo = "combo" in merged.columns
+    if has_combo:
+        combo_mask = merged["combo"].notna()
+        combo_df = merged[combo_mask].drop_duplicates(subset=["combo"], keep="last")
+        rest_df = merged[~combo_mask]
+    else:
+        combo_df = pd.DataFrame()
+        rest_df = merged
+    if "param" in rest_df.columns and "value" in rest_df.columns:
+        rest_df = rest_df.drop_duplicates(subset=["param", "value"], keep="last")
+    merged = pd.concat([rest_df, combo_df], ignore_index=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(dest, index=False)
     print(f"Merged → {dest} ({len(merged)} rows)")
