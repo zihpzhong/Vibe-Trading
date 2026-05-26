@@ -90,6 +90,8 @@ TIER_3: Final[list[str]] = [
     "ZEC",    # Zcash
     "WLD",    # Worldcoin
     "TAO",    # Bittensor
+    "ONDO",   # Ondo
+    "ASTER",  # Aster
 ]
 
 # ---------------------------------------------------------------------------

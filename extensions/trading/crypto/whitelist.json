@@ -1,9 +1,9 @@
 {
   "meta": {
     "name": "top50",
-    "description": "市值前50加密货币白名单（排除稳定币/衍生品）— 47个Binance永续合约可用币种",
+    "description": "市值前50加密货币白名单（排除稳定币/衍生品）— 49个Binance永续合约可用币种",
     "version": "2026-05-26",
-    "total": 47
+    "total": 49
   },
   "tiers": {
     "blue_chip": {
@@ -68,7 +68,9 @@
         {"rank": 44, "symbol": "JUP",    "name": "Jupiter",      "sector": "DeFi"},
         {"rank": 45, "symbol": "ZEC",    "name": "Zcash",        "sector": "Privacy"},
         {"rank": 46, "symbol": "WLD",    "name": "Worldcoin",    "sector": "AI"},
-        {"rank": 47, "symbol": "TAO",    "name": "Bittensor",    "sector": "AI"}
+        {"rank": 47, "symbol": "TAO",    "name": "Bittensor",    "sector": "AI"},
+        {"rank": 48, "symbol": "ONDO",   "name": "Ondo",         "sector": "RWA"},
+        {"rank": 49, "symbol": "ASTER",  "name": "Aster",        "sector": "AI"}
       ]
     }
   },
