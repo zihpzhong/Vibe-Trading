@@ -62,6 +62,18 @@ def test_has_bracket_support() -> None:
     assert has_bracket_support(bare) is False
 
 
+def test_has_bracket_support_real_exchange_no_api_probe() -> None:
+    """RealExchange override 应返回 True，且不应用无效 symbol 调 API。"""
+    from extensions.trading.crypto.live._real_exchange import RealExchange
+
+    ex = RealExchange()
+    ex.create_stop_loss_order = MagicMock(side_effect=AssertionError("must not probe API"))
+    ex.create_take_profit_order = MagicMock(side_effect=AssertionError("must not probe API"))
+    assert has_bracket_support(ex) is True
+    ex.create_stop_loss_order.assert_not_called()
+    ex.create_take_profit_order.assert_not_called()
+
+
 def test_sanitize_bracket_order_ids_clears_canceled() -> None:
     ex = MagicMock()
     ex.fetch_algo_order = MagicMock(side_effect=[

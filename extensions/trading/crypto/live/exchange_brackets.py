@@ -13,8 +13,9 @@ from __future__ import annotations
 import logging
 from typing import Optional, TYPE_CHECKING
 
+from extensions.trading.crypto.live.exchange import ExchangeBase, MockExchange
+
 if TYPE_CHECKING:
-    from extensions.trading.crypto.live.exchange import ExchangeBase
     from extensions.trading.crypto.live.position_tracker import Position
 
 logger = logging.getLogger(__name__)
@@ -25,32 +26,43 @@ _ACTIVE_ALGO_STATUSES = frozenset({"NEW", "TRIGGERED"})
 _BRACKET_ORDER_TYPES = frozenset({"STOP_MARKET", "TAKE_PROFIT_MARKET"})
 
 
+def _overrides_bracket_method(exchange: ExchangeBase, method_name: str) -> bool:
+    """子类是否实现了 bracket 方法（非 ExchangeBase 默认 stub）。
+    Whether the exchange subclass overrides a bracket method (not ExchangeBase stub).
+    """
+    if getattr(exchange, method_name, None) is None:
+        return False
+    base_method = getattr(ExchangeBase, method_name, None)
+    return getattr(type(exchange), method_name, None) is not base_method
+
+
 def has_bracket_support(exchange: ExchangeBase) -> bool:
     """True when exchange can place stop-loss and take-profit conditional orders."""
     for method_name in ("create_stop_loss_order", "create_take_profit_order"):
-        method = getattr(exchange, method_name, None)
-        if method is None:
+        if not _overrides_bracket_method(exchange, method_name):
             logger.info(
                 "Exchange %s missing %s — software TPSL fallback",
                 type(exchange).__name__, method_name,
             )
             return False
-        # Concrete methods on ExchangeBase raise NotImplementedError
-        try:
-            method("TEST", "sell", 0.001, 1.0)
-        except NotImplementedError:
-            logger.info(
-                "Exchange %s %s raises NotImplementedError — software TPSL fallback",
-                type(exchange).__name__, method_name,
-            )
-            return False
-        except Exception:
-            logger.warning(
-                "Exchange %s %s probe failed:",
-                type(exchange).__name__, method_name,
-                exc_info=True,
-            )
-            return False
+        # MockExchange 可走内存探测；实盘实现仅检查 override，避免无效 symbol 误触 API
+        # MockExchange: in-memory probe; live exchange: override check only (no API probe)
+        if isinstance(exchange, MockExchange):
+            try:
+                getattr(exchange, method_name)("TEST", "sell", 0.001, 1.0)
+            except NotImplementedError:
+                logger.info(
+                    "Exchange %s %s raises NotImplementedError — software TPSL fallback",
+                    type(exchange).__name__, method_name,
+                )
+                return False
+            except Exception:
+                logger.warning(
+                    "Exchange %s %s probe failed:",
+                    type(exchange).__name__, method_name,
+                    exc_info=True,
+                )
+                return False
     logger.info(
         "Exchange %s supports bracket orders",
         type(exchange).__name__,
