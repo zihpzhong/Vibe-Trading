@@ -723,6 +723,52 @@ class TPSLMonitor(Thread):
                     else:
                         self._positions.close_position(pos.symbol, exit_price=price, reason=reason)
                     return
+                if "ReduceOnly" in err_msg or "-2022" in err_msg:
+                    logger.warning(
+                        "ReduceOnly rejected for %s %s, retrying as regular market order",
+                        pos.symbol, reason,
+                    )
+                    try:
+                        order = self._exchange.create_market_order(
+                            pos.symbol, side, qty, reduce_only=False,
+                        )
+                        filled = order.get("filled", 0) or 0
+                        if is_de_risk and de_risk_level < 4:
+                            if filled > 0:
+                                self._positions.de_risk_partial_exit(
+                                    pos.symbol, de_risk_level, filled, price,
+                                )
+                            if filled < qty:
+                                remaining = qty - filled
+                                if remaining > 0:
+                                    min_qty = self._exchange.get_min_qty(pos.symbol)
+                                    if min_qty > 0 and remaining < min_qty:
+                                        self._positions.de_risk_partial_exit(
+                                            pos.symbol, de_risk_level, remaining, price,
+                                        )
+                        else:
+                            if filled < qty:
+                                logger.warning(
+                                    "%s partial fill for %s: filled=%.4f of %.4f",
+                                    reason, pos.symbol, filled, qty,
+                                )
+                            min_qty = self._exchange.get_min_qty(pos.symbol)
+                            self._positions.close_after_market_fill(
+                                pos.symbol, filled or 0, price, reason, min_qty=min_qty,
+                            )
+                        self._trailing_stops.pop(pos.symbol, None)
+                        self._peak_prices.pop(pos.symbol, None)
+                        if reason == "STALE":
+                            self._positions.set_extended_cooldown(
+                                pos.symbol, pos.direction, self._stale_reentry_cooldown_minutes,
+                            )
+                        elif reason == "TP" and self._on_take_profit:
+                            self._on_take_profit(pos)
+                        elif reason in ("SL", "DOOM") and self._on_stop_loss:
+                            self._on_stop_loss(pos)
+                        return
+                    except Exception as retry_exc:
+                        last_err = retry_exc
                 last_err = exc
                 if attempt < self._max_retries - 1:
                     delay = self._retry_backoff[attempt]
@@ -796,7 +842,8 @@ class TPSLMonitor(Thread):
         """Execute take-profit: market order to close position with retry."""
         self._cancel_exchange_brackets(pos)
         side = "sell" if pos.direction == "LONG" else "buy"
-        logger.info("TP triggered: %s %s @ %.4f (TP=%.4f)", pos.symbol, pos.direction, price, pos.take_profit)
+        tp = pos.take_profit
+        logger.info("TP triggered: %s %s @ %.4f (TP=%s)", pos.symbol, pos.direction, price, tp if tp is not None else "None")
 
         last_err: Optional[Exception] = None
         for attempt in range(self._max_retries):
@@ -809,9 +856,7 @@ class TPSLMonitor(Thread):
                         pos.symbol, filled, pos.quantity, pos.quantity - filled,
                     )
                 min_qty = self._exchange.get_min_qty(pos.symbol)
-                self._positions.close_after_market_fill(
-                    pos.symbol, filled or 0, price, "TP", min_qty=min_qty,
-                )
+                self._positions.close_after_market_fill(pos.symbol, filled or 0, price, "TP", min_qty=min_qty)
                 self._trailing_stops.pop(pos.symbol, None)
                 self._peak_prices.pop(pos.symbol, None)
                 if self._on_take_profit:
@@ -819,6 +864,27 @@ class TPSLMonitor(Thread):
                 return
             except Exception as exc:
                 err_msg = str(exc)
+                if "ReduceOnly" in err_msg or "-2022" in err_msg:
+                    # ReduceOnly 被拒绝，尝试普通市价单 / Fallback to regular market order
+                    logger.warning("ReduceOnly rejected for %s, retrying as regular market order", pos.symbol)
+                    try:
+                        order = self._exchange.create_market_order(pos.symbol, side, pos.quantity, reduce_only=False)
+                        filled = order.get("filled", 0) or 0
+                        if filled < pos.quantity:
+                            logger.warning(
+                                "TP partial fill for %s: filled=%.4f of %.4f, remaining=%.4f",
+                                pos.symbol, filled, pos.quantity, pos.quantity - filled,
+                            )
+                        min_qty = self._exchange.get_min_qty(pos.symbol)
+                        self._positions.close_after_market_fill(pos.symbol, filled or 0, price, "TP", min_qty=min_qty)
+                        self._trailing_stops.pop(pos.symbol, None)
+                        self._peak_prices.pop(pos.symbol, None)
+                        if self._on_take_profit:
+                            self._on_take_profit(pos)
+                        return
+                    except Exception as retry_exc:
+                        err_msg = str(retry_exc)
+                        last_err = retry_exc
                 if "below minimum tradeable" in err_msg or "Quantity less than or equal to zero" in err_msg:
                     logger.warning(
                         "TP dust: %s remaining qty=%.6f untradeable, closing in tracker",
@@ -869,6 +935,28 @@ class TPSLMonitor(Thread):
                 return
             except Exception as exc:
                 err_msg = str(exc)
+                if "ReduceOnly" in err_msg or "-2022" in err_msg:
+                    # ReduceOnly 被拒绝，尝试普通市价单 / Fallback to regular market order
+                    logger.warning("ReduceOnly rejected for %s, retrying as regular market order", pos.symbol)
+                    try:
+                        order = self._exchange.create_market_order(pos.symbol, side, pos.quantity, reduce_only=False)
+                        filled = order.get("filled", 0) or 0
+                        if filled < pos.quantity:
+                            logger.warning(
+                                "SL partial fill for %s: filled=%.4f of %.4f, remaining=%.4f",
+                                pos.symbol, filled, pos.quantity, pos.quantity - filled,
+                            )
+                        min_qty = self._exchange.get_min_qty(pos.symbol)
+                        self._positions.close_after_market_fill(
+                            pos.symbol, filled or 0, price, "SL", min_qty=min_qty,
+                        )
+                        self._trailing_stops.pop(pos.symbol, None)
+                        self._peak_prices.pop(pos.symbol, None)
+                        if self._on_stop_loss:
+                            self._on_stop_loss(pos)
+                        return
+                    except Exception as retry_exc:
+                        last_err = retry_exc
                 if "below minimum tradeable" in err_msg or "Quantity less than or equal to zero" in err_msg:
                     logger.warning(
                         "SL dust: %s remaining qty=%.6f untradeable, closing in tracker",
