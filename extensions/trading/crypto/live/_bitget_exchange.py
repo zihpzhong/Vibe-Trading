@@ -25,18 +25,30 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _to_trading_symbol(symbol: str) -> str:
+    """Normalize base or pair symbol to internal USDT perpetual form.
+
+    BTC / BTCUSDT → BTCUSDT
+    """
+    sym = symbol.strip().upper()
+    if sym.endswith("USDT"):
+        return sym
+    return f"{sym}USDT"
+
+
 def _ccxt_symbol(symbol: str) -> str:
     """Convert internal short format to ccxt Bitget swap format.
 
     BTCUSDT → BTC/USDT:USDT
     ETHUSD → ETH/USD:USD
     """
-    for suffix in ("USDT", "USD", "BTC", "ETH"):
-        if symbol.endswith(suffix) and suffix:
-            base = symbol[: -len(suffix)]
+    trading_sym = _to_trading_symbol(symbol)
+    for suffix in ("USDT", "USD"):
+        if trading_sym.endswith(suffix):
+            base = trading_sym[: -len(suffix)]
             if base:
                 return f"{base}/{suffix}:{suffix}"
-    return symbol
+    return trading_sym
 
 
 def _internal_symbol(ccxt_sym: str) -> str:
@@ -547,7 +559,8 @@ class BitgetExchange(ExchangeBase):
     def validate_symbols(self, symbols: list[str]) -> list[str]:
         """Filter out symbols not available on Bitget.
 
-        Called once at startup when switching from Binance to Bitget.
+        Whitelist may use base tickers (BTC) or pair tickers (BTCUSDT); both are
+        accepted. Called once at startup when switching from Binance to Bitget.
         """
         self._require_markets()
         valid: list[str] = []
@@ -556,7 +569,10 @@ class BitgetExchange(ExchangeBase):
             if ccxt_sym in self._ccxt.markets:
                 valid.append(sym)
             else:
-                logger.warning("Bitget 不支持 %s（已从白名单移除）", sym)
+                logger.warning(
+                    "Bitget 不支持 %s（已从白名单移除）",
+                    _to_trading_symbol(sym),
+                )
         return valid
 
     # ------------------------------------------------------------------
