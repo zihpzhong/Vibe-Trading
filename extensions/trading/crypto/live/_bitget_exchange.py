@@ -156,6 +156,76 @@ def _ccxt_ticker_to_internal(raw: dict) -> dict[str, Any]:
     }
 
 
+def _extract_filled_qty(raw: dict, fallback_qty: float = 0.0) -> float:
+    """从 ccxt 订单结构提取成交量（含 Bitget info 字段回退）。
+    Extract filled quantity from ccxt order dict with Bitget-specific fallbacks.
+    """
+    filled = float(raw.get("filled", 0) or 0)
+    if filled > 0:
+        return filled
+
+    info = raw.get("info")
+    if isinstance(info, dict):
+        for key in (
+            "fillSize",
+            "filledSize",
+            "filledQty",
+            "baseVolume",
+            "accBaseVolume",
+            "size",
+            "fillQty",
+            "dealSize",
+        ):
+            try:
+                candidate = float(info.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                return candidate
+
+    status = str(raw.get("status", "")).lower()
+    if status in ("closed", "filled", "done", "success", "partially_filled"):
+        for key in ("amount", "lastTradeAmount"):
+            try:
+                candidate = float(raw.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                return candidate
+        if fallback_qty > 0:
+            return fallback_qty
+    return 0.0
+
+
+def _to_internal_order(
+    raw: dict,
+    *,
+    symbol: str,
+    requested_qty: float,
+    order_type: str,
+    side: str,
+    price: Optional[float] = None,
+) -> dict[str, Any]:
+    """Map ccxt order response to ExchangeBase internal format."""
+    filled = _extract_filled_qty(raw, requested_qty)
+    result: dict[str, Any] = {
+        "order_id": raw.get("id", ""),
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "amount": requested_qty,
+        "filled": filled,
+        "status": raw.get("status", "open"),
+        "avg_price": float(raw.get("average", 0) or 0),
+        "cummulative_quote": float(raw.get("cost", 0) or 0),
+    }
+    if price is not None:
+        result["price"] = price
+    if "remaining" in raw:
+        result["remaining"] = float(raw.get("remaining", 0) or 0)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # BitgetExchange
 # ---------------------------------------------------------------------------
@@ -361,6 +431,37 @@ class BitgetExchange(ExchangeBase):
             return float(rounded)
         return round(qty, 6)
 
+    def _resolve_filled_qty(self, raw: dict, symbol: str, requested_qty: float) -> float:
+        """Resolve filled qty; Bitget create_order often returns filled=0 initially.
+        解析成交量；Bitget 下单响应常延迟填充 filled 字段。
+        """
+        filled = _extract_filled_qty(raw, requested_qty)
+        if filled > 0:
+            return filled
+
+        order_id = raw.get("id")
+        if not order_id:
+            return filled
+
+        ccxt_sym = _ccxt_symbol(symbol)
+        for delay in (0.0, 0.2, 0.5):
+            if delay:
+                time.sleep(delay)
+            try:
+                with self._lock:
+                    fetched = _retry_ccxt(
+                        f"fetch_order({symbol})",
+                        self._ccxt.fetch_order,
+                        order_id,
+                        ccxt_sym,
+                    )
+                filled = _extract_filled_qty(fetched, requested_qty)
+                if filled > 0:
+                    return filled
+            except Exception as exc:
+                logger.debug("Bitget fill poll via fetch_order failed: %s", exc)
+        return filled
+
     def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
         """Place a market order via ccxt."""
         self._require_auth("market_order")
@@ -383,17 +484,17 @@ class BitgetExchange(ExchangeBase):
         with self._lock:
             raw = _retry_ccxt(f"market({symbol})", _place)
 
-        return {
-            "order_id": raw.get("id", ""),
-            "symbol": symbol,
-            "side": ccxt_side,
-            "type": "market",
-            "amount": amount,
-            "filled": float(raw.get("filled", 0) or 0),
-            "status": raw.get("status", "closed"),
-            "avg_price": float(raw.get("average", 0) or 0),
-            "cummulative_quote": float(raw.get("cost", 0) or 0),
-        }
+        filled = self._resolve_filled_qty(raw, symbol, qty)
+        order = _to_internal_order(
+            raw,
+            symbol=symbol,
+            requested_qty=qty,
+            order_type="market",
+            side=ccxt_side,
+        )
+        order["filled"] = filled
+        order["amount"] = amount
+        return order
 
     def create_limit_order(self, symbol: str, side: str, amount: float, price: float) -> dict:
         """Place a limit order via ccxt."""
@@ -409,16 +510,14 @@ class BitgetExchange(ExchangeBase):
         with self._lock:
             raw = _retry_ccxt(f"limit({symbol})", _place)
 
-        return {
-            "order_id": raw.get("id", ""),
-            "symbol": symbol,
-            "side": ccxt_side,
-            "type": "limit",
-            "amount": amount,
-            "price": price,
-            "filled": float(raw.get("filled", 0) or 0),
-            "status": raw.get("status", "open"),
-        }
+        return _to_internal_order(
+            raw,
+            symbol=symbol,
+            requested_qty=qty,
+            order_type="limit",
+            side=ccxt_side,
+            price=price,
+        )
 
     def cancel_order(self, order_id: str, symbol: str) -> dict:
         """Cancel an open order via ccxt."""
@@ -447,13 +546,14 @@ class BitgetExchange(ExchangeBase):
         with self._lock:
             raw = _retry_ccxt(f"fetch_order({symbol})", _fetch)
 
-        return {
-            "order_id": raw.get("id", order_id),
-            "symbol": symbol,
-            "filled": float(raw.get("filled", 0) or 0),
-            "status": raw.get("status", "open"),
-            "remaining": float(raw.get("remaining", 0) or 0),
-        }
+        ccxt_side = str(raw.get("side", "")).lower() or "buy"
+        return _to_internal_order(
+            raw,
+            symbol=symbol,
+            requested_qty=float(raw.get("amount", 0) or 0),
+            order_type=str(raw.get("type", "market")),
+            side=ccxt_side,
+        )
 
     # ------------------------------------------------------------------
     # Account

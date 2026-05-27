@@ -319,3 +319,55 @@ class TestBitgetExchangeTradingWithAuth:
 
         assert result["order_id"] == "67890"
         assert result["status"] == "open"
+
+
+class TestBitgetFilledExtraction:
+    """Bitget create_order often omits filled; adapter must resolve it."""
+
+    def test_extract_filled_from_info_fill_size(self) -> None:
+        from extensions.trading.crypto.live._bitget_exchange import _extract_filled_qty
+
+        raw = {"filled": 0, "status": "closed", "info": {"fillSize": "1177"}}
+        assert _extract_filled_qty(raw, fallback_qty=1177.0) == 1177.0
+
+    def test_extract_filled_closed_status_uses_amount(self) -> None:
+        from extensions.trading.crypto.live._bitget_exchange import _extract_filled_qty
+
+        raw = {"filled": 0, "status": "closed", "amount": 0.000421}
+        assert _extract_filled_qty(raw) == 0.000421
+
+    @patch("ccxt.bitget")
+    def test_market_order_polls_fetch_order_when_filled_zero(
+        self, mock_bitget: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("BITGET_API_KEY", "key")
+        monkeypatch.setenv("BITGET_SECRET", "secret")
+        monkeypatch.setenv("BITGET_PASSPHRASE", "pass")
+
+        mock_instance = MagicMock()
+        mock_instance.create_order.return_value = {
+            "id": "ord-1",
+            "symbol": "NAORIS/USDT:USDT",
+            "side": "sell",
+            "type": "market",
+            "filled": 0,
+            "status": "open",
+        }
+        mock_instance.fetch_order.return_value = {
+            "id": "ord-1",
+            "symbol": "NAORIS/USDT:USDT",
+            "side": "sell",
+            "type": "market",
+            "amount": 1177.0,
+            "filled": 1177.0,
+            "status": "closed",
+            "average": 0.0345,
+        }
+        mock_bitget.return_value = mock_instance
+
+        from extensions.trading.crypto.live._bitget_exchange import BitgetExchange
+        ex = BitgetExchange()
+        result = ex.create_market_order("NAORISUSDT", "sell", 1177.0, reduce_only=True)
+
+        assert result["filled"] == 1177.0
+        mock_instance.fetch_order.assert_called()
