@@ -191,6 +191,15 @@ class BitgetExchange(ExchangeBase):
                 "defaultType": "swap",  # 永续合约 / perpetual swap
             },
         }
+        try:
+            from extensions.backtest.ccxt_helpers import ccxt_proxies_dict
+
+            proxies = ccxt_proxies_dict()
+            if proxies:
+                exchange_config["proxies"] = proxies
+                logger.info("Bitget ccxt proxy enabled")
+        except ImportError:
+            pass
 
         self._ccxt = ccxt.bitget(exchange_config)
         self._ccxt.markets = {}

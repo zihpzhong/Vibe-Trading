@@ -59,6 +59,26 @@ _PROJECT_ROOT = _EXT_ROOT.parent  # project root
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_EXT_ROOT))
 
+_AGENT_ENV = _PROJECT_ROOT / "agent" / ".env"
+_EXT_ENV_LOCAL = _EXT_ROOT / "config" / ".env.local"
+
+
+def _load_runtime_env() -> None:
+    """加载 agent/.env 与 extensions/config/.env.local（若存在）。
+    Load agent/.env and extensions/config/.env.local when present.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    if _AGENT_ENV.is_file():
+        load_dotenv(_AGENT_ENV, override=False)
+    if _EXT_ENV_LOCAL.is_file():
+        load_dotenv(_EXT_ENV_LOCAL, override=True)
+
+
+_load_runtime_env()
+
 from logging.handlers import RotatingFileHandler
 
 # 日志目录
@@ -244,6 +264,14 @@ def build_status_table(
 
 def main() -> int:
     args = parse_args()
+    try:
+        from extensions.backtest.ccxt_helpers import apply_proxy_env
+
+        proxy_url = apply_proxy_env()
+        if proxy_url:
+            log.info("CCXT proxy enabled: %s", proxy_url)
+    except ImportError:
+        pass
     if args.market == "astock":
         from extensions import run_astock_trading
 
@@ -280,7 +308,17 @@ def main() -> int:
     config.scan_top_n = whitelist_cfg.scan_top_n
     # 3) CLI 参数覆盖
     config.default_scan_interval_minutes = args.interval
-    config.exchange_name = args.exchange or os.environ.get("CRYPTO_EXCHANGE", config.exchange_name)
+    config.exchange_name = (
+        args.exchange
+        or os.environ.get("CRYPTO_EXCHANGE", "").strip().lower()
+        or config.exchange_name
+    )
+    # Bitget 无交易所原生 bracket，强制软件 TPSL / No native brackets on Bitget
+    if config.exchange_name == "bitget" and config.use_exchange_bracket_orders:
+        log.info(
+            "Bitget 不支持交易所原生 SL/TP，已关闭 use_exchange_bracket_orders，使用软件 TPSL",
+        )
+        config.use_exchange_bracket_orders = False
 
     # 4) 从 config.json 解析交易循环参数
     _min_entry_score = int(_get_cfg("trading", "min_entry_score", DEFAULT_MIN_ENTRY_SCORE))  # type: ignore[arg-type]
@@ -323,7 +361,7 @@ def main() -> int:
 
     mode_label = {"default": "默认", "conservative": "保守", "aggressive": "激进"}
     # ---- 交易所 ----
-    exchange_name = args.exchange or os.environ.get("CRYPTO_EXCHANGE", "binance")
+    exchange_name = config.exchange_name
     exchange = create_exchange(mock=args.mock, exchange_name=exchange_name)
     log.info(
         "Exchange: %s (mock=%s, exchange=%s, auth=%s)",
