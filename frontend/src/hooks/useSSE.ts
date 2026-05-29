@@ -83,6 +83,7 @@ export function useSSE(config?: SSEConfig) {
       "text_delta", "thinking_done", "tool_call", "tool_result", "compact",
       "attempt.completed", "attempt.failed",
       "goal.created", "goal.evidence", "goal.updated",
+      "mandate.proposal", "mandate.committed", "live.halted", "live.resumed", "live.action",
       "heartbeat", "done",
     ];
 

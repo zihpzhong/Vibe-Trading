@@ -143,3 +143,34 @@ def test_answer_renderer_upgrades_markdown_pipe_tables() -> None:
     assert "$217.61" in out
     assert "Metric" in out
     assert "| **Last** | **$217.61** |" not in out
+
+
+def test_answer_renderer_strips_standalone_horizontal_rules() -> None:
+    """`---` HR lines render as ugly full-width terminal lines — drop them."""
+    content = """## Section A
+
+收益指标
+- total_return: 15%
+
+---
+
+## Section B
+
+风险指标
+- max_drawdown: -8%
+
+***
+
+## Section C
+
+更多内容
+"""
+    out = _render(render_answer(content))
+
+    assert "Section A" in out
+    assert "Section B" in out
+    assert "Section C" in out
+    # Rich's HR is rendered with U+2500. After stripping `---` / `***`
+    # standalone lines, no run of three or more box-drawing chars should
+    # appear in the rendered output (table borders are short and bracketed).
+    assert "─" * 10 not in out

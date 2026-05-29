@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, useMemo, useCallback, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play } from "lucide-react";
+import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
 import { useAgentStore } from "@/stores/agent";
 import { useSSE } from "@/hooks/useSSE";
-import { ApiError, api, type GoalSnapshot } from "@/lib/api";
+import { ApiError, api, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LiveStatus } from "@/lib/api";
 import { isReportWorthyRun } from "@/lib/runReports";
 import type { AgentMessage, ToolCallEntry } from "@/types/agent";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
@@ -13,6 +13,8 @@ import { MessageBubble } from "@/components/chat/MessageBubble";
 import { ThinkingTimeline } from "@/components/chat/ThinkingTimeline";
 import { ConversationTimeline } from "@/components/chat/ConversationTimeline";
 import { ToolProgressIndicator } from "@/components/chat/ToolProgressIndicator";
+import { MandateProposalCard } from "@/components/chat/MandateProposalCard";
+import { RunnerStatus } from "@/components/chat/RunnerStatus";
 
 /* ---------- Message grouping ---------- */
 type MsgGroup =
@@ -36,6 +38,72 @@ function groupMessages(msgs: AgentMessage[]): MsgGroup[] {
 }
 
 const act = () => useAgentStore.getState();
+
+/** Poll cadence for the shared `GET /live/status` snapshot. */
+const LIVE_STATUS_POLL_INTERVAL_MS = 15_000;
+
+/* ---------- Live trading channel ----------
+ * Mandate proposals and live-action chips render as standalone timeline items,
+ * never folded into the thinking timeline (SPEC Consent §2 grouping note). They
+ * are driven by dedicated state rather than the chat message store because they
+ * are privileged-surface artifacts, not chat messages, and the proposal card
+ * needs commit/adjust callbacks the generic MessageBubble does not carry. */
+interface ProposalItem {
+  kind: "proposal";
+  timestamp: number;
+  proposal: MandateProposal;
+}
+interface LiveActionItem {
+  kind: "live_action";
+  timestamp: number;
+  action: LiveAction;
+}
+type LiveItem = ProposalItem | LiveActionItem;
+
+function liveActionStyle(kind: string): { icon: typeof Activity; tone: string } {
+  switch (kind) {
+    case "order_rejected":
+    case "breach":
+      return { icon: Ban, tone: "border-amber-500/40 bg-amber-500/5 text-amber-600 dark:text-amber-400" };
+    case "halt_tripped":
+      return { icon: OctagonX, tone: "border-destructive/40 bg-destructive/5 text-destructive" };
+    case "mandate_committed":
+    case "halt_cleared":
+      return { icon: CheckCircle2, tone: "border-emerald-500/40 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400" };
+    default:
+      return { icon: Activity, tone: "border-sky-500/40 bg-sky-500/5 text-sky-600 dark:text-sky-400" };
+  }
+}
+
+function liveActionLabel(action: LiveAction): string {
+  return action.kind.replace(/_/g, " ");
+}
+
+function LiveActionChip({ action }: { action: LiveAction }) {
+  const { icon: Icon, tone } = liveActionStyle(action.kind);
+  return (
+    <div className="flex gap-3">
+      <AgentAvatar />
+      <div className="flex-1 min-w-0">
+        <div className={["inline-flex max-w-full flex-wrap items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs", tone].join(" ")}>
+          <Icon className="h-3 w-3 shrink-0" />
+          <span className="shrink-0 font-medium uppercase tracking-wide text-[10px]">LIVE</span>
+          <span className="shrink-0 font-medium">{liveActionLabel(action)}</span>
+          {action.intent_normalized && (
+            <span className="truncate text-foreground/80">· {action.intent_normalized}</span>
+          )}
+          {action.outcome && (
+            <span className="shrink-0 font-mono text-[10px] text-muted-foreground">· {action.outcome}</span>
+          )}
+          {action.remote_tool && (
+            <span className="shrink-0 font-mono text-[10px] text-muted-foreground">· {action.remote_tool}</span>
+          )}
+          {action.error && <span className="truncate text-destructive">· {action.error}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function isCriterionStatusMet(status: string): boolean {
   return !["", "pending", "open", "unsatisfied"].includes(status.toLowerCase());
@@ -137,6 +205,23 @@ export function Agent() {
   const [goalSnapshot, setGoalSnapshot] = useState<GoalSnapshot | null>(null);
   const [goalEditActive, setGoalEditActive] = useState(false);
   const [goalEditValue, setGoalEditValue] = useState("");
+
+  /* Live trading channel state (SPEC Consent §1/§4/§5) */
+  const [liveItems, setLiveItems] = useState<LiveItem[]>([]);
+  const [committedMandates, setCommittedMandates] = useState<Record<string, MandateCommitted>>({});
+  const [liveHalted, setLiveHalted] = useState<LiveHalted | null>(null);
+  const [halting, setHalting] = useState(false);
+  /* Bumped to force an immediate live-status re-poll on a live event
+   * (commit / halt / resume / runner-affecting action) rather than waiting a tick. */
+  const [liveStatusRefresh, setLiveStatusRefresh] = useState(0);
+  /* Shared `GET /live/status` snapshot. Owned here (single poller) and passed down
+   * to RunnerStatus, so the global kill switch can be shown whenever live trading
+   * could be active out-of-band (CLI/another session), not only off in-session SSE
+   * items (audit M2: always-available global halt — SPEC Consent §4). */
+  const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
+  /* The status endpoint is not wired on every backend; a 404/501 hides the panel
+   * and removes status from the kill-switch visibility condition. */
+  const [liveStatusUnavailable, setLiveStatusUnavailable] = useState(false);
 
   const messages = useAgentStore(s => s.messages);
   const streamingText = useAgentStore(s => s.streamingText);
@@ -439,6 +524,59 @@ export function Agent() {
         loadGoalSnapshot(sid);
       },
 
+      "mandate.proposal": (d) => {
+        touch();
+        const proposal = d as unknown as MandateProposal;
+        if (!proposal.proposal_id || !Array.isArray(proposal.profiles)) return;
+        setLiveItems((items) => [...items, { kind: "proposal", timestamp: Date.now(), proposal }]);
+        scrollToBottom();
+      },
+
+      "mandate.committed": (d) => {
+        touch();
+        const committed = d as unknown as MandateCommitted;
+        if (!committed.proposal_id) return;
+        setCommittedMandates((prev) => ({ ...prev, [committed.proposal_id as string]: committed }));
+        // A fresh mandate may bring up the runner; refresh the runtime panel now.
+        setLiveStatusRefresh((n) => n + 1);
+        scrollToBottom();
+      },
+
+      "live.halted": (d) => {
+        touch();
+        const halted = d as unknown as LiveHalted;
+        // Preemptive kill switch: the server has cancelled resting orders and may have
+        // flattened positions (SPEC §7.5 #6). Reflect the halted state across surfaces;
+        // the RunnerStatus panel re-polls so its per-broker rows show "halted".
+        setLiveHalted(halted);
+        setLiveStatusRefresh((n) => n + 1);
+        toast.warning("Live trading halted — runner stopped, resting orders cancelled");
+      },
+
+      "live.resumed": (d) => {
+        touch();
+        // Kill switch cleared via a privileged surface action (SPEC Consent §4);
+        // clear the halted banner and re-poll runtime status.
+        void d;
+        setLiveHalted(null);
+        setLiveStatusRefresh((n) => n + 1);
+        toast.success("Live trading resumed");
+      },
+
+      "live.action": (d) => {
+        touch();
+        const action = d as unknown as LiveAction;
+        if (!action.kind) return;
+        setLiveItems((items) => [...items, { kind: "live_action", timestamp: Date.now(), action }]);
+        if (action.kind === "halt_tripped") setLiveHalted({ reason: action.intent_normalized });
+        if (action.kind === "halt_cleared") setLiveHalted(null);
+        // Mandate-affecting / runner-affecting actions should refresh the runtime panel.
+        if (["mandate_committed", "halt_tripped", "halt_cleared"].includes(action.kind)) {
+          setLiveStatusRefresh((n) => n + 1);
+        }
+        scrollToBottom();
+      },
+
       heartbeat: () => {},
       reconnect: (d) => { act().setSseStatus("reconnecting", Number(d.attempt ?? 0)); },
     });
@@ -451,6 +589,11 @@ export function Agent() {
       const gen = genRef.current + 1;
       genRef.current = gen;
       doDisconnect();
+      // Live-channel timeline items are per-session; clear on switch.
+      setLiveItems([]);
+      setCommittedMandates({});
+      setLiveHalted(null);
+      setLiveStatusRefresh((n) => n + 1);
       if (curSid && curMsgs.length > 0) cacheSession(curSid, curMsgs);
 
       // Atomic switch: cache hit = instant, cache miss = show loading skeleton
@@ -465,10 +608,43 @@ export function Agent() {
     } else if (!urlSessionId && curSid) {
       genRef.current += 1;
       doDisconnect();
+      setLiveItems([]);
+      setCommittedMandates({});
+      setLiveHalted(null);
+      setLiveStatusRefresh((n) => n + 1);
       if (curSid && curMsgs.length > 0) cacheSession(curSid, curMsgs);
       reset();
     }
   }, [urlSessionId, doDisconnect, loadSessionMessages, setupSSE, forceScrollToBottom]);
+
+  /* Single shared poller for `GET /live/status`. RunnerStatus consumes this snapshot
+   * as a prop rather than polling independently, and the global kill switch reads it
+   * to stay available whenever live trading could be active out-of-band. */
+  const refreshLiveStatus = useCallback(async () => {
+    try {
+      const next = await api.getLiveStatus();
+      setLiveStatus(next);
+      setLiveStatusUnavailable(false);
+    } catch (error) {
+      // A 404/501 means the runtime endpoint is not wired on this backend; treat the
+      // status source as unavailable. Any other failure keeps the last snapshot.
+      if (error instanceof ApiError && (error.status === 404 || error.status === 501)) {
+        setLiveStatus(null);
+        setLiveStatusUnavailable(true);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshLiveStatus();
+    const timer = setInterval(refreshLiveStatus, LIVE_STATUS_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [refreshLiveStatus]);
+
+  // Force an immediate re-poll when a live event bumps refreshKey (commit/halt/resume).
+  useEffect(() => {
+    if (liveStatusRefresh > 0) refreshLiveStatus();
+  }, [liveStatusRefresh, refreshLiveStatus]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -587,6 +763,28 @@ export function Agent() {
       toast.error("Cancel failed");
     }
   };
+
+  const handleHaltLive = useCallback(async () => {
+    if (halting) return;
+    setHalting(true);
+    try {
+      // The kill switch is global and must fire even with no active chat session
+      // (e.g. a runner started from the CLI / another session). The backend scopes
+      // the SSE broadcast by session_id when present; an empty string is a valid
+      // global trip.
+      await api.haltLive(sessionId ?? "");
+      // Preemptive halt: the server trips the kill switch (cancel resting orders +
+      // optional flatten per SPEC §7.5 #6) and broadcasts live.halted. Reflect
+      // optimistically and re-poll the runtime panel so the runner shows stopped.
+      setLiveHalted((cur) => cur ?? { by: "frontend", tripped_at: new Date().toISOString() });
+      setLiveStatusRefresh((n) => n + 1);
+      toast.success("Live trading halted");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to halt live trading.");
+    } finally {
+      setHalting(false);
+    }
+  }, [sessionId, halting]);
 
   const handleCancelGoal = useCallback(async () => {
     if (!sessionId || !goalSnapshot) return;
@@ -734,6 +932,42 @@ export function Agent() {
   const groups = useMemo(() => groupMessages(messages), [messages]);
   const goalProgress = useMemo(() => getGoalProgress(goalSnapshot), [goalSnapshot]);
 
+  /* Merge message groups with live-channel items, ordered by timestamp, so a
+   * mandate proposal / live-action chip renders inline at the point it arrived. */
+  type TimelineRow =
+    | { sort: number; render: "group"; group: MsgGroup; key: string }
+    | { sort: number; render: "live"; item: LiveItem; key: string };
+  const timelineRows = useMemo<TimelineRow[]>(() => {
+    const rows: TimelineRow[] = groups.map((g, i) => {
+      const ts = g.kind === "timeline" ? g.msgs[0].timestamp : g.msg.timestamp;
+      const key = g.kind === "timeline" ? `g_${g.msgs[0].id || g.msgs[0].timestamp}` : `g_${g.msg.id || g.msg.timestamp}_${i}`;
+      return { sort: ts, render: "group", group: g, key };
+    });
+    for (const item of liveItems) {
+      const key = item.kind === "proposal" ? `lp_${item.proposal.proposal_id}` : `la_${item.action.audit_id || item.timestamp}`;
+      rows.push({ sort: item.timestamp, render: "live", item, key });
+    }
+    return rows.sort((a, b) => a.sort - b.sort);
+  }, [groups, liveItems]);
+
+  /* Whether live trading could be active *anywhere* — the global kill switch must be
+   * available whenever it could (audit M2 / SPEC Consent §4). Driven off both
+   * in-session SSE artifacts AND the shared `/live/status` snapshot, so a runner
+   * started from the CLI or another browser session still surfaces the halt button
+   * in a freshly-loaded web session. */
+  const liveStatusActive =
+    liveStatus != null &&
+    (liveStatus.halted ||
+      liveStatus.brokers.some((b) => b.authorized || b.runner?.alive || b.mandate != null));
+  const liveActive =
+    liveItems.length > 0 ||
+    Object.keys(committedMandates).length > 0 ||
+    liveHalted != null ||
+    liveStatusActive;
+  /* The kill switch reflects a halt from either an in-session SSE event or the polled
+   * status, so the halted/resumed state stays consistent across surfaces. */
+  const liveIsHalted = liveHalted != null || (liveStatus?.halted ?? false);
+
   return (
     <div className="flex flex-col flex-1 min-w-0 overflow-hidden h-full">
       <div ref={listRef} className="flex-1 overflow-auto p-6 scroll-smooth relative">
@@ -753,19 +987,34 @@ export function Agent() {
           )}
           {!sessionLoading && messages.length === 0 && <WelcomeScreen onExample={runPrompt} />}
 
-          {groups.map((g, i) => {
+          {timelineRows.map((row, rowIdx) => {
+            if (row.render === "live") {
+              if (row.item.kind === "proposal") {
+                return (
+                  <MandateProposalCard
+                    key={row.key}
+                    proposal={row.item.proposal}
+                    committed={committedMandates[row.item.proposal.proposal_id] ?? null}
+                    onAdjust={runPrompt}
+                  />
+                );
+              }
+              return <LiveActionChip key={row.key} action={row.item.action} />;
+            }
+            const g = row.group;
             if (g.kind === "timeline") {
+              const isLastRow = rowIdx === timelineRows.length - 1;
               return (
                 <ThinkingTimeline
-                  key={g.msgs[0].id || g.msgs[0].timestamp}
+                  key={row.key}
                   messages={g.msgs}
-                  isLatest={i === groups.length - 1 && status === "streaming"}
+                  isLatest={isLastRow && status === "streaming"}
                 />
               );
             }
             const msgIdx = messages.indexOf(g.msg);
             return (
-              <div key={g.msg.id || g.msg.timestamp} data-msg-idx={msgIdx}>
+              <div key={row.key} data-msg-idx={msgIdx}>
                 <MessageBubble msg={g.msg} onRetry={g.msg.type === "error" ? handleRetry : undefined} />
               </div>
             );
@@ -1002,6 +1251,14 @@ export function Agent() {
               )}
             </div>
           )}
+          {/* Persistent live runtime status panel — sits alongside the goal/mandate
+              badges (SPEC §7.5 + audit C2). Self-hides when no broker is configured. */}
+          <RunnerStatus
+            status={liveStatus}
+            unavailable={liveStatusUnavailable}
+            halted={liveIsHalted}
+            onRefresh={refreshLiveStatus}
+          />
           {/* Attachment badge */}
           {attachment && (
             <div className="flex items-center gap-1">
@@ -1019,6 +1276,29 @@ export function Agent() {
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
               Uploading...
+            </div>
+          )}
+          {/* Persistent kill switch — distinct from the per-turn Stop button
+              above; disables all live order activity (SPEC Consent §4). */}
+          {liveActive && (
+            <div className="flex items-center gap-2">
+              {liveIsHalted ? (
+                <span className="inline-flex items-center gap-1.5 rounded-lg bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive">
+                  <OctagonX className="h-3 w-3" />
+                  Live trading halted
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleHaltLive}
+                  disabled={halting}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/5 px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-40"
+                  title="Instantly halt all live trading for this session"
+                >
+                  {halting ? <Loader2 className="h-3 w-3 animate-spin" /> : <OctagonX className="h-3 w-3" />}
+                  Halt live trading
+                </button>
+              )}
             </div>
           )}
           <div className="flex gap-2 items-end">

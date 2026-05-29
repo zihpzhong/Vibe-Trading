@@ -15,6 +15,9 @@ from rich.text import Text
 from cli.theme import Theme
 
 _PIPE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+# Standalone markdown horizontal rule (---, ***, ___). Stripped from
+# assistant answers so they don't render as full-width terminal lines.
+_HR_LINE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
 _PROMPT_BORDER = "#4b5563"
 _MUTED = "#6b7280"
 
@@ -90,6 +93,11 @@ def render_answer(content: str) -> Group:
                 blocks.append(table)
             else:
                 pending.extend(table_lines)
+            continue
+        if _HR_LINE.match(lines[index]):
+            # Drop standalone horizontal rules — Rich renders them as a
+            # full-width terminal line that looks like a separator border.
+            index += 1
             continue
         pending.append(lines[index])
         index += 1
