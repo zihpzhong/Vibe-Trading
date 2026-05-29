@@ -47,6 +47,7 @@ class Position:
     de_risk_level: int = 0  # 已触发的最高 de-risk 级别 (0-4)
     sl_order_id: Optional[str] = None  # 交易所止损单 ID
     tp_order_id: Optional[str] = None  # 交易所止盈单 ID
+    entry_atr: float = 0.0  # 开仓时 ATR(14) 值，用于 ATR 基础 TP/SL 计算 / ATR at entry for ATR-based TP
 
     def __post_init__(self) -> None:
         if not self.opened_at:
@@ -74,6 +75,7 @@ class Position:
             "de_risk_level": self.de_risk_level,
             "sl_order_id": self.sl_order_id,
             "tp_order_id": self.tp_order_id,
+            "entry_atr": self.entry_atr,
         }
 
     @classmethod
@@ -94,6 +96,7 @@ class Position:
             de_risk_level=int(d.get("de_risk_level", 0)),
             sl_order_id=d.get("sl_order_id") or None,
             tp_order_id=d.get("tp_order_id") or None,
+            entry_atr=float(d.get("entry_atr", 0.0)),
         )
 
 
@@ -254,10 +257,15 @@ class PositionTracker:
         self._migrate_positions_schema()
 
     def _migrate_positions_schema(self) -> None:
-        """Add columns for exchange bracket order IDs (idempotent)."""
-        for col in ("sl_order_id", "tp_order_id"):
+        """Add columns for exchange bracket order IDs and entry_atr (idempotent)."""
+        cols = [
+            ("sl_order_id", "TEXT"),
+            ("tp_order_id", "TEXT"),
+            ("entry_atr", "REAL DEFAULT 0.0"),
+        ]
+        for col_name, col_type in cols:
             try:
-                self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col} TEXT")
+                self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col_name} {col_type}")
             except sqlite3.OperationalError:
                 pass
 
@@ -275,6 +283,7 @@ class PositionTracker:
         take_profit: Optional[float] = None,
         leverage: int = 1,
         entry_score: int = -1,
+        entry_atr: float = 0.0,
     ) -> Position:
         """Record a new position. Overwrites existing position for the same symbol."""
         with self._lock:
@@ -287,6 +296,7 @@ class PositionTracker:
                 take_profit=take_profit,
                 leverage=leverage,
                 entry_score=entry_score,
+                entry_atr=entry_atr,
             )
             self._positions[symbol] = pos
             # Record cooldown to prevent immediate re-entry
@@ -715,6 +725,60 @@ class PositionTracker:
         return result
 
     # ------------------------------------------------------------------
+    # Gate result persistence
+    # ------------------------------------------------------------------
+
+    def record_gate_result(
+        self,
+        symbol: str,
+        direction: str,
+        score: int,
+        gate_status: str,
+        gate_checks: Optional[list[dict[str, Any]]] = None,
+        phase2_consensus: Optional[str] = None,
+        summary: str = "",
+    ) -> None:
+        """Persist a gate evaluation result for post-trade analysis.
+
+        Called after every Phase2 + Gate evaluation (PASS/WATCH_ONLY/REJECT),
+        regardless of whether a position was opened.
+
+        Args:
+            symbol: Trading symbol.
+            direction: LONG or SHORT.
+            score: Phase 1 entry score.
+            gate_status: GateStatus value (PASS, WATCH_ONLY, REJECT).
+            gate_checks: List of check dicts from ExecutionGateResult.
+            phase2_consensus: Phase 2 consensus verdict (PASS/NEUTRAL/FAIL).
+            summary: One-line summary from gate result.
+        """
+        import json
+
+        if self._conn is None:
+            return
+        try:
+            checks_json = json.dumps(gate_checks or [], ensure_ascii=False)
+            self._conn.execute(
+                """INSERT INTO gate_results
+                   (timestamp, symbol, direction, score, phase2_consensus,
+                    gate_status, gate_checks, summary)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    symbol,
+                    direction,
+                    score,
+                    phase2_consensus,
+                    gate_status,
+                    checks_json,
+                    summary,
+                ),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.warning("Failed to persist gate result for %s: %s", symbol, exc)
+
+    # ------------------------------------------------------------------
     # Guards
     # ------------------------------------------------------------------
 
@@ -949,13 +1013,13 @@ class PositionTracker:
                        (symbol, direction, entry_price, quantity, stop_loss,
                         take_profit, opened_at, dca_count, leverage, entry_score,
                         first_entry_cost, first_entry_quantity, de_risk_level,
-                        sl_order_id, tp_order_id)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        sl_order_id, tp_order_id, entry_atr)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (pos.symbol, pos.direction, pos.entry_price, pos.quantity,
                      pos.stop_loss, pos.take_profit, pos.opened_at, pos.dca_count,
                      pos.leverage, pos.entry_score, pos.first_entry_cost,
                      pos.first_entry_quantity, pos.de_risk_level,
-                     pos.sl_order_id, pos.tp_order_id),
+                     pos.sl_order_id, pos.tp_order_id, pos.entry_atr),
                 )
 
             # Closed trades: incremental append
@@ -1072,6 +1136,7 @@ class PositionTracker:
                     de_risk_level=row["de_risk_level"],
                     sl_order_id=row["sl_order_id"] if "sl_order_id" in keys else None,
                     tp_order_id=row["tp_order_id"] if "tp_order_id" in keys else None,
+                    entry_atr=float(row["entry_atr"]) if "entry_atr" in keys else 0.0,
                 )
 
             # Closed trades

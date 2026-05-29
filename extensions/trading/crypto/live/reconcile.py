@@ -40,6 +40,17 @@ def reconcile_positions(
             continue
         exch_map[sym] = raw
 
+    # 防御：交易所返回空持仓列表但本地有持仓时拒绝全量对账
+    # 交易所维护/API 异常返回 [] 不应导致本地持仓被误判为幽灵全平
+    # Guard: skip reconcile when exchange returns zero positions but tracker has active ones
+    if not exch_map and tracker.active_count > 0:
+        logger.warning(
+            "Reconcile: exchange returned zero positions but %d local active — "
+            "skipping to prevent false ghost-close (possible API maintenance/error)",
+            tracker.active_count,
+        )
+        return {"removed": [], "adopted": [], "unchanged": tracker.active_count}
+
     removed: list[str] = []
     adopted: list[str] = []
 

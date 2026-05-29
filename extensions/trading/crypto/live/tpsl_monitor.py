@@ -338,27 +338,45 @@ class TPSLMonitor(Thread):
     # ------------------------------------------------------------------
 
     def _check_take_profit(self, pos: Position, price: float) -> bool:
-        """Check if TP level is reached — time-decaying minimal_roi style.
+        """Check if TP level is reached — time-decaying with ATR-aware thresholds.
 
-        The longer the position is held, the lower the TP threshold:
+        ATR-based multipliers (preferred when entry_atr > 0):
+          < 30 min : ATR * 2.5
+          30-60 min : ATR * 2.0
+          60-120 min: ATR * 1.5
+          > 120 min : ATR * 1.0
+
+        Fixed-percentage fallback (when entry_atr == 0):
           < 30 min : +8%
           30-60 min : +5%
           60-120 min: +3%
-          > 120 min : +2% (保本附近)
+          > 120 min : +2%
 
         If a fixed take_profit is set, uses the tighter of the two.
         """
         elapsed = time.time() - datetime.fromisoformat(pos.opened_at).timestamp()
         elapsed_min = elapsed / 60
 
-        if elapsed_min < 30:
-            tp_pct = 0.08
-        elif elapsed_min < 60:
-            tp_pct = 0.05
-        elif elapsed_min < 120:
-            tp_pct = 0.03
+        use_atr = pos.entry_atr > 0 and pos.entry_price > 0
+        if use_atr:
+            atr_pct = pos.entry_atr / pos.entry_price
+            if elapsed_min < 30:
+                tp_pct = atr_pct * 2.5
+            elif elapsed_min < 60:
+                tp_pct = atr_pct * 2.0
+            elif elapsed_min < 120:
+                tp_pct = atr_pct * 1.5
+            else:
+                tp_pct = atr_pct * 1.0
         else:
-            tp_pct = 0.02
+            if elapsed_min < 30:
+                tp_pct = 0.08
+            elif elapsed_min < 60:
+                tp_pct = 0.05
+            elif elapsed_min < 120:
+                tp_pct = 0.03
+            else:
+                tp_pct = 0.02
 
         thresholds = [tp_pct]
         if pos.take_profit is not None:

@@ -116,9 +116,9 @@ Rules:
 - FAIL = dimension opposes the signal or shows danger
 """
         if tier == "fast_track":
-            base += """- consensus = PASS when at least one dimension is PASS and none are FAIL
+            base += """- consensus = PASS when at least two dimensions are PASS and none are FAIL
 - consensus = FAIL if any required dim is FAIL
-- consensus = NEUTRAL if ALL dimensions are NEUTRAL"""
+- consensus = NEUTRAL if fewer than two dimensions are PASS (and none FAIL)"""
         else:
             base += """- consensus = PASS when >= 50% of required dims are PASS and none are FAIL
 - consensus = FAIL if any required dim is FAIL

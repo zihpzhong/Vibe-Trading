@@ -38,6 +38,16 @@ class DeRiskConfig:
 
 
 @dataclass
+class TrailingStopConfig:
+    """移动止损配置 / Trailing stop configuration."""
+
+    activation_pct: float = 3.0  # 盈利达到此百分比后激活移动止损 / profit % to activate
+    trail_distance_pct: float = 2.5  # 追踪距离 (%) — 原 1.5 过紧易被噪音触发 / trail distance behind peak
+    atr_based: bool = False  # 若 True，追踪距离 = ATR × trail_atr_multiplier
+    trail_atr_multiplier: float = 0.8  # ATR 乘数（当 atr_based=True 时生效）
+
+
+@dataclass
 class ATRStopConfig:
     """ATR 动态止损配置."""
 
@@ -107,6 +117,7 @@ class LiveTradingConfig:
     execution_gate: ExecutionGateConfig = field(default_factory=ExecutionGateConfig)
     de_risk: DeRiskConfig = field(default_factory=DeRiskConfig)
     dca: DCAConfig = field(default_factory=DCAConfig)
+    trailing_stop: TrailingStopConfig = field(default_factory=TrailingStopConfig)
     scan_top_n: int = 20  # Phase 1 扫描数量
     scan_batch_size: int = 5  # 并发批次大小
     default_scan_interval_minutes: int = 5  # 闪电模式默认间隔
@@ -121,6 +132,7 @@ class LiveTradingConfig:
         "btc_conduction": "BTCConductionConfig",
         "de_risk": "DeRiskConfig",
         "dca": "DCAConfig",
+        "trailing_stop": "TrailingStopConfig",
     }
     """Mapping from config.json section names to dataclass types."""
 

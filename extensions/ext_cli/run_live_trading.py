@@ -313,13 +313,6 @@ def main() -> int:
         or os.environ.get("CRYPTO_EXCHANGE", "").strip().lower()
         or config.exchange_name
     )
-    # Bitget 无交易所原生 bracket，强制软件 TPSL / No native brackets on Bitget
-    if config.exchange_name == "bitget" and config.use_exchange_bracket_orders:
-        log.info(
-            "Bitget 不支持交易所原生 SL/TP，已关闭 use_exchange_bracket_orders，使用软件 TPSL",
-        )
-        config.use_exchange_bracket_orders = False
-
     # 4) 从 config.json 解析交易循环参数
     _min_entry_score = int(_get_cfg("trading", "min_entry_score", DEFAULT_MIN_ENTRY_SCORE))  # type: ignore[arg-type]
     _score_half = int(_get_cfg("trading", "score_tier_half_size", SCORE_TIER_HALF_SIZE))  # type: ignore[arg-type]
@@ -457,8 +450,8 @@ def main() -> int:
 
     # ---- TP/SL 守护 ----
     _tpsl_poll = float(_get_cfg("tpsl_monitor", "poll_interval_seconds", 5.0))  # type: ignore[arg-type]
-    _tpsl_trail_act = float(_get_cfg("tpsl_monitor", "trailing_activation_pct", 3.0))  # type: ignore[arg-type]
-    _tpsl_trail_dist = float(_get_cfg("tpsl_monitor", "trail_distance_pct", 1.5))  # type: ignore[arg-type]
+    _tpsl_trail_act = float(_get_cfg("tpsl_monitor", "trailing_activation_pct", config.trailing_stop.activation_pct))  # type: ignore[arg-type]
+    _tpsl_trail_dist = float(_get_cfg("tpsl_monitor", "trail_distance_pct", config.trailing_stop.trail_distance_pct))  # type: ignore[arg-type]
     monitor = TPSLMonitor(
         exchange, positions,
         poll_interval=_tpsl_poll,
@@ -532,6 +525,26 @@ def main() -> int:
                     log.warning("  → bracket placement returned no order IDs")
         else:
             log.info("Exchange lacks bracket support — skip retroactive bracket placement")
+
+        # 启动时预置所有白名单 symbol 的保证金模式为逐仓
+        # 提前设置避免开仓时才调 API，Bitget 有持仓时无法切换保证金模式
+        # Pre-set ISOLATED margin for all whitelist symbols at startup
+        if hasattr(exchange, "set_margin_mode"):
+            active_syms = {p.symbol for p in positions.get_active_positions()}
+            init_symbols = config.pair_whitelist if config.pair_whitelist else []
+            if not init_symbols:
+                init_symbols = []  # Top-N 模式无法预先知道所有 symbol，开仓时按需设置
+            isolated_ok = 0
+            for sym in init_symbols:
+                if sym in active_syms:
+                    continue  # 已有持仓无法修改
+                try:
+                    if exchange.set_margin_mode(sym, "ISOLATED"):
+                        isolated_ok += 1
+                except Exception:
+                    pass
+            if isolated_ok > 0:
+                log.info("Pre-set ISOLATED margin for %d/%d whitelist symbols", isolated_ok, len(init_symbols))
 
     # ---- 日亏损熔断 ----
     # ---- 日亏损熔断 ----
@@ -1032,6 +1045,7 @@ def main() -> int:
 
                     # 2c. Phase 2: LLM深度分析 — load_skill per dim → 综合评分
                     watch_only_flag = False
+                    _phase2_consensus: str | None = None
                     phase2_result: dict | None = None
                     alpha_context = extract_alpha_context(ranking_by_symbol.get(symbol, {}))
                     if phase2_analyzer and req.dims:
@@ -1048,6 +1062,7 @@ def main() -> int:
                                 for d in req.dims
                             )
                             consensus = phase2_result.get("consensus", "NEUTRAL")
+                            _phase2_consensus = consensus
                             summary = phase2_result.get("summary", "")
 
                             # Swarm shadow fires for ALL enhanced tier (regardless of gate decision)
@@ -1242,6 +1257,21 @@ def main() -> int:
                         entry_price, stop_price, tp_price, detail,
                     )
 
+                    # 持久化 Gate 评估结果，用于事后分析和参数优化
+                    # Persist gate evaluation for post-trade analysis and param optimization
+                    positions.record_gate_result(
+                        symbol=symbol,
+                        direction=direction.value,
+                        score=score,
+                        gate_status=gate_result.status.value,
+                        gate_checks=[
+                            {"name": c.name, "passed": c.passed, "detail": c.detail}
+                            for c in gate_result.checks
+                        ],
+                        phase2_consensus=_phase2_consensus,
+                        summary=gate_result.summary,
+                    )
+
                     # 2g. Gate PASS → 开仓
                     if gate_result.status.value == "PASS":
                         # 复用 Gate 前置计算的下单量（见 2e 节）
@@ -1287,11 +1317,17 @@ def main() -> int:
                             )
 
                             try:
-                                # Set futures leverage and margin mode before placing order
+                                # 逐仓模式必须在开仓前设置（Bitget 有持仓时无法修改）
+                                # Margin mode must be ISOLATED and set BEFORE opening position
+                                if hasattr(exchange, "set_margin_mode"):
+                                    margin_ok = exchange.set_margin_mode(symbol, "ISOLATED")
+                                    if not margin_ok:
+                                        log.warning(
+                                            "%s: 无法设置为逐仓模式（可能已有持仓），将以当前模式开仓",
+                                            symbol,
+                                        )
                                 if hasattr(exchange, "set_leverage"):
                                     exchange.set_leverage(symbol, leverage=leverage)
-                                if hasattr(exchange, "set_margin_mode"):
-                                    exchange.set_margin_mode(symbol, "ISOLATED")
                                 order = exchange.create_market_order(symbol, direction.value.lower(), quantity)
                                 log.info("Order placed: %s", order)
 
@@ -1330,6 +1366,7 @@ def main() -> int:
                                     take_profit=tp_price,
                                     leverage=leverage,
                                     entry_score=score,
+                                    entry_atr=atr_value,
                                 )
                                 bracket_note = ""
                                 if (

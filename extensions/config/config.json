@@ -5,8 +5,8 @@
     "//exchange_name": "交易所选择: binance 或 bitget。也可通过 CRYPTO_EXCHANGE 环境变量或 --exchange CLI 参数设置",
     "exchange_name": "bitget",
 
-    "//use_exchange_bracket_orders": "开仓后挂交易所原生 SL/TP 条件单。false=回退到软件 TPSL 守护线程。Bitget 不支持原生 bracket",
-    "use_exchange_bracket_orders": false,
+    "//use_exchange_bracket_orders": "开仓后挂交易所原生 SL/TP 条件单。false=回退到软件 TPSL 守护线程。Bitget 通过 ccxt stop_market/take_profit_market 支持原生 bracket",
+    "use_exchange_bracket_orders": true,
 
     "//scan_top_n": "Phase 1 扫描币种数量。0=仅用 pair_whitelist",
     "scan_top_n": 20,

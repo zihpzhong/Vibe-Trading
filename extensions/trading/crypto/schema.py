@@ -16,7 +16,8 @@ SCHEMA_SQL = """
         leverage INTEGER DEFAULT 1, entry_score INTEGER DEFAULT -1,
         first_entry_cost REAL DEFAULT 0.0,
         first_entry_quantity REAL DEFAULT 0.0,
-        de_risk_level INTEGER DEFAULT 0
+        de_risk_level INTEGER DEFAULT 0,
+        entry_atr REAL DEFAULT 0.0
     );
 
     CREATE TABLE IF NOT EXISTS closed_trades (
@@ -54,6 +55,20 @@ SCHEMA_SQL = """
         trailing_stop REAL NOT NULL,
         peak_price REAL NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS gate_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        phase2_consensus TEXT,
+        gate_status TEXT NOT NULL,
+        gate_checks TEXT,
+        summary TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_ts ON gate_results(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_gate_symbol ON gate_results(symbol);
 
     CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY, value TEXT NOT NULL

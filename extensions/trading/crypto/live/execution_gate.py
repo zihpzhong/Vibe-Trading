@@ -195,29 +195,38 @@ class ExecGateEngine:
             )
             return
 
-        # Mid price from best bid/ask
-        best_bid = float(orderbook["bids"][0][0]) if orderbook.get("bids") else signal.entry_price or 0
-        best_ask = float(orderbook["asks"][0][0]) if orderbook.get("asks") else signal.entry_price or 0
+        # 方向匹配基准价格：LONG 用 best_ask（我们向 ask 买入），SHORT 用 best_bid（我们向 bid 卖出）
+        # 避免 mid price 在 spread 大时高估实际冲击（mid=(bid+ask)/2 非实际可成交价）
+        # Direction-matched baseline: LONG→best_ask (we buy from asks), SHORT→best_bid (we sell into bids)
+        best_bid = float(orderbook["bids"][0][0]) if orderbook.get("bids") else 0.0
+        best_ask = float(orderbook["asks"][0][0]) if orderbook.get("asks") else 0.0
 
-        if best_bid <= 0 or best_ask <= 0:
-            result.add_check("orderbook_impact", True, "Invalid bid/ask for mid price, skipping")
-            return
+        if signal.direction == SignalDirection.LONG:
+            baseline = best_ask
+        else:
+            baseline = best_bid
 
-        mid = (best_bid + best_ask) / 2
+        if baseline <= 0:
+            # fallback: use signal entry_price or mid as last resort
+            baseline = signal.entry_price or ((best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0)
+            if baseline <= 0:
+                result.add_check("orderbook_impact", False, "Cannot determine baseline price for impact, skipping")
+                return
+
         vwap = total_cost / filled
-        impact_pct = abs(vwap - mid) / mid * 100
+        impact_pct = abs(vwap - baseline) / baseline * 100
 
         if impact_pct <= max_impact:
             result.add_check(
                 "orderbook_impact", True,
                 f"VWAP impact ~{impact_pct:.2f}% ≤ {max_impact}% "
-                f"(mid={mid:.4f}, vwap={vwap:.4f}, filled={filled:.6f})",
+                f"(baseline={baseline:.4f}, vwap={vwap:.4f}, filled={filled:.6f})",
             )
         else:
             result.add_check(
                 "orderbook_impact", False,
                 f"VWAP impact ~{impact_pct:.2f}% > {max_impact}% "
-                f"(mid={mid:.4f}, vwap={vwap:.4f}, filled={filled:.6f})",
+                f"(baseline={baseline:.4f}, vwap={vwap:.4f}, filled={filled:.6f})",
             )
 
     def _check_risk_reward(self, result: ExecutionGateResult, signal: LiveSignal) -> None:

@@ -241,14 +241,12 @@ class BitgetExchange(ExchangeBase):
 
     Uses ccxt.bitget() with defaultType='swap' for perpetual futures.
     Without API keys, market-data methods still work (public endpoints).
-    Trading methods raise RuntimeError with a clear message.
+    Trading methods implemented.
 
-    Note: Bitget does NOT support exchange-native bracket orders
-    (stop-loss / take-profit conditional orders) matching Binance's
-    Algo Order API. Both create_stop_loss_order() and
-    create_take_profit_order() raise NotImplementedError, causing
-    has_bracket_support() to return False. Software TPSL handles
-    all risk management.
+    Supports exchange-native bracket orders (stop-loss / take-profit conditional
+    orders) via ccxt stop_market / take_profit_market order types.
+    Software TPSL handles trailing stop, DCA, and de-risk as usual —
+    these paths cancel exchange brackets before issuing market closes.
     """
 
     def __init__(self) -> None:
@@ -431,6 +429,20 @@ class BitgetExchange(ExchangeBase):
             return float(rounded)
         return round(qty, 6)
 
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round price using ccxt tick_size to match exchange precision.
+        使用 tick_size 匹配交易所价格精度。
+        """
+        tick = self._tick_sizes.get(symbol)
+        if tick and tick > 0:
+            from decimal import Decimal, ROUND_HALF_UP
+            tick_d = Decimal(str(tick))
+            price_d = Decimal(str(price))
+            rounded = (price_d / tick_d).to_integral_value(rounding=ROUND_HALF_UP) * tick_d
+            return float(rounded)
+        decimals = 2 if price >= 1 else 6
+        return round(price, decimals)
+
     def _resolve_filled_qty(self, raw: dict, symbol: str, requested_qty: float) -> float:
         """Resolve filled qty; Bitget create_order often returns filled=0 initially.
         解析成交量；Bitget 下单响应常延迟填充 filled 字段。
@@ -518,6 +530,76 @@ class BitgetExchange(ExchangeBase):
             side=ccxt_side,
             price=price,
         )
+
+    def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
+        """Place stop-loss plan order via ccxt dedicated method.
+        Bitget 通过 ccxt create_stop_loss_order 创建 plan order（planType=loss_plan）。
+        """
+        self._require_auth("stop_loss_order")
+        self._require_markets()
+        ccxt_sym = _ccxt_symbol(symbol)
+        ccxt_side = side.lower()
+        qty = self._round_qty(symbol, amount)
+        if qty <= 0:
+            raise RuntimeError(
+                f"stop_loss({symbol},{side},{amount},{stop_price}) rounds to {qty} — below minimum tradeable"
+            )
+        trigger_price = self._round_price(symbol, stop_price)
+
+        def _place() -> dict:
+            return self._ccxt.create_stop_loss_order(
+                ccxt_sym, "market", ccxt_side, qty, None, trigger_price,
+                {"reduceOnly": True},
+            )
+
+        with self._lock:
+            raw = _retry_ccxt(f"stop_loss({symbol})", _place)
+
+        return {
+            "order_id": str(raw.get("id", "")),
+            "symbol": symbol,
+            "side": side,
+            "type": "stop_loss",
+            "amount": amount,
+            "stop_price": stop_price,
+            "filled": float(raw.get("filled", 0) or 0),
+            "status": raw.get("status", ""),
+        }
+
+    def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
+        """Place take-profit plan order via ccxt dedicated method.
+        Bitget 通过 ccxt create_take_profit_order 创建 plan order（planType=profit_plan）。
+        """
+        self._require_auth("take_profit_order")
+        self._require_markets()
+        ccxt_sym = _ccxt_symbol(symbol)
+        ccxt_side = side.lower()
+        qty = self._round_qty(symbol, amount)
+        if qty <= 0:
+            raise RuntimeError(
+                f"take_profit({symbol},{side},{amount},{tp_price}) rounds to {qty} — below minimum tradeable"
+            )
+        trigger_price = self._round_price(symbol, tp_price)
+
+        def _place() -> dict:
+            return self._ccxt.create_take_profit_order(
+                ccxt_sym, "market", ccxt_side, qty, None, trigger_price,
+                {"reduceOnly": True},
+            )
+
+        with self._lock:
+            raw = _retry_ccxt(f"take_profit({symbol})", _place)
+
+        return {
+            "order_id": str(raw.get("id", "")),
+            "symbol": symbol,
+            "side": side,
+            "type": "take_profit",
+            "amount": amount,
+            "tp_price": tp_price,
+            "filled": float(raw.get("filled", 0) or 0),
+            "status": raw.get("status", ""),
+        }
 
     def cancel_order(self, order_id: str, symbol: str) -> dict:
         """Cancel an open order via ccxt."""
@@ -691,22 +773,29 @@ class BitgetExchange(ExchangeBase):
         except Exception as exc:
             logger.warning("Bitget set_leverage failed for %s: %s", symbol, exc)
 
-    def set_margin_mode(self, symbol: str, mode: str = "ISOLATED") -> None:
-        """Set margin mode via ccxt (isolated or cross)."""
+    def set_margin_mode(self, symbol: str, mode: str = "ISOLATED") -> bool:
+        """Set margin mode via ccxt (isolated or cross).
+
+        Returns True if margin mode was successfully set or already correct.
+        Returns False if the change failed (e.g. position exists on symbol).
+        Bitget 不允许在有持仓时改变保证金模式。
+        """
         if not self._has_auth:
-            return
+            return False
         ccxt_sym = _ccxt_symbol(symbol)
         ccxt_mode = "isolated" if mode.upper() == "ISOLATED" else "cross"
         try:
             with self._lock:
                 self._ccxt.set_margin_mode(ccxt_mode, ccxt_sym)
             logger.info("Bitget margin mode set to %s for %s", mode.upper(), symbol)
+            return True
         except Exception as exc:
             message = str(exc).lower()
-            if "position" in message and (("exist" in message) or ("open" in message)):
+            if "position" in message and (("exist" in message) or ("open" in message) or ("holding" in message)):
                 logger.info("Bitget margin mode already %s for %s (or position exists)", mode.upper(), symbol)
             else:
                 logger.warning("Bitget set_margin_mode failed for %s: %s", symbol, exc)
+            return False
 
     # ------------------------------------------------------------------
     # Helpers
