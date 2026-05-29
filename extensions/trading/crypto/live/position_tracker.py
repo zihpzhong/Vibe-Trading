@@ -19,6 +19,9 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PERSIST_DIR = Path.home() / ".vibe-trading"
+# 单次余额同步跌幅 ≥ 此比例视为外部调整（提现/划转/对账），重置 rolling 峰值
+# Treat single-step balance drops ≥ this ratio as external (withdraw/transfer/reconcile)
+ROLLING_EXTERNAL_JUMP_PCT = 0.10
 
 # 合法 symbol 格式：仅含 ASCII 字母/数字/连字符，长度 1-30
 # 用于过滤中文字符等无效 symbol（如历史上的 "币安人生USDT"）
@@ -215,6 +218,8 @@ class PositionTracker:
         self._trailing_stops: dict[str, float] = {}
         self._peak_prices: dict[str, float] = {}
         self._equity_history: list[dict[str, Any]] = []  # 权益曲线快照
+        self._rolling_peak_balance: float = account_balance  # 24h rolling 回撤基准峰值
+        self._rolling_peak_externally_reset: bool = False
         self._initial_balance: float = account_balance
         self._synced_closed_count: int = 0
         self._synced_equity_count: int = 0
@@ -720,21 +725,74 @@ class PositionTracker:
             return sum(1 for p in self._positions.values() if p.direction == direction)
 
     def get_rolling_drawdown_pct(self, hours: int = 24) -> float:
-        """Peak-to-current balance drawdown over the last N hours (0.0–1.0)."""
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        cutoff_s = cutoff.isoformat()
+        """Peak-to-current balance drawdown over the last N hours (0.0–1.0).
+
+        使用独立维护的 ``_rolling_peak_balance``，不用 equity_history 的 max，
+        避免提现/对账/换所后历史虚高峰误触发熔断。
+        Uses maintained ``_rolling_peak_balance``, not equity_history max.
+        """
+        _ = hours  # 峰值由 _rolling_peak_balance 维护，保留参数兼容旧调用
         with self._lock:
-            balances = [
-                e["balance"] for e in self._equity_history
-                if e.get("timestamp", "") >= cutoff_s
-            ]
-            if not balances:
-                return 0.0
-            peak = max(balances)
+            peak = self._rolling_peak_balance
             current = self._account_balance
             if peak <= 0:
                 return 0.0
             return max(0.0, (peak - current) / peak)
+
+    def _peak_balance_from_history(self, hours: int = 24) -> float:
+        """24h 内 equity_history 余额峰值（仅用于启动对齐诊断）。
+        Max balance in equity_history over the last N hours (startup diagnostics).
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        cutoff_s = cutoff.isoformat()
+        balances = [
+            e["balance"] for e in self._equity_history
+            if e.get("timestamp", "") >= cutoff_s
+        ]
+        return max(balances) if balances else self._account_balance
+
+    def initialize_rolling_peak(self, balance: Optional[float] = None) -> None:
+        """启动/换所后用交易所真实余额对齐 rolling 峰值。
+        Align rolling peak to live exchange balance on startup or exchange switch.
+        """
+        with self._lock:
+            bal = balance if balance is not None else self._account_balance
+            hist_peak = self._peak_balance_from_history(hours=24)
+            old_peak = self._rolling_peak_balance
+            self._rolling_peak_balance = bal
+            if hist_peak > bal * 1.02 or old_peak > bal * 1.02:
+                logger.info(
+                    "Rolling peak reset on init: %.2f → %.2f (24h history peak %.2f)",
+                    old_peak, bal, hist_peak,
+                )
+            self._persist_metadata_unlocked()
+
+    def consume_rolling_peak_reset(self) -> bool:
+        """若最近一次余额同步触发了外部峰值重置，返回 True 并清除标记。
+        True if the last balance sync reset rolling peak due to external adjustment.
+        """
+        with self._lock:
+            flag = self._rolling_peak_externally_reset
+            self._rolling_peak_externally_reset = False
+            return flag
+
+    def _update_rolling_peak(self, old_balance: float, new_balance: float) -> None:
+        """根据余额变动更新 rolling 峰值（调用方已持锁）。
+        Update rolling peak from a balance change (caller holds lock).
+        """
+        if new_balance > self._rolling_peak_balance:
+            self._rolling_peak_balance = new_balance
+            return
+        if old_balance <= 0:
+            return
+        drop_pct = (old_balance - new_balance) / old_balance
+        if drop_pct >= ROLLING_EXTERNAL_JUMP_PCT:
+            logger.info(
+                "Rolling peak reset: external balance adjustment %.2f → %.2f (Δ%.1f%%)",
+                old_balance, new_balance, drop_pct * 100,
+            )
+            self._rolling_peak_balance = new_balance
+            self._rolling_peak_externally_reset = True
 
     def can_open_new(
         self,
@@ -829,17 +887,21 @@ class PositionTracker:
     @account_balance.setter
     def account_balance(self, value: float) -> None:
         with self._lock:
-            delta = value - self._account_balance
+            old_balance = self._account_balance
+            delta = value - old_balance
             if abs(delta) > 0.01:  # 忽略微小舍入差异
                 if hasattr(self, "_last_balance_log"):
                     logger.info(
                         "Balance changed: %.2f → %.2f (Δ%+.2f USDT)",
-                        self._account_balance, value, delta,
+                        old_balance, value, delta,
                     )
                 else:
                     logger.info("Balance initialized: %.2f USDT", value)
                 self._last_balance_log = True
             self._account_balance = value
+            if abs(delta) > 0.01:
+                self._update_rolling_peak(old_balance, value)
+                self._persist_metadata_unlocked()
 
     @property
     def max_exposure_pct(self) -> float:
@@ -956,6 +1018,10 @@ class PositionTracker:
                 "INSERT OR REPLACE INTO metadata (key, value) VALUES ('account_balance', ?)",
                 (str(self._account_balance),),
             )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('rolling_peak_balance', ?)",
+                (str(self._rolling_peak_balance),),
+            )
 
             self._conn.commit()
         except Exception as exc:
@@ -964,6 +1030,23 @@ class PositionTracker:
             except Exception:
                 pass
             logger.warning("SQLite persistence unavailable (in-memory only): %s", exc)
+
+    def _persist_metadata_unlocked(self) -> None:
+        """Persist account_balance + rolling_peak_balance only (caller holds lock)."""
+        if self._conn is None:
+            return
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('account_balance', ?)",
+                (str(self._account_balance),),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('rolling_peak_balance', ?)",
+                (str(self._rolling_peak_balance),),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.warning("Metadata persistence failed: %s", exc)
 
     def _load(self) -> None:
         """Restore in-memory state from SQLite database."""
@@ -1038,6 +1121,15 @@ class PositionTracker:
             row = cursor.fetchone()
             if row is not None:
                 self._account_balance = float(row["value"])
+
+            cursor = self._conn.execute(
+                "SELECT value FROM metadata WHERE key='rolling_peak_balance'"
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                self._rolling_peak_balance = float(row["value"])
+            else:
+                self._rolling_peak_balance = self._account_balance
 
             logger.info(
                 "Loaded %d positions, %d closed records, %d equity snapshots from %s",

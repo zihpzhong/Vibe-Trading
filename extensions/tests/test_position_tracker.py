@@ -602,3 +602,49 @@ class TestCloseAfterMarketFill:
         assert t.is_in_cooldown("INJUSDT", "LONG") is True
         t.close_position("INJUSDT", exit_price=5.1, reason="TP")
         assert t.is_in_cooldown("INJUSDT", "LONG") is True
+
+
+class TestRollingDrawdownPeak:
+    def test_external_balance_drop_resets_peak(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=260.0, persist_dir=tmp)
+        t._equity_history.append({
+            "timestamp": "2026-05-28T10:00:00+00:00",
+            "balance": 262.0,
+            "equity": 262.0,
+            "active_positions": 0,
+            "total_realized_pnl": 0.0,
+        })
+        t._rolling_peak_balance = 262.0
+        t.account_balance = 214.0
+        assert t.get_rolling_drawdown_pct() == pytest.approx(0.0)
+        assert t.consume_rolling_peak_reset() is True
+        t.clear()
+
+    def test_trading_loss_does_not_reset_peak(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=214.0, persist_dir=tmp)
+        t._rolling_peak_balance = 214.0
+        t.account_balance = 208.0  # ~2.8% drop
+        assert t.get_rolling_drawdown_pct() == pytest.approx((214.0 - 208.0) / 214.0)
+        assert t.consume_rolling_peak_reset() is False
+        t.clear()
+
+    def test_initialize_rolling_peak_ignores_history_spike(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=214.0, persist_dir=tmp)
+        t._rolling_peak_balance = 262.0
+        t._equity_history.append({
+            "timestamp": "2026-05-28T10:00:00+00:00",
+            "balance": 262.0,
+            "equity": 262.0,
+            "active_positions": 1,
+            "total_realized_pnl": 0.0,
+        })
+        t.account_balance = 214.71
+        t.initialize_rolling_peak(214.71)
+        assert t.get_rolling_drawdown_pct() == pytest.approx(0.0)
+        t.clear()

@@ -432,6 +432,8 @@ def main() -> int:
         # 同步 initial_balance，避免 _load() 留下的旧 JSON 值
         # 影响绩效指标准确性
         positions._initial_balance = actual_usdt_balance
+        # 用交易所真实余额对齐 rolling 峰值，避免 equity_history 虚高误触发熔断
+        positions.initialize_rolling_peak(actual_usdt_balance)
 
     # ---- Phase 2 分析引擎 ----
     phase2_analyzer = Phase2Analyzer() if not args.no_phase2 else None
@@ -625,6 +627,27 @@ def main() -> int:
                 return True
             return False
 
+        def clear_rolling_suspension(self) -> None:
+            """外部余额调整重置 rolling 峰值后，解除误触发的熔断。
+            Clear rolling drawdown suspension after external balance peak reset.
+            """
+            if self._rolling_tripped:
+                log.info("Rolling drawdown suspension cleared: external balance peak reset")
+            self._rolling_tripped = False
+            self._suspended_until = 0.0
+
+        @property
+        def suspension_reason(self) -> str:
+            """当前熔断原因：daily_loss / rolling_drawdown / ''。"""
+            if self._suspended_until <= time.time():
+                return ""
+            if self._rolling_tripped:
+                return "rolling_drawdown"
+            loss_pct = abs(min(self._realized_pnl, 0.0)) / positions.account_balance if positions.account_balance else 0
+            if loss_pct >= self.max_daily_loss_pct:
+                return "daily_loss"
+            return "cooldown"
+
         @property
         def is_blown(self) -> bool:
             """是否触发熔断。
@@ -739,13 +762,26 @@ def main() -> int:
             # ================================================================
             daily_risk.reset_if_new_day()
             if daily_risk.is_blown:
-                log.warning(
-                    "Daily loss limit reached: %.2f USDT (%.1f%%), skipping this cycle",
-                    daily_risk.day_pnl,
-                    daily_risk.day_pnl / positions.account_balance * 100,
-                )
-                cooldown_str = daily_risk.suspension_remaining_str
-                console.print(f"[red]⚠️ 日亏损熔断触发 (已实现亏损: {daily_risk.day_pnl:.2f} USDT), 冷却剩余 {cooldown_str}[/red]")
+                reason = daily_risk.suspension_reason
+                if reason == "rolling_drawdown":
+                    log.warning(
+                        "24h rolling drawdown breaker active (day PnL=%+.2f USDT), skipping this cycle",
+                        daily_risk.day_pnl,
+                    )
+                    console.print(
+                        f"[red]⚠️ 24h 滚动回撤熔断 (当日已实现: {daily_risk.day_pnl:+.2f} USDT), "
+                        f"冷却剩余 {daily_risk.suspension_remaining_str}[/red]"
+                    )
+                else:
+                    log.warning(
+                        "Daily loss limit reached: %.2f USDT (%.1f%%), skipping this cycle",
+                        daily_risk.day_pnl,
+                        daily_risk.day_pnl / positions.account_balance * 100 if positions.account_balance else 0,
+                    )
+                    console.print(
+                        f"[red]⚠️ 日亏损熔断触发 (已实现亏损: {daily_risk.day_pnl:.2f} USDT), "
+                        f"冷却剩余 {daily_risk.suspension_remaining_str}[/red]"
+                    )
                 report = ScheduleReport(
                     rankings=[], phase2_requests=[], watchlist=[],
                     btc_status="CONDUCTION_OK", btc_1h_trend="NEUTRAL",
@@ -892,6 +928,8 @@ def main() -> int:
                         )
                     else:
                         positions.account_balance = new_balance
+                        if positions.consume_rolling_peak_reset():
+                            daily_risk.clear_rolling_suspension()
                 # 同步可用余额（开仓保证金用）
                 # 说明：wallet balance（总权益）用作 exposure 计算分母，
                 #       available balance（可用余额）用作开仓金额上限。
