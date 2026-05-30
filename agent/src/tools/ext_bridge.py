@@ -48,6 +48,13 @@ def _load_ext_tools() -> None:
 
 _load_ext_tools()
 
+# Ensure the project root is on sys.path so ``extensions.live.bitget_bridge``
+# is importable when the server starts via ``vibe-trading serve`` (Docker) —
+# in that context only ``agent/`` is on the Python path.
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 # Load the Bitget live-broker bridge, which monkey-patches upstream data
 # structures so the live-broker pipeline (detection / classification /
 # extraction) works for the bitget broker without modifying upstream source.

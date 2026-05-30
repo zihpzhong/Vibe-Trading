@@ -41,3 +41,15 @@ import api_server  # noqa: E402
 _patch_api_server_surfaces()
 
 app = api_server.app
+
+
+@app.get("/__debug")
+async def _debug_runner_factory():
+    """Return the current _runner_factory status for debugging."""
+    import api_server as _ap
+    return {
+        "_runner_factory": _ap._runner_factory is not None,
+        "_runner_factory_name": _ap._runner_factory.__name__ if _ap._runner_factory is not None else None,
+        "_known_live_brokers": _ap._known_live_brokers(),
+        "_oauth_token_present_bitget": _ap._oauth_token_present("bitget") if hasattr(_ap, "_oauth_token_present") else None,
+    }

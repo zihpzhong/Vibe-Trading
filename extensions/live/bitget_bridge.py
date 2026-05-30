@@ -180,62 +180,119 @@ def _patch_api_server_surfaces() -> None:
 
         mod._oauth_token_present = _patched_oauth_token_present
 
-    # Patch _build_live_runner so Bitget read callables unwrap MCP envelope dicts.
-    # Reconcile expects raw data (list/dict) but adapter.call_tool returns a
-    # wrapped payload {"status": "ok", "data": ..., "text": ...}.
-    _patch_api_server_build_runner()
+    # Use _runner_factory (the upstream's official injection point) to wrap
+    # Bitget read callables with _unwrap.  The factory calls the original
+    # _build_live_runner then patches the read callables — no need to
+    # replicate the upstream wiring logic.
+    if hasattr(mod, "_runner_factory"):
+
+        def _bitget_runner_factory(broker: str) -> Any:  # noqa: ANN401
+            """Build a runner with the adapter constructed directly (bypass
+            ``_live_broker_adapter`` which may load a stale/cached config)."""
+            import json
+            from functools import partial
+            from src.live.audit import write_live_action
+            from src.live.runtime.reconcile import reconcile
+            from src.live.runtime.runner import LiveRunner
+            from src.live.runtime.scheduler import Scheduler
+            from src.live.runtime.triggers import Trigger
+            from src.tools.mcp import MCPServerAdapter
+            from src.config.schema import MCPServerConfig
+
+            _cfg = MCPServerConfig(
+                type="stdio",
+                command="python3",
+                args=["extensions/live/bitget_mcp_server.py"],
+                tool_timeout=30,
+            )
+            adapter = MCPServerAdapter("bitget", _cfg)
+
+            def _read(remote_tool: str):
+                return _unwrap(lambda: adapter.call_tool(remote_tool, {}))
+
+            def _submit(order: dict) -> dict:
+                if order.get("action") == "cancel":
+                    return adapter.call_tool("cancel_order", order)
+                return adapter.call_tool("place_order", order)
+
+            svc = getattr(
+                __import__("api_server", fromlist=["_get_session_service"]),
+                "_get_session_service",
+            )()
+            session = svc.create_session(title=f"live-runner:{broker}")
+            session_id = session.session_id
+
+            async def _agent_caller(sid: str, prompt: str) -> dict:
+                return await svc.send_message(sid, prompt)
+
+            def _audit_with_bus(event: Any) -> dict:
+                return write_live_action(
+                    event,
+                    event_callback=lambda etype, record: svc.event_bus.emit(
+                        session_id, etype, record
+                    ),
+                )
+
+            runner_holder: dict = {}
+            scheduler = Scheduler(
+                lambda _job: runner_holder["runner"].run_once()
+                if runner_holder.get("runner")
+                else None
+            )
+
+            runner = LiveRunner(
+                broker,
+                agent_caller=_agent_caller,
+                reconcile_fn=reconcile,
+                read_positions=_read("get_positions"),
+                read_balance=_read("get_account"),
+                read_open_orders=_read("list_orders"),
+                submit_fn=_submit,
+                write_audit_fn=_audit_with_bus,
+                scheduler=scheduler,
+                triggers=[Trigger.market("us_equity")],
+                session_id=session_id,
+            )
+            runner_holder["runner"] = runner
+            return runner
+
+        mod._runner_factory = _bitget_runner_factory
 
 
-def _patch_api_server_build_runner() -> None:
-    """Wrap ``api_server._build_live_runner`` to unwrap MCP envelopes for Bitget.
+def _unwrap(read_fn):  # type: ignore[no-untyped-def]
+    """Wrap a read callable to unwrap MCP envelope dicts.
 
-    The upstream ``_read`` callable returns ``adapter.call_tool(...)`` which is
-    a normalized dict envelope (status / data / text / server / remote_tool).
-    ``reconcile`` expects raw positions/balance/orders, so we patch the runner
-    after construction to unwrap the envelope on every read callable.
+    adapter.call_tool returns a normalized envelope::
+
+        {"status": "ok", "structured_content": ..., "data": ..., "text": ..., "server": ...}
+
+    Reconcile expects raw data (list/dict), so we strip the envelope.
+    FastMCP wraps list returns (get_positions, list_orders) as
+    ``{"result": [...]}`` — extract the list in that case.
+    Dict returns (get_account, get_quotes) have a flat dict with no
+    ``"result"`` wrapper and are returned as-is.
     """
     import json
 
-    mod = sys.modules.get("api_server")
-    if mod is None:
-        return
-    if not hasattr(mod, "_build_live_runner"):
-        return
+    def _inner():
+        result = read_fn()
+        if isinstance(result, dict) and result.get("status") == "ok":
+            sc = result.get("structured_content")
+            if sc is not None:
+                if isinstance(sc, dict) and list(sc.keys()) == ["result"] and isinstance(sc["result"], list):
+                    return sc["result"]
+                return sc
+            data = result.get("data")
+            if data is not None:
+                return data
+            text = result.get("text")
+            if text is not None:
+                try:
+                    return json.loads(text)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return result
 
-    _orig_build = mod._build_live_runner
+    return _inner
 
-    def _unwrap(read_fn):  # type: ignore[no-untyped-def]
-        def _inner():
-            result = read_fn()
-            if isinstance(result, dict) and result.get("status") == "ok":
-                sc = result.get("structured_content")
-                if sc is not None:
-                    # FastMCP wraps list returns (get_positions, list_orders) as
-                    # {"result": [...]}.  Reconcile expects the raw list, so
-                    # unwrap it here.
-                    # Dict returns (get_account, get_quotes) have a flat dict
-                    # with no "result" wrapper — return them as-is.
-                    if isinstance(sc, dict) and list(sc.keys()) == ["result"] and isinstance(sc["result"], list):
-                        return sc["result"]
-                    return sc
-                data = result.get("data")
-                if data is not None:
-                    return data
-                text = result.get("text")
-                if text is not None:
-                    try:
-                        return json.loads(text)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-            return result
-        return _inner
 
-    def _patched_build(broker: str):  # type: ignore[no-untyped-def]
-        runner = _orig_build(broker)
-        if broker.strip().lower() in _EXTRA_LIVE_KEYS:
-            runner._read_positions = _unwrap(runner._read_positions)
-            runner._read_balance = _unwrap(runner._read_balance)
-            runner._read_open_orders = _unwrap(runner._read_open_orders)
-        return runner
-
-    mod._build_live_runner = _patched_build

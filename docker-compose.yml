@@ -1,16 +1,25 @@
 services:
   vibe-trading:
-    build: .
+    build:
+      context: .
+      args:
+        - HTTP_PROXY=http://host.docker.internal:7897
+        - HTTPS_PROXY=http://host.docker.internal:7897
+        - NO_PROXY=localhost,127.0.0.1,host.docker.internal
     ports:
       - "127.0.0.1:8899:8899"
     env_file:
       - agent/.env
     environment:
+      - HTTP_PROXY=http://host.docker.internal:7897
+      - HTTPS_PROXY=http://host.docker.internal:7897
+      - NO_PROXY=localhost,127.0.0.1,host.docker.internal
       - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1
-      - NO_PROXY=localhost,127.0.0.1
     volumes:
       - vibe-runs:/app/agent/runs
       - vibe-sessions:/app/agent/sessions
+      - ~/.vibe-trading:/home/vibe/.vibe-trading
+    command: ["python", "-m", "uvicorn", "extensions.live.serve_with_bridge:app", "--host", "0.0.0.0", "--port", "8899"]
     restart: unless-stopped
 
   live-trading:
@@ -19,7 +28,9 @@ services:
     env_file:
       - agent/.env
     environment:
-      - NO_PROXY=localhost,127.0.0.1
+      - HTTP_PROXY=http://host.docker.internal:7897
+      - HTTPS_PROXY=http://host.docker.internal:7897
+      - NO_PROXY=localhost,127.0.0.1,host.docker.internal
       - HOME=/home/vibe
     volumes:
       - live-trading-data:/home/vibe/.vibe-trading
