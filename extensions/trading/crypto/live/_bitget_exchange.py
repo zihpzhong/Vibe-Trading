@@ -131,7 +131,12 @@ def _retry_ccxt(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
                 time.sleep(delay)
         except ccxt.RateLimitExceeded as exc:
             last_err = exc
-            time.sleep(2)
+            delay = 5 << attempt  # 指数退避: 5s, 10s, 20s / exponential backoff
+            logger.warning(
+                "%s attempt %d/%d rate-limited (%.1fs backoff): %s",
+                op_name, attempt + 1, _MAX_RETRIES, delay, exc,
+            )
+            time.sleep(delay)
             continue
         except Exception as exc:
             raise _map_ccxt_error(exc, op_name) from exc
@@ -297,10 +302,18 @@ class BitgetExchange(ExchangeBase):
     # ------------------------------------------------------------------
 
     def _load_markets(self) -> None:
-        """Load markets to cache precision and valid symbols."""
+        """Load markets to cache precision and valid symbols.
+
+        One-shot: once ``_markets_loaded`` is set (even on failure), subsequent
+        calls are skipped. This prevents a cascading retry loop when the Bitget
+        API rate-limits the ``load_markets`` endpoint — without this guard every
+        order/balance call re-triggers ``load_markets``, compounding the 429 and
+        starving actual trading requests.
+        """
+        if self._markets_loaded:
+            return
         try:
             self._ccxt.load_markets()
-            self._markets_loaded = True
             for ccxt_sym, m in self._ccxt.markets.items():
                 sym = _internal_symbol(ccxt_sym)
                 limits = m.get("limits", {})
@@ -312,7 +325,9 @@ class BitgetExchange(ExchangeBase):
                 if "amount" in prec:
                     self._step_sizes[sym] = float(prec["amount"] or 1)
         except Exception as exc:
-            logger.warning("Bitget load_markets failed: %s", exc)
+            logger.warning("Bitget load_markets failed: %s (one-shot, will not retry)", exc)
+        finally:
+            self._markets_loaded = True
 
     def _require_markets(self) -> None:
         """Ensure markets are loaded before trading operations."""
