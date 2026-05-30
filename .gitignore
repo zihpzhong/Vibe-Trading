@@ -48,6 +48,7 @@ docs/*
 !docs/extension-guide.md
 !docs/project-overview.md
 !docs/crypto-live-optimization-plan.md
+!docs/bitget-mcp-live-broker-plan.md
 !wiki/docs/
 !wiki/docs/**
 docs/screenshots/agent-run.png
