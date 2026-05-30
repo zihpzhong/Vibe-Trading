@@ -82,7 +82,10 @@ def patch_upstream() -> None:
     # 7. Patch order_guard._read_first to unwrap MCP envelopes.
     _patch_order_guard_read_first()
 
-    # 8. API / status surfaces (import api_server when already running as serve).
+    # 8. Patch runner prompt to add leverage guidance (3-8X self-assessment).
+    _patch_runner_prompt()
+
+    # 9. API / status surfaces (import api_server when already running as serve).
     _patch_api_server_surfaces()
     if "api_server" not in sys.modules:
         try:
@@ -191,6 +194,33 @@ def _patch_order_guard_read_first() -> None:
 
     _og.LiveOrderGuardTool._read_first = _patched_read_first  # type: ignore[assignment]
     logger.info("bitget order_guard._read_first patched to unwrap MCP envelopes")
+
+
+def _patch_runner_prompt() -> None:
+    """Patch ``_pin_mandate_prompt`` to append AI self-assessed leverage guidance.
+
+    The original prompt only states ``max_leverage`` as a ceiling; this patch
+    adds an instruction telling the agent to assess market conditions and choose
+    a leverage between 3X and 8X on its own judgment. The enforcement gate
+    (``max_leverage=8.0`` in the mandate) remains the hard ceiling.
+    """
+    from src.live.runtime import runner as _runner
+
+    _orig_prompt = _runner._pin_mandate_prompt
+
+    def _patched_prompt(broker: str, mandate, now) -> str:
+        base = _orig_prompt(broker, mandate, now)
+        return base + (
+            "\n\n=== LEVERAGE GUIDANCE ===\n"
+            "Assess current market conditions (volatility, trend strength, risk) "
+            "and self-select an appropriate leverage between 3X and 8X for each "
+            "position. The mandate ceiling is 8X; aim for at least 3X unless "
+            "conditions clearly warrant lower. This is an AI judgment call — "
+            "scale leverage to conviction, not to the limit."
+        )
+
+    _runner._pin_mandate_prompt = _patched_prompt  # type: ignore[assignment]
+    logger.info("bitget runner prompt patched with 3-8X leverage guidance")
 
 
 def _patch_api_server_surfaces() -> None:
