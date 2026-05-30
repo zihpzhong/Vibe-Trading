@@ -287,7 +287,7 @@ def _patch_api_server_surfaces() -> None:
                 submit_fn=_submit,
                 write_audit_fn=_audit_with_bus,
                 scheduler=scheduler,
-                triggers=[Trigger.market("us_equity")],
+                triggers=[Trigger.market("crypto")],
                 session_id=session_id,
             )
             runner_holder["runner"] = runner
