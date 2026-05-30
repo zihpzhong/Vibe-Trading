@@ -23,7 +23,6 @@ Tools:
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from pathlib import Path
@@ -91,71 +90,67 @@ def _create_server(mock: bool = False) -> Any:
     # ------------------------------------------------------------------
 
     @server.tool()
-    def get_account() -> str:
+    def get_account() -> dict[str, Any]:
         """获取 Bitget 账户余额 / Get Bitget account balance.
 
         Returns:
-            JSON string with equity and balance info.
+            Dict with equity and balance info.
         """
         try:
             snap = exchange.get_balance_snapshot()
-            result = {
+            return {
                 "equity": snap["total"],
                 "available": snap["free"],
             }
-            return json.dumps(result, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return {"error": str(exc)}
 
     @server.tool()
-    def get_positions() -> str:
+    def get_positions() -> list[dict[str, Any]]:
         """获取 Bitget 当前持仓 / Get Bitget open positions.
 
         Returns:
-            JSON string with list of open positions.
+            List of open position dicts.
         """
         try:
-            positions = exchange.get_positions()
-            return json.dumps(positions, ensure_ascii=False, default=str)
+            return exchange.get_positions()
         except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return [{"error": str(exc)}]
 
     @server.tool()
-    def get_quotes(symbol: str) -> str:
+    def get_quotes(symbol: str) -> dict[str, Any]:
         """获取指定交易对的最新报价 / Get latest quote for a symbol.
 
         Args:
             symbol: Trading pair symbol, e.g. "BTCUSDT".
 
         Returns:
-            JSON string with ticker data.
+            Dict with ticker data.
         """
         try:
-            ticker = exchange.get_ticker(symbol)
-            return json.dumps(ticker, ensure_ascii=False, default=str)
+            return exchange.get_ticker(symbol)
         except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return {"error": str(exc)}
 
     @server.tool()
-    def list_orders(symbol: str = "") -> str:
+    def list_orders(symbol: str = "") -> list[dict[str, Any]]:
         """获取当前未成交订单列表 / List open orders, optionally filtered by symbol.
 
         Args:
             symbol: Optional trading pair symbol, e.g. "BTCUSDT". Empty = all.
 
         Returns:
-            JSON string with list of open orders.
+            List of open order dicts.
         """
         try:
             if hasattr(exchange, "fetch_open_orders"):
-                orders = exchange.fetch_open_orders(symbol if symbol else None)
+                return exchange.fetch_open_orders(symbol if symbol else None)
             elif hasattr(exchange, "fetch_open_algo_orders"):
-                orders = exchange.fetch_open_algo_orders(symbol if symbol else None)
+                return exchange.fetch_open_algo_orders(symbol if symbol else None)
             else:
-                orders = []
-            return json.dumps(orders, ensure_ascii=False, default=str)
+                return []
         except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return [{"error": str(exc)}]
 
     # ------------------------------------------------------------------
     # WRITE tools
@@ -170,7 +165,7 @@ def _create_server(mock: bool = False) -> Any:
         order_type: str = "market",
         price: float | None = None,
         reduce_only: bool = False,
-    ) -> str:
+    ) -> dict[str, Any]:
         """开仓/平仓 / Place an order on Bitget.
 
         Accepts ``notional_usd`` or ``quantity`` (not both — when both are
@@ -188,7 +183,7 @@ def _create_server(mock: bool = False) -> Any:
             reduce_only: If True, order only reduces position (default False).
 
         Returns:
-            JSON string with order result.
+            Dict with order result.
         """
         try:
             # Resolve quantity from notional if needed.
@@ -197,34 +192,27 @@ def _create_server(mock: bool = False) -> Any:
                 ticker = exchange.get_ticker(symbol)
                 last_price = float(ticker.get("last", 0) or 0)
                 if last_price <= 0:
-                    return json.dumps(
-                        {"error": f"cannot resolve price for {symbol} — last price is {last_price}"},
-                        ensure_ascii=False,
-                    )
+                    return {
+                        "error": f"cannot resolve price for {symbol} — last price is {last_price}"
+                    }
                 qty = notional_usd / last_price
 
             if qty is None or qty <= 0:
-                return json.dumps(
-                    {"error": "either notional_usd or quantity is required with a positive value"},
-                    ensure_ascii=False,
-                )
+                return {
+                    "error": "either notional_usd or quantity is required with a positive value"
+                }
 
             if order_type == "limit":
                 if price is None or price <= 0:
-                    return json.dumps(
-                        {"error": "price is required for limit orders"},
-                        ensure_ascii=False,
-                    )
-                result = exchange.create_limit_order(symbol, side, qty, price)
+                    return {"error": "price is required for limit orders"}
+                return exchange.create_limit_order(symbol, side, qty, price)
             else:
-                result = exchange.create_market_order(symbol, side, qty, reduce_only)
-
-            return json.dumps(result, ensure_ascii=False, default=str)
+                return exchange.create_market_order(symbol, side, qty, reduce_only)
         except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return {"error": str(exc)}
 
     @server.tool()
-    def cancel_order(order_id: str, symbol: str) -> str:
+    def cancel_order(order_id: str, symbol: str) -> dict[str, Any]:
         """取消订单 / Cancel an open order by ID.
 
         Args:
@@ -232,13 +220,12 @@ def _create_server(mock: bool = False) -> Any:
             symbol: Trading pair symbol, e.g. "BTCUSDT".
 
         Returns:
-            JSON string with cancellation result.
+            Dict with cancellation result.
         """
         try:
-            result = exchange.cancel_order(order_id, symbol)
-            return json.dumps(result, ensure_ascii=False, default=str)
+            return exchange.cancel_order(order_id, symbol)
         except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return {"error": str(exc)}
 
     return server
 

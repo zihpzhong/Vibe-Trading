@@ -90,8 +90,17 @@ def _init_and_call(method: str, arguments: dict | None = None, id: int = 1) -> d
 
 
 def _response_text(resp: dict) -> object:
-    """Extract and parse the text content from a ``tools/call`` response."""
-    content = resp["result"].get("content", [])
+    """Extract the result payload from a ``tools/call`` response.
+
+    FastMCP places structured return values in ``structuredContent.result``
+    when the tool returns a dict/list; falls back to text content for
+    string-returning tools.
+    """
+    result = resp.get("result", {})
+    sc = result.get("structuredContent")
+    if isinstance(sc, dict) and "result" in sc:
+        return sc["result"]
+    content = result.get("content", [])
     text = "".join(c.get("text", "") for c in content if isinstance(c, dict))
     return json.loads(text)
 
