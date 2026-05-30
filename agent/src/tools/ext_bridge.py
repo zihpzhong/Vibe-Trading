@@ -47,3 +47,20 @@ def _load_ext_tools() -> None:
 
 
 _load_ext_tools()
+
+# Load the Bitget live-broker bridge, which monkey-patches upstream data
+# structures so the live-broker pipeline (detection / classification /
+# extraction) works for the bitget broker without modifying upstream source.
+try:
+    from extensions.live.bitget_bridge import patch_upstream as _patch_bitget
+
+    _patch_bitget()
+    # 若 api_server 已加载，补打 API 层补丁 / Patch API surfaces when serve is up
+    try:
+        from extensions.live.bitget_bridge import _patch_api_server_surfaces
+
+        _patch_api_server_surfaces()
+    except ImportError:
+        pass
+except ImportError:
+    pass  # bitget bridge not available — live broker registration skipped
