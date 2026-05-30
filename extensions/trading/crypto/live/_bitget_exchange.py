@@ -489,6 +489,11 @@ class BitgetExchange(ExchangeBase):
         params: dict[str, Any] = {}
         if reduce_only:
             params["reduceOnly"] = True
+        # UTA 统一账户需指定 posSide / UTA account requires posSide for hedge mode
+        if side.upper() in ("LONG", "BUY"):
+            params["posSide"] = "long"
+        else:
+            params["posSide"] = "short"
 
         def _place() -> dict:
             return self._ccxt.create_order(ccxt_sym, "market", ccxt_side, qty, None, params)
@@ -517,7 +522,8 @@ class BitgetExchange(ExchangeBase):
         qty = self._round_qty(symbol, amount)
 
         def _place() -> dict:
-            return self._ccxt.create_order(ccxt_sym, "limit", ccxt_side, qty, price)
+            params: dict[str, Any] = {"posSide": "long" if ccxt_side == "buy" else "short"}
+            return self._ccxt.create_order(ccxt_sym, "limit", ccxt_side, qty, price, params)
 
         with self._lock:
             raw = _retry_ccxt(f"limit({symbol})", _place)
@@ -547,9 +553,11 @@ class BitgetExchange(ExchangeBase):
         trigger_price = self._round_price(symbol, stop_price)
 
         def _place() -> dict:
+            params: dict[str, Any] = {"reduceOnly": True}
+            params["posSide"] = "long" if ccxt_side == "buy" else "short"
             return self._ccxt.create_stop_loss_order(
                 ccxt_sym, "market", ccxt_side, qty, None, trigger_price,
-                {"reduceOnly": True},
+                params,
             )
 
         with self._lock:
@@ -582,9 +590,11 @@ class BitgetExchange(ExchangeBase):
         trigger_price = self._round_price(symbol, tp_price)
 
         def _place() -> dict:
+            params: dict[str, Any] = {"reduceOnly": True}
+            params["posSide"] = "long" if ccxt_side == "buy" else "short"
             return self._ccxt.create_take_profit_order(
                 ccxt_sym, "market", ccxt_side, qty, None, trigger_price,
-                {"reduceOnly": True},
+                params,
             )
 
         with self._lock:
@@ -789,11 +799,15 @@ class BitgetExchange(ExchangeBase):
                 continue
             side = pos.get("side", "")
             direction = "LONG" if side in ("long", "LONG") else "SHORT"
+            mark = float(pos.get("markPrice", 0) or 0)
+            entry = float(pos.get("entryPrice", 0) or 0)
             positions.append({
                 "symbol": _internal_symbol(ccxt_sym),
                 "direction": direction,
-                "entry_price": float(pos.get("entryPrice", 0) or 0),
+                "entry_price": entry,
+                "mark_price": mark if mark > 0 else entry,  # 标记价格供 mandate 门控检查 / mark price for mandate enforcement
                 "quantity": abs(amt),
+                "notional": float(pos.get("notional", 0) or 0),
                 "unrealized_pnl": float(pos.get("unrealizedPnl", 0) or 0),
             })
         return positions

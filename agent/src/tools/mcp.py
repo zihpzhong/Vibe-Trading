@@ -864,7 +864,13 @@ def _normalize_call_tool_result(result: CallToolResult) -> dict[str, Any]:
     if result.data is not None:
         payload["data"] = _make_jsonable(result.data)
     if result.structured_content is not None:
-        payload["structured_content"] = _make_jsonable(result.structured_content)
+        sc = _make_jsonable(result.structured_content)
+        # FastMCP wraps list returns inside {"result": [...]} — unwrap at the
+        # source so no downstream consumer (bridge, reconcile, agent tools)
+        # needs to replicate this heuristic.
+        if isinstance(sc, dict) and list(sc) == ["result"]:
+            sc = sc["result"]
+        payload["structured_content"] = sc
     if result.content:
         payload["content"] = [_make_jsonable(block) for block in result.content]
         text = _extract_text_content(result.content)
@@ -984,13 +990,22 @@ def _make_jsonable(value: Any) -> Any:
 def _json_default(value: Any) -> Any:
     """Fallback serializer used by ``json.dumps``.
 
+    Tries ``_make_jsonable`` first; if it returns the same object unchanged
+    (meaning it is not a dict, list, or Pydantic model), falls back to
+    ``str()`` to avoid infinite recursion in ``json.dumps`` which would
+    raise ``ValueError: Circular reference detected`` — seen with FastMCP
+    internal types such as ``get_positionsOutput``.
+
     Args:
         value: Value rejected by the standard encoder.
 
     Returns:
         JSON-serializable representation.
     """
-    return _make_jsonable(value)
+    result = _make_jsonable(value)
+    if result is value:
+        return str(value)
+    return result
 
 
 def _to_display_text(value: Any) -> str:

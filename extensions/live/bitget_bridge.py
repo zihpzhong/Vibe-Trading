@@ -17,8 +17,10 @@ Extension guide principle
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,10 @@ def patch_upstream() -> None:
     # 6. Mandate propose/commit: propagate crypto asset_classes (ceilings → profile → universe).
     _patch_mandate_crypto_universe()
 
-    # 7. API / status surfaces (import api_server when already running as serve).
+    # 7. Patch order_guard._read_first to unwrap MCP envelopes.
+    _patch_order_guard_read_first()
+
+    # 8. API / status surfaces (import api_server when already running as serve).
     _patch_api_server_surfaces()
     if "api_server" not in sys.modules:
         try:
@@ -154,6 +159,40 @@ def _patch_schema_is_live_broker_entry() -> None:
     _schema.is_live_broker_entry = _patched_entry  # type: ignore[assignment]
 
 
+def _patch_order_guard_read_first() -> None:
+    """Patch ``LiveOrderGuardTool._read_first`` to unwrap MCP envelopes for Bitget.
+
+    ``_read_first`` returns the raw ``adapter.call_tool()`` result (a dict envelope),
+    but the enforcement code expects the actual position/balance data inside it.
+    Without unwrapping, ``_coerce_position_rows`` finds the ``"data"`` key containing
+    a string like ``"get_positionsOutput(result=[])"`` instead of a list, returning
+    ``None`` and causing a fail-closed breach.
+
+    This patch extracts ``structured_content`` from the envelope before returning,
+    matching what ``_unwrap`` does in the reconcile path.
+    """
+    from src.live import order_guard as _og
+
+    _orig_read_first = _og.LiveOrderGuardTool._read_first
+
+    def _patched_read_first(self, candidates: tuple[str, ...]) -> object:
+        raw = _orig_read_first(self, candidates)
+        # Unwrap MCP envelope: extract structured_content or data
+        if isinstance(raw, dict):
+            sc = raw.get("structured_content")
+            if sc is not None:
+                if isinstance(sc, dict) and list(sc) == ["result"]:
+                    return sc["result"]
+                return sc
+            data = raw.get("data")
+            if data is not None:
+                return data
+        return raw
+
+    _og.LiveOrderGuardTool._read_first = _patched_read_first  # type: ignore[assignment]
+    logger.info("bitget order_guard._read_first patched to unwrap MCP envelopes")
+
+
 def _patch_api_server_surfaces() -> None:
     """Patch live status helpers on ``api_server`` when that module is already loaded."""
     mod = sys.modules.get("api_server")
@@ -189,8 +228,6 @@ def _patch_api_server_surfaces() -> None:
         def _bitget_runner_factory(broker: str) -> Any:  # noqa: ANN401
             """Build a runner with the adapter constructed directly (bypass
             ``_live_broker_adapter`` which may load a stale/cached config)."""
-            import json
-            from functools import partial
             from src.live.audit import write_live_action
             from src.live.runtime.reconcile import reconcile
             from src.live.runtime.runner import LiveRunner
@@ -262,36 +299,50 @@ def _patch_api_server_surfaces() -> None:
 def _unwrap(read_fn):  # type: ignore[no-untyped-def]
     """Wrap a read callable to unwrap MCP envelope dicts.
 
-    adapter.call_tool returns a normalized envelope::
+    ``adapter.call_tool`` returns a normalized envelope::
 
         {"status": "ok", "structured_content": ..., "data": ..., "text": ..., "server": ...}
 
     Reconcile expects raw data (list/dict), so we strip the envelope.
-    FastMCP wraps list returns (get_positions, list_orders) as
-    ``{"result": [...]}`` — extract the list in that case.
-    Dict returns (get_account, get_quotes) have a flat dict with no
-    ``"result"`` wrapper and are returned as-is.
+
+    FastMCP wraps returns inside ``{"result": <value>}`` when the value is a list
+    (e.g. ``get_positions``, ``list_orders``). Dict returns such as ``get_account``
+    appear as a flat dict with no ``"result"`` wrapper.  We handle both shapes.
+
+    When ``status`` is ``"error"`` (MCP timeout / connection failure) we raise
+    :class:`ValueError` so the runner's ``_run_reconcile`` try/except catches it
+    and produces a clean ``TICK_RECONCILE_ERROR`` outcome — instead of leaking the
+    raw envelope dict into ``list()`` / ``dict()`` calls that later crash with
+    opaque ``ValueError`` or ``AttributeError``.
     """
-    import json
 
     def _inner():
         result = read_fn()
-        if isinstance(result, dict) and result.get("status") == "ok":
-            sc = result.get("structured_content")
-            if sc is not None:
-                if isinstance(sc, dict) and list(sc.keys()) == ["result"] and isinstance(sc["result"], list):
-                    return sc["result"]
-                return sc
-            data = result.get("data")
-            if data is not None:
-                return data
-            text = result.get("text")
-            if text is not None:
-                try:
-                    return json.loads(text)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-        return result
+        if not isinstance(result, dict):
+            raise ValueError(f"bitget MCP call failed: unexpected type {type(result).__name__}")
+        if result.get("status") != "ok":
+            raise ValueError(
+                f"bitget MCP call failed: {result.get('error', str(result))}"
+            )
+
+        sc = result.get("structured_content")
+        if sc is not None:
+            if isinstance(sc, dict) and list(sc) == ["result"]:
+                # FastMCP wraps list returns in {"result": [...]}; unwrap it.
+                return sc["result"]
+            return sc
+        data = result.get("data")
+        if data is not None:
+            return data
+        text = result.get("text")
+        if text is not None:
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        raise ValueError(
+            f"bitget MCP call failed: ok response has no extractable content: {result}"
+        )
 
     return _inner
 
