@@ -68,6 +68,12 @@ def _internal_symbol(ccxt_sym: str) -> str:
 
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = (1, 2, 4)
+# 429 断路器 / 429 circuit breaker — pause all requests for 60s after too many
+_RATE_LIMIT_COOLDOWN = 60.0  # 限流后冷却秒数
+_RATE_LIMIT_THRESHOLD = 3  # 连续 429 达到此数后触发冷却
+_consecutive_429 = 0
+_rate_limited_until: float = 0.0
+_rl_lock = threading.Lock()
 
 
 def _retry(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
@@ -116,10 +122,29 @@ def _retry_ccxt(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
     """Call ccxt method with retry and error mapping."""
     import ccxt
 
+    global _consecutive_429  # noqa: PLW0602
+
     last_err: Optional[Exception] = None
+
+    # 429 断路器：冷却期内直接略过 / circuit breaker: skip during cooldown
+    with _rl_lock:
+        if _rate_limited_until > time.time():
+            logger.warning(
+                "%s skipped — rate-limit cooldown (%.0fs remaining)",
+                op_name, _rate_limited_until - time.time(),
+            )
+            raise _map_ccxt_error(
+                RuntimeError(f"rate-limit cooldown active for {op_name}"),
+                op_name,
+            )
+
     for attempt in range(_MAX_RETRIES):
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            # 成功 → 重置连续 429 计数 / success resets the counter
+            with _rl_lock:
+                _consecutive_429 = 0
+            return result
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
             last_err = exc
             if attempt < _MAX_RETRIES - 1:
@@ -131,6 +156,14 @@ def _retry_ccxt(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
                 time.sleep(delay)
         except ccxt.RateLimitExceeded as exc:
             last_err = exc
+            with _rl_lock:
+                _consecutive_429 += 1
+                if _consecutive_429 >= _RATE_LIMIT_THRESHOLD:
+                    _rate_limited_until = time.time() + _RATE_LIMIT_COOLDOWN
+                    logger.warning(
+                        "%s — consecutive 429 threshold hit (%d), cooling down for %.0fs",
+                        op_name, _consecutive_429, _RATE_LIMIT_COOLDOWN,
+                    )
             delay = 5 << attempt  # 指数退避: 5s, 10s, 20s / exponential backoff
             logger.warning(
                 "%s attempt %d/%d rate-limited (%.1fs backoff): %s",
@@ -326,6 +359,12 @@ class BitgetExchange(ExchangeBase):
                     self._step_sizes[sym] = float(prec["amount"] or 1)
         except Exception as exc:
             logger.warning("Bitget load_markets failed: %s (one-shot, will not retry)", exc)
+            # ccxt internally checks ``markets_by_id`` before every API call and
+            # auto-reloads markets when empty — which hits the rate-limited
+            # ``/api/v2/spot/public/coins`` endpoint and 429s the actual request.
+            # Setting a dummy entry tells ccxt "markets are loaded" so it skips
+            # the internal reload and lets the real API call through.
+            self._ccxt.markets_by_id = {"_placeholder_": {"id": "_", "symbol": "_"}}
         finally:
             self._markets_loaded = True
 
