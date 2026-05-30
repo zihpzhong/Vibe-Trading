@@ -179,3 +179,63 @@ def _patch_api_server_surfaces() -> None:
             return _original_oauth(broker)
 
         mod._oauth_token_present = _patched_oauth_token_present
+
+    # Patch _build_live_runner so Bitget read callables unwrap MCP envelope dicts.
+    # Reconcile expects raw data (list/dict) but adapter.call_tool returns a
+    # wrapped payload {"status": "ok", "data": ..., "text": ...}.
+    _patch_api_server_build_runner()
+
+
+def _patch_api_server_build_runner() -> None:
+    """Wrap ``api_server._build_live_runner`` to unwrap MCP envelopes for Bitget.
+
+    The upstream ``_read`` callable returns ``adapter.call_tool(...)`` which is
+    a normalized dict envelope (status / data / text / server / remote_tool).
+    ``reconcile`` expects raw positions/balance/orders, so we patch the runner
+    after construction to unwrap the envelope on every read callable.
+    """
+    import json
+
+    mod = sys.modules.get("api_server")
+    if mod is None:
+        return
+    if not hasattr(mod, "_build_live_runner"):
+        return
+
+    _orig_build = mod._build_live_runner
+
+    def _unwrap(read_fn):  # type: ignore[no-untyped-def]
+        def _inner():
+            result = read_fn()
+            if isinstance(result, dict) and result.get("status") == "ok":
+                sc = result.get("structured_content")
+                if sc is not None:
+                    # FastMCP wraps list returns (get_positions, list_orders) as
+                    # {"result": [...]}.  Reconcile expects the raw list, so
+                    # unwrap it here.
+                    # Dict returns (get_account, get_quotes) have a flat dict
+                    # with no "result" wrapper — return them as-is.
+                    if isinstance(sc, dict) and list(sc.keys()) == ["result"] and isinstance(sc["result"], list):
+                        return sc["result"]
+                    return sc
+                data = result.get("data")
+                if data is not None:
+                    return data
+                text = result.get("text")
+                if text is not None:
+                    try:
+                        return json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            return result
+        return _inner
+
+    def _patched_build(broker: str):  # type: ignore[no-untyped-def]
+        runner = _orig_build(broker)
+        if broker.strip().lower() in _EXTRA_LIVE_KEYS:
+            runner._read_positions = _unwrap(runner._read_positions)
+            runner._read_balance = _unwrap(runner._read_balance)
+            runner._read_open_orders = _unwrap(runner._read_open_orders)
+        return runner
+
+    mod._build_live_runner = _patched_build
