@@ -617,6 +617,50 @@ class BitgetExchange(ExchangeBase):
             "status": raw.get("status", "canceled"),
         }
 
+    def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """获取当前未成交订单列表 / Fetch open orders via ccxt.
+
+        Args:
+            symbol: Optional symbol filter. ``None`` returns all open orders.
+
+        Returns:
+            List of open order dicts with keys: order_id, symbol, side, type,
+            amount, filled, status, price, timestamp.
+        """
+        if not self._has_auth:
+            return []
+
+        ccxt_sym = _ccxt_symbol(symbol) if symbol else None
+
+        def _fetch() -> list:
+            params: dict[str, Any] = {"productType": "USDT-FUTURES"}
+            return self._ccxt.fetch_open_orders(ccxt_sym, params=params)
+
+        with self._lock:
+            try:
+                raw_list = _retry_ccxt("open_orders", _fetch)
+            except Exception as exc:
+                logger.warning("Bitget fetch_open_orders failed: %s", exc)
+                return []
+
+        orders: list[dict[str, Any]] = []
+        for raw in raw_list:
+            ccxt_order_sym = raw.get("symbol", "")
+            if not ccxt_order_sym:
+                continue
+            orders.append({
+                "order_id": raw.get("id", ""),
+                "symbol": _internal_symbol(ccxt_order_sym) if ccxt_order_sym else "",
+                "side": str(raw.get("side", "")).lower(),
+                "type": str(raw.get("type", "")),
+                "amount": float(raw.get("amount", 0) or 0),
+                "filled": float(raw.get("filled", 0) or 0),
+                "status": raw.get("status", ""),
+                "price": float(raw.get("price", 0) or 0),
+                "timestamp": raw.get("timestamp"),
+            })
+        return orders
+
     def fetch_order(self, order_id: str, symbol: str) -> dict:
         """Query order status via ccxt."""
         self._require_auth("fetch_order")
@@ -689,6 +733,36 @@ class BitgetExchange(ExchangeBase):
                 if bal and float(bal) > 0:
                     result[asset] = float(bal)
         return result
+
+    def get_balance_snapshot(self) -> dict[str, dict[str, float]]:
+        """Fetch total and available balances in a single ccxt call.
+
+        Avoids the double API round-trip that calling ``get_account_balance``
+        and ``get_available_balance`` separately would incur.
+        """
+        if not self._has_auth:
+            return {"total": {}, "free": {}}
+
+        def _fetch() -> dict:
+            return self._ccxt.fetch_balance()
+
+        with self._lock:
+            try:
+                raw = _retry_ccxt("balance_snapshot", _fetch)
+            except Exception as exc:
+                logger.warning("Bitget balance snapshot failed: %s", exc)
+                return {"total": {}, "free": {}}
+
+        def _extract(key: str) -> dict[str, float]:
+            result: dict[str, float] = {}
+            items = raw.get(key, {})
+            if isinstance(items, dict):
+                for asset, bal in items.items():
+                    if bal and float(bal) > 0:
+                        result[asset] = float(bal)
+            return result
+
+        return {"total": _extract("total"), "free": _extract("free")}
 
     def get_positions(self) -> list[dict[str, Any]]:
         """Fetch open positions via ccxt."""

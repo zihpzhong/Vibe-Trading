@@ -116,6 +116,22 @@ class ExchangeBase(ABC):
         """Fetch open positions (futures positionRisk). Spot: non-zero balances."""
         return []
 
+    def get_account_balance(self) -> dict[str, float]:
+        """Fetch wallet balances. Mock: return a default USDT balance."""
+        return {"USDT": 10_000.0}
+
+    def get_available_balance(self) -> dict[str, float]:
+        """Fetch available (free) balances. Mock: delegates to get_account_balance."""
+        return self.get_account_balance()
+
+    def get_balance_snapshot(self) -> dict[str, dict[str, float]]:
+        """Fetch both total and available balances in one API call (mock: single call).
+
+        Override in subclasses that can fetch both in one round-trip.
+        Returns ``{"total": ..., "free": ...}``.
+        """
+        return {"total": self.get_account_balance(), "free": self.get_available_balance()}
+
 
 class MockExchange(ExchangeBase):
     """Mock exchange that returns simulated data.
