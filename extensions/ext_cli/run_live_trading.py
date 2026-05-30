@@ -449,7 +449,7 @@ def main() -> int:
     scheduler = TradingScheduler(exchange, positions, trading_enabled=True)
 
     # ---- TP/SL 守护 ----
-    _tpsl_poll = float(_get_cfg("tpsl_monitor", "poll_interval_seconds", 5.0))  # type: ignore[arg-type]
+    _tpsl_poll = float(_get_cfg("tpsl_monitor", "poll_interval_seconds", 30.0))  # type: ignore[arg-type]
     _tpsl_trail_act = float(_get_cfg("tpsl_monitor", "trailing_activation_pct", config.trailing_stop.activation_pct))  # type: ignore[arg-type]
     _tpsl_trail_dist = float(_get_cfg("tpsl_monitor", "trail_distance_pct", config.trailing_stop.trail_distance_pct))  # type: ignore[arg-type]
     monitor = TPSLMonitor(

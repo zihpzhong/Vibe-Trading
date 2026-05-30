@@ -122,7 +122,7 @@ def _retry_ccxt(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
     """Call ccxt method with retry and error mapping."""
     import ccxt
 
-    global _consecutive_429  # noqa: PLW0602
+    global _consecutive_429, _rate_limited_until  # noqa: PLW0602
 
     last_err: Optional[Exception] = None
 
@@ -359,12 +359,11 @@ class BitgetExchange(ExchangeBase):
                     self._step_sizes[sym] = float(prec["amount"] or 1)
         except Exception as exc:
             logger.warning("Bitget load_markets failed: %s (one-shot, will not retry)", exc)
-            # ccxt internally checks ``markets_by_id`` before every API call and
-            # auto-reloads markets when empty — which hits the rate-limited
-            # ``/api/v2/spot/public/coins`` endpoint and 429s the actual request.
-            # Setting a dummy entry tells ccxt "markets are loaded" so it skips
-            # the internal reload and lets the real API call through.
-            self._ccxt.markets_by_id = {"_placeholder_": {"id": "_", "symbol": "_"}}
+            # ccxt checks ``self.markets`` before every API call and reloads if
+            # it's ``None``/empty — which hits the rate-limited ``/spot/public/coins``
+            # endpoint. Setting ``_markets`` directly bypasses this check.
+            self._ccxt._markets = {"_": {"id": "_", "symbol": "_"}}  # type: ignore[union-attr]
+            self._ccxt.markets = self._ccxt._markets  # type: ignore[union-attr]
         finally:
             self._markets_loaded = True
 
@@ -413,26 +412,41 @@ class BitgetExchange(ExchangeBase):
             return _ccxt_ticker_to_internal(raw)
 
     def get_tickers(self, symbols: Optional[list[str]] = None) -> list[dict[str, Any]]:
-        """Batch fetch tickers filtered to USDT pairs, sorted by volume."""
-        def _fetch() -> dict:
-            return self._ccxt.fetch_tickers()
+        """Fetch tickers for requested symbols, one-by-one to avoid heavy endpoint.
 
-        with self._lock:
-            raw_all = _retry_ccxt("tickers", _fetch)
+        Uses ``fetch_ticker()`` per symbol (lighter) instead of ``fetch_tickers()``
+        (fetches every tradable pair, hits a high-volume public endpoint that is
+        easily rate-limited). When ``symbols`` is ``None`` (caller wants everything)
+        fall back to ``fetch_tickers()``.
+        """
+        if not symbols:
+            def _fetch_all() -> dict:
+                return self._ccxt.fetch_tickers()
 
-        tickers: list[dict[str, Any]] = []
-        for ccxt_sym, raw in raw_all.items():
-            sym = _internal_symbol(ccxt_sym)
-            if not sym.endswith("USDT"):
-                continue
-            if symbols and sym not in symbols:
-                continue
-            t = _ccxt_ticker_to_internal(raw)
-            if t["volume24h"] > 0:
-                tickers.append(t)
+            with self._lock:
+                raw_all = _retry_ccxt("tickers", _fetch_all)
 
-        tickers.sort(key=lambda x: x["volume24h"], reverse=True)
-        return tickers
+            tickers: list[dict[str, Any]] = []
+            for ccxt_sym, raw in raw_all.items():
+                sym = _internal_symbol(ccxt_sym)
+                if not sym.endswith("USDT"):
+                    continue
+                t = _ccxt_ticker_to_internal(raw)
+                if t["volume24h"] > 0:
+                    tickers.append(t)
+            tickers.sort(key=lambda x: x["volume24h"], reverse=True)
+            return tickers
+
+        # 精确查询：只获取请求的币种 / Targeted: only fetch requested symbols
+        result: list[dict[str, Any]] = []
+        for sym in symbols:
+            try:
+                t = self.get_ticker(sym)
+                if t.get("last", 0) and float(t["last"]) > 0:
+                    result.append(t)
+            except Exception as exc:
+                logger.warning("get_ticker(%s) skipped: %s", sym, exc)
+        return result
 
     def get_funding_rate(self, symbol: str) -> float:
         """Fetch current perpetual funding rate via ccxt."""
