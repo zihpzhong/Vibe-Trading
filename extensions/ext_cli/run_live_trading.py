@@ -419,12 +419,16 @@ def main() -> int:
             log.info("Could not query account balance (non-fatal)")
             break
 
-    # ---- 设置合约模式：逐仓 + 单向持仓 ----
+    # ---- 设置合约模式：Bitget 用 hedge_mode；Binance 等用单向 ----
     if hasattr(exchange, "set_position_mode") and not args.mock:
+        dual_side = (args.exchange or os.environ.get("CRYPTO_EXCHANGE", "")).lower() == "bitget"
         try:
-            exchange.set_position_mode(dual=False)
+            exchange.set_position_mode(dual=dual_side)
         except Exception:
-            log.warning("set_position_mode failed (可能 Binance 网络暂时不可用), 继续启动...")
+            log.warning(
+                "set_position_mode failed (Bitget hedge=%s); orders may 40774-fallback",
+                dual_side,
+            )
 
     # ---- 持仓管理 ----
     # 使用实际余额（优先）或 CLI 默认值
@@ -1351,11 +1355,29 @@ def main() -> int:
                                     margin_ok = exchange.set_margin_mode(symbol, "ISOLATED")
                                     if not margin_ok:
                                         log.warning(
-                                            "%s: 无法设置为逐仓模式（可能已有持仓），将以当前模式开仓",
+                                            "%s: 无法设置为逐仓模式（可能已有持仓），跳过开仓",
                                             symbol,
                                         )
+                                        console.print(
+                                            "           [yellow]⚠️ 无法切逐仓，已跳过[/yellow]",
+                                        )
+                                        continue
                                 if hasattr(exchange, "set_leverage"):
                                     exchange.set_leverage(symbol, leverage=leverage)
+                                if hasattr(exchange, "verify_margin_leverage"):
+                                    if not exchange.verify_margin_leverage(
+                                        symbol,
+                                        margin_mode="ISOLATED",
+                                        leverage=leverage,
+                                    ):
+                                        log.warning(
+                                            "%s: 逐仓/杠杆校验失败，跳过开仓",
+                                            symbol,
+                                        )
+                                        console.print(
+                                            "           [yellow]⚠️ 逐仓或杠杆未生效，已跳过[/yellow]",
+                                        )
+                                        continue
                                 order = exchange.create_market_order(symbol, direction.value.lower(), quantity)
                                 log.info("Order placed: %s", order)
 

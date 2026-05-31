@@ -79,6 +79,26 @@ _rate_limited_until: float = 0.0
 _rl_lock = threading.Lock()
 
 
+def _env_hedge_mode_default() -> bool | None:
+    """Optional BITGET_HEDGE_MODE=1|0 override; None = defer until set_position_mode."""
+    raw = os.environ.get("BITGET_HEDGE_MODE", "").strip().lower()
+    if raw in ("1", "true", "yes", "hedge", "hedge_mode"):
+        return True
+    if raw in ("0", "false", "no", "one_way", "one_way_mode", "oneway"):
+        return False
+    return None
+
+
+def _bitget_error_text(exc: Exception) -> str:
+    return str(exc) or type(exc).__name__
+
+
+def _is_one_way_mode_error(exc: Exception) -> bool:
+    """Bitget 40774: order params disagree with account hold mode."""
+    text = _bitget_error_text(exc).lower()
+    return "40774" in text or "unilateral position" in text
+
+
 # ---------------------------------------------------------------------------
 # ccxt error mapping
 # ---------------------------------------------------------------------------
@@ -431,6 +451,11 @@ class BitgetExchange(ExchangeBase):
         self._min_qtys: dict[str, float] = {}
         self._tick_sizes: dict[str, float] = {}
         self._step_sizes: dict[str, float] = {}
+        # None = assume hedge until set_position_mode / 40774 fallback resolves it
+        self._hedge_mode: bool | None = _env_hedge_mode_default()
+        self._uta_account: bool | None = None  # UTA vs Classic (mix v2)
+        # ccxt 下单未传 marginMode 时默认全仓 / ccxt defaults orders to cross margin
+        self._margin_mode: str = "isolated"
 
         # Lazy-load markets on first API call (best-effort)
         self._load_markets()
@@ -629,12 +654,35 @@ class BitgetExchange(ExchangeBase):
         return "long" if side.lower() in ("buy", "long") else "short"
 
     def _order_params(self, side: str, *, reduce_only: bool = False) -> dict[str, Any]:
-        """Build ccxt params dict for Bitget UTA hedge-mode orders."""
-        params: dict[str, Any] = {}
+        """Build ccxt params aligned with UTA hedge vs one-way hold mode.
+
+        Do not pass raw ``posSide`` — ccxt sets it when ``hedged=True``.
+        One-way accounts need ``oneWayMode=True`` and must omit ``posSide``.
+        Always pass ``marginMode`` — ccxt Bitget defaults to cross (全仓) otherwise.
+        """
+        params: dict[str, Any] = {"marginMode": self._margin_mode}
         if reduce_only:
             params["reduceOnly"] = True
-        params["posSide"] = self._pos_side(side)
+        hedge = True if self._hedge_mode is None else self._hedge_mode
+        if hedge:
+            params["hedged"] = True
+        else:
+            params["oneWayMode"] = True
         return params
+
+    def _place_with_hold_mode_fallback(self, op_name: str, place_fn) -> Any:
+        """Place order; on 40774 retry once after switching to oneWayMode."""
+        try:
+            return _retry_ccxt(op_name, place_fn)
+        except Exception as exc:
+            if not _is_one_way_mode_error(exc) or self._hedge_mode is False:
+                raise _map_ccxt_error(exc, op_name) from exc
+            logger.warning(
+                "%s — account appears one-way; retrying with oneWayMode",
+                op_name,
+            )
+            self._hedge_mode = False
+            return _retry_ccxt(f"{op_name}(oneWay)", place_fn)
 
     def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
         """Place a market order via ccxt."""
@@ -654,7 +702,7 @@ class BitgetExchange(ExchangeBase):
             return self._ccxt.create_order(ccxt_sym, "market", ccxt_side, qty, None, params)
 
         with self._lock:
-            raw = _retry_ccxt(f"market({symbol})", _place)
+            raw = self._place_with_hold_mode_fallback(f"market({symbol})", _place)
 
         filled = self._resolve_filled_qty(raw, symbol, qty)
         order = _to_internal_order(
@@ -680,7 +728,7 @@ class BitgetExchange(ExchangeBase):
             return self._ccxt.create_order(ccxt_sym, "limit", ccxt_side, qty, price, self._order_params(side))
 
         with self._lock:
-            raw = _retry_ccxt(f"limit({symbol})", _place)
+            raw = self._place_with_hold_mode_fallback(f"limit({symbol})", _place)
 
         return _to_internal_order(
             raw,
@@ -713,7 +761,7 @@ class BitgetExchange(ExchangeBase):
             )
 
         with self._lock:
-            raw = _retry_ccxt(f"stop_loss({symbol})", _place)
+            raw = self._place_with_hold_mode_fallback(f"stop_loss({symbol})", _place)
 
         return {
             "order_id": str(raw.get("id", "")),
@@ -748,7 +796,7 @@ class BitgetExchange(ExchangeBase):
             )
 
         with self._lock:
-            raw = _retry_ccxt(f"take_profit({symbol})", _place)
+            raw = self._place_with_hold_mode_fallback(f"take_profit({symbol})", _place)
 
         return {
             "order_id": str(raw.get("id", "")),
@@ -1011,6 +1059,46 @@ class BitgetExchange(ExchangeBase):
     # Futures configuration
     # ------------------------------------------------------------------
 
+    def set_position_mode(self, dual: bool = False) -> None:
+        """Set hold mode: dual=True → hedge_mode (posSide), dual=False → one-way.
+
+        Tries UTA API first; Classic accounts fall back to mix v2 ``productType``.
+        """
+        if not self._has_auth:
+            return
+        hedged = dual
+        last_exc: Exception | None = None
+        param_attempts = (
+            (True, {"uta": True}),
+            (False, {"productType": "USDT-FUTURES"}),
+        )
+        for uta, params in param_attempts:
+            try:
+                with self._lock:
+                    self._ccxt.set_position_mode(hedged, None, dict(params))
+                self._hedge_mode = hedged
+                self._uta_account = uta
+                label = "hedge_mode" if hedged else "one_way_mode"
+                api_label = "UTA" if uta else "Classic/mix-v2"
+                logger.info("Bitget position mode set to %s (%s)", label, api_label)
+                return
+            except Exception as exc:
+                last_exc = exc
+                text = _bitget_error_text(exc)
+                if uta and ("40084" in text or "Classic Account" in text or "Unified Account" in text):
+                    logger.info("Bitget account is Classic — retrying set_position_mode via mix v2")
+                    continue
+                logger.warning(
+                    "Bitget set_position_mode(%s, uta=%s) failed: %s",
+                    "hedge" if hedged else "one-way",
+                    uta,
+                    exc,
+                )
+        if self._hedge_mode is None:
+            self._hedge_mode = hedged
+        if last_exc is not None:
+            logger.warning("Bitget set_position_mode exhausted attempts: %s", last_exc)
+
     def set_leverage(self, symbol: str, leverage: int = 5) -> None:
         """Set futures leverage via ccxt."""
         if not self._has_auth:
@@ -1022,6 +1110,50 @@ class BitgetExchange(ExchangeBase):
             logger.info("Bitget leverage set to %dx for %s", leverage, symbol)
         except Exception as exc:
             logger.warning("Bitget set_leverage failed for %s: %s", symbol, exc)
+
+    def verify_margin_leverage(
+        self,
+        symbol: str,
+        *,
+        margin_mode: str = "ISOLATED",
+        leverage: int | None = None,
+    ) -> bool:
+        """Confirm symbol margin mode (and optional leverage) via fetch_leverage.
+
+        开仓前校验 Bitget 侧是否已切到逐仓/目标杠杆。
+        """
+        if not self._has_auth:
+            return True
+        ccxt_sym = _ccxt_symbol(symbol)
+        want_mode = "isolated" if margin_mode.upper() == "ISOLATED" else "cross"
+        try:
+            with self._lock:
+                lev = self._ccxt.fetch_leverage(ccxt_sym)
+        except Exception as exc:
+            logger.warning("Bitget verify_margin_leverage fetch failed for %s: %s", symbol, exc)
+            return False
+        got_mode = str(lev.get("marginMode") or "").lower()
+        if got_mode != want_mode:
+            logger.warning(
+                "Bitget %s margin mode mismatch: want=%s got=%s",
+                symbol,
+                want_mode,
+                got_mode or "?",
+            )
+            return False
+        if leverage is not None:
+            long_lev = int(float(lev.get("longLeverage") or 0))
+            short_lev = int(float(lev.get("shortLeverage") or long_lev))
+            if long_lev != leverage or short_lev != leverage:
+                logger.warning(
+                    "Bitget %s leverage mismatch: want=%dx got long=%d short=%d",
+                    symbol,
+                    leverage,
+                    long_lev,
+                    short_lev,
+                )
+                return False
+        return True
 
     def set_margin_mode(self, symbol: str, mode: str = "ISOLATED") -> bool:
         """Set margin mode via ccxt (isolated or cross).
@@ -1037,6 +1169,7 @@ class BitgetExchange(ExchangeBase):
         try:
             with self._lock:
                 self._ccxt.set_margin_mode(ccxt_mode, ccxt_sym)
+            self._margin_mode = ccxt_mode
             logger.info("Bitget margin mode set to %s for %s", mode.upper(), symbol)
             return True
         except Exception as exc:

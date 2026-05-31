@@ -415,3 +415,83 @@ class TestBitgetFilledExtraction:
 
         assert result["filled"] == 1177.0
         mock_instance.fetch_order.assert_called()
+
+
+class TestBitgetHoldModeParams:
+    """Order params must match UTA hedge vs one-way hold mode."""
+
+    @patch("ccxt.bitget")
+    def test_order_params_hedge_uses_hedged_flag_not_pos_side(self, mock_bitget: MagicMock) -> None:
+        from extensions.trading.crypto.live._bitget_exchange import BitgetExchange
+
+        ex = BitgetExchange()
+        ex._hedge_mode = True
+        params = ex._order_params("LONG", reduce_only=False)
+
+        assert params == {"marginMode": "isolated", "hedged": True}
+        assert "posSide" not in params
+
+    @patch("ccxt.bitget")
+    def test_order_params_one_way_uses_one_way_mode(self, mock_bitget: MagicMock) -> None:
+        from extensions.trading.crypto.live._bitget_exchange import BitgetExchange
+
+        ex = BitgetExchange()
+        ex._hedge_mode = False
+        params = ex._order_params("LONG", reduce_only=True)
+
+        assert params == {
+            "marginMode": "isolated",
+            "reduceOnly": True,
+            "oneWayMode": True,
+        }
+
+    @patch("ccxt.bitget")
+    def test_set_position_mode_falls_back_to_classic_api(self, mock_bitget: MagicMock) -> None:
+        mock_instance = MagicMock()
+        mock_instance.set_position_mode.side_effect = [
+            Exception('bitget {"code":"40084","msg":"Classic Account mode"}'),
+            {"code": "00000"},
+        ]
+        mock_bitget.return_value = mock_instance
+
+        with patch.dict("os.environ", {
+            "BITGET_API_KEY": "k",
+            "BITGET_SECRET": "s",
+            "BITGET_PASSPHRASE": "p",
+        }):
+            from extensions.trading.crypto.live._bitget_exchange import BitgetExchange
+            ex = BitgetExchange()
+            ex.set_position_mode(dual=True)
+
+        assert mock_instance.set_position_mode.call_count == 2
+        mock_instance.set_position_mode.assert_any_call(True, None, {"uta": True})
+        mock_instance.set_position_mode.assert_any_call(True, None, {"productType": "USDT-FUTURES"})
+        assert ex._hedge_mode is True
+        assert ex._uta_account is False
+
+    @patch("ccxt.bitget")
+    def test_market_order_retries_one_way_after_40774(
+        self, mock_bitget: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("BITGET_API_KEY", "key")
+        monkeypatch.setenv("BITGET_SECRET", "secret")
+        monkeypatch.setenv("BITGET_PASSPHRASE", "pass")
+
+        mock_instance = MagicMock()
+        mock_instance.create_order.side_effect = [
+            Exception('bitget {"code":"40774","msg":"unilateral position"}'),
+            {"id": "ok", "filled": 1.0, "status": "closed"},
+        ]
+        mock_bitget.return_value = mock_instance
+
+        from extensions.trading.crypto.live._bitget_exchange import BitgetExchange
+        ex = BitgetExchange()
+        ex._hedge_mode = True
+        result = ex.create_market_order("XRPUSDT", "LONG", 10.0)
+
+        assert result["filled"] == 1.0
+        assert ex._hedge_mode is False
+        assert mock_instance.create_order.call_count == 2
+        second_params = mock_instance.create_order.call_args_list[1].args[5]
+        assert second_params.get("oneWayMode") is True
+        assert "posSide" not in second_params

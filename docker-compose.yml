@@ -13,6 +13,8 @@ services:
       - agent/.env.agt
     environment:
       - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1
+      # AGT live-runner tick 间隔（ms）；180000 = 3 分钟 / 3-min autonomous tick
+      - LIVE_RUNNER_MARKET_WATCH_MS=180000
       # 108 等生产环境直连 Bitget，勿继承 agent/.env 的本地代理 / prod: no proxy
       - CCXT_PROXY=
       - CCXT_PROXY_PORT=

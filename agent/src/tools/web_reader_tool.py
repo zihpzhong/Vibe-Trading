@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import os
 from urllib.parse import urlsplit
 
 import requests
@@ -19,6 +20,20 @@ _JINA_PREFIX = "https://r.jina.ai/"
 _TIMEOUT = 30
 _MAX_LENGTH = 8000
 _CACHED_MARKER = "Warning: This is a cached snapshot"
+
+
+def _jina_request_headers(*, no_cache: bool = False) -> dict[str, str]:
+    """Build Jina Reader request headers, optionally with API key auth.
+
+    构建 Jina Reader 请求头；若设置 ``JINA_API_KEY`` 则附带 Bearer 认证以提升 RPM。
+    """
+    headers: dict[str, str] = {"Accept": "text/markdown"}
+    if no_cache:
+        headers["x-no-cache"] = "true"
+    api_key = os.environ.get("JINA_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def _url_allowed(url: str) -> tuple[bool, str]:
@@ -79,9 +94,7 @@ def read_url(url: str, no_cache: bool = False) -> str:
         return json.dumps({"status": "error", "error": error}, ensure_ascii=False)
 
     try:
-        headers = {"Accept": "text/markdown"}
-        if no_cache:
-            headers["x-no-cache"] = "true"
+        headers = _jina_request_headers(no_cache=no_cache)
         emit_progress(
             "fetching",
             message=f"GET {target_url[:60]}{'…' if len(target_url) > 60 else ''}",

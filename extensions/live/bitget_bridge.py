@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from typing import Any
 
@@ -33,6 +34,55 @@ _EXTRA_LIVE_KEYS: frozenset[str] = frozenset({"bitget"})
 # 缓存 balance/positions 快照，每第 N tick 刷新一次 / refresh every N runner ticks
 _SIZING_CACHE: dict[str, Any] = {"tick_count": 0, "snapshot": None, "adapter": None}
 _SIZING_REFRESH_INTERVAL = 5
+
+# AGT Runner tick 间隔默认 60s；可用 LIVE_RUNNER_MARKET_WATCH_MS 覆盖 / override via env
+_DEFAULT_RUNNER_MARKET_WATCH_MS = 60_000
+
+
+def _runner_market_watch_ms() -> int:
+    """Parse ``LIVE_RUNNER_MARKET_WATCH_MS`` (ms); invalid values fall back to 60s."""
+    raw = os.environ.get("LIVE_RUNNER_MARKET_WATCH_MS", "").strip()
+    if not raw:
+        return _DEFAULT_RUNNER_MARKET_WATCH_MS
+    try:
+        ms = int(raw)
+    except ValueError:
+        logger.warning("Invalid LIVE_RUNNER_MARKET_WATCH_MS=%r — using 60s", raw)
+        return _DEFAULT_RUNNER_MARKET_WATCH_MS
+    if ms <= 0:
+        logger.warning("LIVE_RUNNER_MARKET_WATCH_MS must be > 0 (got %s) — using 60s", ms)
+        return _DEFAULT_RUNNER_MARKET_WATCH_MS
+    return ms
+
+
+def _ensure_runner_job_interval(broker: str, watch_ms: int) -> None:
+    """Persist scheduler cadence so job store resume matches ``market_watch_ms``.
+
+    上游 runner 重启时优先加载 jobs.json；若仍是旧的 interval:60000 会忽略 env。
+    On restart, LiveRunner reloads persisted jobs before synthesizing from triggers.
+    """
+    import time
+
+    from src.live.runtime.jobstore import JobStore
+    from src.live.runtime.scheduler import Job
+
+    store = JobStore()
+    now_ms = int(time.time() * 1000)
+    job = Job(
+        id=f"{broker}-market-0",
+        next_run_at=now_ms + min(watch_ms, 15_000),
+        schedule=f"interval:{watch_ms}",
+        payload={"broker": broker, "trigger": "market"},
+    )
+    try:
+        store.save([job])
+        logger.info(
+            "bitget runner job store synced: %s interval=%dms",
+            broker,
+            watch_ms,
+        )
+    except Exception as exc:
+        logger.warning("bitget runner job store sync failed: %s", exc)
 
 
 def patch_upstream() -> None:
@@ -90,6 +140,9 @@ def patch_upstream() -> None:
     # 8. Patch runner prompt + order_guard with AGT sizing engine.
     _patch_runner_prompt()
     _patch_order_guard_sizing()
+
+    # 10. AGT live-runner: tool allowlist + prompt constraints / 工具白名单
+    _patch_agt_live_tool_filter()
 
     # 9. API / status surfaces (import api_server when already running as serve).
     _patch_api_server_surfaces()
@@ -277,10 +330,75 @@ def _patch_runner_prompt() -> None:
             mandate_max_total_exposure=float(caps.max_total_exposure_usd or 0),
             mandate_account_funding=float(caps.account_funding_usd or 0),
         )
-        return base + format_sizing_prompt_block(plan)
+        from extensions.live.agt_runner_config import append_agt_live_prompt_constraints
+
+        return append_agt_live_prompt_constraints(base + format_sizing_prompt_block(plan))
 
     _runner._pin_mandate_prompt = _patched_prompt  # type: ignore[assignment]
     logger.info("bitget runner prompt patched with AGT position sizing engine")
+
+
+def _patch_agt_live_tool_filter() -> None:
+    """Filter the agent tool registry for ``live-runner:*`` sessions.
+
+    自主 tick 禁用 read_url / run_swarm 等研究工具，仅保留 Bitget MCP + live_trading。
+    """
+    import src.tools as _tools_mod
+
+    if getattr(_tools_mod, "_agt_live_build_registry_patched", False):
+        return
+
+    from extensions.live.agt_runner_config import (
+        filter_registry_for_agt_live,
+        is_live_runner_session_title,
+    )
+
+    _orig_build = _tools_mod.build_registry
+
+    def _build_registry_with_agt_filter(*args: Any, **kwargs: Any):  # noqa: ANN401
+        registry = _orig_build(*args, **kwargs)
+        session_id = kwargs.get("session_id")
+        if not session_id:
+            return registry
+        try:
+            title = _live_runner_session_title(session_id)
+        except Exception:
+            return registry
+        if not is_live_runner_session_title(title):
+            return registry
+        return filter_registry_for_agt_live(registry)
+
+    _tools_mod.build_registry = _build_registry_with_agt_filter  # type: ignore[assignment]
+    _tools_mod._agt_live_build_registry_patched = True
+    logger.info("agt live-runner build_registry tool filter installed")
+
+
+def _live_runner_session_title(session_id: str) -> str | None:
+    """Resolve session title for tool-filter gating."""
+    if "api_server" in sys.modules:
+        mod = sys.modules["api_server"]
+        svc = mod._get_session_service()
+        session = svc.store.get_session(session_id)
+        return session.title if session else None
+    return None
+
+
+def _get_or_create_live_runner_session(svc: Any, broker: str) -> Any:  # noqa: ANN401
+    """Reuse the newest ``live-runner:{broker}`` session instead of spawning another.
+
+    复用已有 live-runner 会话，避免每次 start 产生新 session 堆积。
+    """
+    title = f"live-runner:{broker}"
+    candidates = [s for s in svc.list_sessions(limit=200) if s.title == title]
+    if candidates:
+        session = max(candidates, key=lambda s: s.updated_at or s.created_at)
+        logger.info(
+            "reusing live-runner session %s (skipped %d duplicate titles)",
+            session.session_id,
+            len(candidates) - 1,
+        )
+        return session
+    return svc.create_session(title=title)
 
 
 def _patch_order_guard_sizing() -> None:
@@ -423,7 +541,7 @@ def _patch_api_server_surfaces() -> None:
                 __import__("api_server", fromlist=["_get_session_service"]),
                 "_get_session_service",
             )()
-            session = svc.create_session(title=f"live-runner:{broker}")
+            session = _get_or_create_live_runner_session(svc, broker)
             session_id = session.session_id
 
             async def _agent_caller(sid: str, prompt: str) -> dict:
@@ -444,6 +562,8 @@ def _patch_api_server_surfaces() -> None:
                 else None
             )
 
+            watch_ms = _runner_market_watch_ms()
+            _ensure_runner_job_interval(broker, watch_ms)
             runner = LiveRunner(
                 broker,
                 agent_caller=_agent_caller,
@@ -456,8 +576,14 @@ def _patch_api_server_surfaces() -> None:
                 scheduler=scheduler,
                 triggers=[Trigger.market("crypto")],
                 session_id=session_id,
+                market_watch_ms=watch_ms,
             )
             runner_holder["runner"] = runner
+            logger.info(
+                "bitget LiveRunner market_watch_ms=%d (%.1f min/tick)",
+                watch_ms,
+                watch_ms / 60_000,
+            )
             return runner
 
         mod._runner_factory = _bitget_runner_factory

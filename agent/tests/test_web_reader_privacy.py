@@ -75,3 +75,10 @@ def test_no_cache_header_opt_in_only(captured):
     assert "x-no-cache" not in {k.lower() for k in captured["headers"]}
     read_url(URL, no_cache=True)
     assert captured["headers"].get("x-no-cache") == "true"
+
+
+def test_jina_api_key_sent_when_configured(captured, monkeypatch):
+    monkeypatch.setenv("JINA_API_KEY", "jina_test_key")
+    captured["resp"] = _Resp(200, "Title: X\n\nbody")
+    read_url(URL)
+    assert captured["headers"].get("Authorization") == "Bearer jina_test_key"
