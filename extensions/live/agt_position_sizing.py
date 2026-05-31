@@ -530,7 +530,8 @@ def format_sizing_prompt_block(plan: EntrySizePlan) -> str:
         f"Tgt=${plan.notional_target_usdt:.0f} "
         f"Flr=${plan.notional_min_usdt:.0f} "
         f"Ceil=${plan.notional_max_usdt:.0f} "
-        f"Lev={plan.recommended_leverage:.0f}X"
+        f"Lev={plan.recommended_leverage:.0f}X | "
+        "Edge=NEG→no new longs; notional<Flr→rejected"
     )
 
 

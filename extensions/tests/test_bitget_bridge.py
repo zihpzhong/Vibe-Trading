@@ -20,7 +20,18 @@ from src.live.halt import halt_flag_set
 from src.live import registry as _registry
 from src.tools.mcp import MCPRemoteTool, MCPRemoteToolSpec
 
-from extensions.live.bitget_bridge import patch_upstream
+from extensions.live.bitget_bridge import (
+    _SIZING_CACHE,
+    _SIZING_REFRESH_INTERVAL,
+    _maybe_refresh_sizing,
+    patch_upstream,
+)
+
+
+def _reset_sizing_cache() -> None:
+    _SIZING_CACHE["tick_count"] = 0
+    _SIZING_CACHE["snapshot"] = None
+    _SIZING_CACHE["adapter"] = None
 
 # is_live_broker and wrap_live_broker_tools are accessed via _registry
 # (not imported directly) because patch_upstream() replaces them on the
@@ -226,3 +237,66 @@ def test_bridge_rejects_wildcard_for_bitget_in_agent_config() -> None:
                 }
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# Sizing snapshot cache
+# ---------------------------------------------------------------------------
+
+
+def test_maybe_refresh_sizing_skips_broker_between_interval_ticks() -> None:
+    """Broker MCP is called only on tick 0 and every Nth tick thereafter."""
+    _reset_sizing_cache()
+    fake_balance = {"USDT": {"total": 47.0}}
+    fake_positions: list[dict] = []
+    adapter = MagicMock()
+    adapter.call_tool.side_effect = [
+        {"status": "ok", "structured_content": fake_balance},
+        {"status": "ok", "structured_content": fake_positions},
+    ]
+
+    with patch("extensions.live.bitget_bridge._get_sizing_adapter", return_value=adapter):
+        for _ in range(_SIZING_REFRESH_INTERVAL):
+            balance, positions = _maybe_refresh_sizing()
+            assert balance == fake_balance
+            assert positions == fake_positions
+
+    assert adapter.call_tool.call_count == 2
+    assert _SIZING_CACHE["tick_count"] == _SIZING_REFRESH_INTERVAL
+
+
+def test_maybe_refresh_sizing_refreshes_on_nth_tick() -> None:
+    """Tick N triggers a second broker refresh."""
+    _reset_sizing_cache()
+    adapter = MagicMock()
+    adapter.call_tool.side_effect = [
+        {"status": "ok", "structured_content": {"USDT": {"total": 40.0}}},
+        {"status": "ok", "structured_content": []},
+        {"status": "ok", "structured_content": {"USDT": {"total": 41.0}}},
+        {"status": "ok", "structured_content": []},
+    ]
+
+    with patch("extensions.live.bitget_bridge._get_sizing_adapter", return_value=adapter):
+        for _ in range(_SIZING_REFRESH_INTERVAL):
+            _maybe_refresh_sizing()
+        balance, _positions = _maybe_refresh_sizing()
+
+    assert balance == {"USDT": {"total": 41.0}}
+    assert adapter.call_tool.call_count == 4
+
+
+def test_maybe_refresh_sizing_keeps_stale_snapshot_on_refresh_failure() -> None:
+    """Failed refresh retains prior snapshot and drops cached adapter."""
+    _reset_sizing_cache()
+    stale_balance = {"USDT": {"total": 45.0}}
+    _SIZING_CACHE["snapshot"] = (stale_balance, [])
+    _SIZING_CACHE["tick_count"] = _SIZING_REFRESH_INTERVAL
+    adapter = MagicMock()
+    adapter.call_tool.side_effect = RuntimeError("mcp down")
+
+    with patch("extensions.live.bitget_bridge._get_sizing_adapter", return_value=adapter):
+        balance, positions = _maybe_refresh_sizing()
+
+    assert balance == stale_balance
+    assert positions == []
+    assert _SIZING_CACHE["adapter"] is None

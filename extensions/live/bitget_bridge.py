@@ -29,9 +29,9 @@ _PATCHED = False
 #: Live broker keys registered by this extension (stdio MCP, no OAuth).
 _EXTRA_LIVE_KEYS: frozenset[str] = frozenset({"bitget"})
 
-# Sizing plan cache — refreshed every N ticks to reduce MCP subprocess + LLM tokens.
-# 缓存 sizing plan 减少每 tick broker API 调用 / 每次第 5 tick 刷新一次
-_SIZING_CACHE: dict[str, Any] = {"tick_count": 0, "plan": None, "adapter": None}
+# Sizing snapshot cache — refreshed every N ticks to reduce MCP subprocess + LLM tokens.
+# 缓存 balance/positions 快照，每第 N tick 刷新一次 / refresh every N runner ticks
+_SIZING_CACHE: dict[str, Any] = {"tick_count": 0, "snapshot": None, "adapter": None}
 _SIZING_REFRESH_INTERVAL = 5
 
 
@@ -197,48 +197,57 @@ def _patch_order_guard_read_first() -> None:
     logger.info("bitget order_guard._read_first patched to unwrap MCP envelopes")
 
 
-def _get_sizing_adapter() -> Any | None:
-    """Get or create cached MCP adapter for sizing data (reuse subprocess)."""
+def _bitget_mcp_config(*, tool_timeout: int = 20) -> Any:
+    """Build a standard Bitget MCP server config (shared by sizing + runner)."""
     from src.config.schema import MCPServerConfig
-    from src.tools.mcp import MCPServerAdapter
 
-    if _SIZING_CACHE.get("adapter") is not None:
-        try:
-            return _SIZING_CACHE["adapter"]
-        except Exception:
-            pass  # stale adapter, rebuild below
-    cfg = MCPServerConfig(
+    return MCPServerConfig(
         type="stdio",
         command="python3",
         args=["extensions/live/bitget_mcp_server.py"],
-        tool_timeout=20,
+        tool_timeout=tool_timeout,
     )
-    adapter = MCPServerAdapter("bitget", cfg)
+
+
+def _get_sizing_adapter() -> Any:
+    """Get or create cached MCP adapter for sizing prompt refreshes."""
+    from src.tools.mcp import MCPServerAdapter
+
+    adapter = _SIZING_CACHE.get("adapter")
+    if adapter is not None:
+        return adapter
+    adapter = MCPServerAdapter("bitget", _bitget_mcp_config())
     _SIZING_CACHE["adapter"] = adapter
     return adapter
+
+
+def _invalidate_sizing_adapter() -> None:
+    """Drop cached MCP adapter after transport errors."""
+    _SIZING_CACHE["adapter"] = None
 
 
 def _maybe_refresh_sizing() -> tuple[Any | None, Any | None]:
     """Return cached sizing snapshot; refresh from broker every 5 ticks.
 
-    缓存 sizing plan，每第 5 tick 从 broker 刷新一次。减少 ~80% broker API 调用。
+    缓存 balance/positions 快照，每第 5 tick 从 broker 刷新一次。
     """
     tick = _SIZING_CACHE["tick_count"]
-    # Increment tick counter, check if refresh is due (every 5th tick)
-    # 递增 tick 计数，判断是否需要刷新（每 5 tick 一次）
-    if tick % _SIZING_REFRESH_INTERVAL == 0 or _SIZING_CACHE["plan"] is None:
+    snapshot = _SIZING_CACHE.get("snapshot")
+    if tick % _SIZING_REFRESH_INTERVAL == 0 or snapshot is None:
         try:
             adapter = _get_sizing_adapter()
-            if adapter is None:
-                raise RuntimeError("no sizing adapter")
             balance = _unwrap(lambda: adapter.call_tool("get_account", {}))()
             positions = _unwrap(lambda: adapter.call_tool("get_positions", {}))()
             _SIZING_CACHE["snapshot"] = (balance, positions)
         except Exception as exc:
             logger.debug("sizing snapshot refresh failed: %s", exc)
-            # Keep stale cache on failure — stale data is safer than no data
+            _invalidate_sizing_adapter()
+            # 失败时保留旧快照 / keep stale snapshot on failure
     _SIZING_CACHE["tick_count"] = tick + 1
-    return _SIZING_CACHE.get("snapshot", (None, None))
+    cached = _SIZING_CACHE.get("snapshot")
+    if cached is None:
+        return None, None
+    return cached
 
 
 def _patch_runner_prompt() -> None:
@@ -399,15 +408,8 @@ def _patch_api_server_surfaces() -> None:
             from src.live.runtime.scheduler import Scheduler
             from src.live.runtime.triggers import Trigger
             from src.tools.mcp import MCPServerAdapter
-            from src.config.schema import MCPServerConfig
 
-            _cfg = MCPServerConfig(
-                type="stdio",
-                command="python3",
-                args=["extensions/live/bitget_mcp_server.py"],
-                tool_timeout=30,
-            )
-            adapter = MCPServerAdapter("bitget", _cfg)
+            adapter = MCPServerAdapter("bitget", _bitget_mcp_config(tool_timeout=30))
 
             def _read(remote_tool: str):
                 return _unwrap(lambda: adapter.call_tool(remote_tool, {}))
