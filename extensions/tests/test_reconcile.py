@@ -10,7 +10,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from extensions.trading.crypto.live.position_tracker import PositionTracker
-from extensions.trading.crypto.live.reconcile import reconcile_positions
+from extensions.trading.crypto.live.reconcile import (
+    EMPTY_EXCHANGE_CONFIRM_REQUIRED,
+    reconcile_positions,
+)
 
 
 @pytest.fixture
@@ -23,9 +26,17 @@ def tracker() -> PositionTracker:
 
 
 class TestReconcilePositions:
+    def test_skips_ghost_close_until_empty_streak_confirmed(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.01, 63000.0)
+        summary = reconcile_positions(tracker, [], empty_exchange_streak=1)
+        assert summary["removed"] == []
+        assert tracker.active_count == 1
+
     def test_removes_ghost_local_position(self, tracker: PositionTracker) -> None:
         tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.01, 63000.0)
-        summary = reconcile_positions(tracker, [])
+        summary = reconcile_positions(
+            tracker, [], empty_exchange_streak=EMPTY_EXCHANGE_CONFIRM_REQUIRED,
+        )
         assert "BTCUSDT" in summary["removed"]
         assert tracker.active_count == 0
         assert len(tracker.get_recent_closed(5)) == 1

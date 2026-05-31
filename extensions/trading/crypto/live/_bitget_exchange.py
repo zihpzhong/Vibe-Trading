@@ -56,7 +56,10 @@ def _internal_symbol(ccxt_sym: str) -> str:
 
     BTC/USDT:USDT → BTCUSDT
     BTC/USDT → BTCUSDT
+    NEARUSDT → NEARUSDT  (Bitget raw / no-slash ccxt symbol)
     """
+    if "/" not in ccxt_sym:
+        return ccxt_sym.split(":")[0]
     base = ccxt_sym.split("/")[0]
     quote = ccxt_sym.split("/")[-1].split(":")[0]
     return f"{base}{quote}"
@@ -74,24 +77,6 @@ _RATE_LIMIT_THRESHOLD = 3  # 连续 429 达到此数后触发冷却
 _consecutive_429 = 0
 _rate_limited_until: float = 0.0
 _rl_lock = threading.Lock()
-
-
-def _retry(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
-    """Call fn with exponential backoff retry."""
-    last_err: Optional[Exception] = None
-    for attempt in range(_MAX_RETRIES):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as exc:
-            last_err = exc
-            if attempt < _MAX_RETRIES - 1:
-                delay = _RETRY_BACKOFF[attempt]
-                logger.warning(
-                    "%s attempt %d/%d failed (%.1fs retry): %s",
-                    op_name, attempt + 1, _MAX_RETRIES, delay, exc,
-                )
-                time.sleep(delay)
-    raise RuntimeError(f"{op_name} failed after {_MAX_RETRIES} attempts") from last_err
 
 
 # ---------------------------------------------------------------------------
@@ -126,22 +111,22 @@ def _retry_ccxt(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
 
     last_err: Optional[Exception] = None
 
-    # 429 断路器：冷却期内直接略过 / circuit breaker: skip during cooldown
+    # 断路器：冷却期内直接略过 / circuit breaker: skip during cooldown
     with _rl_lock:
         if _rate_limited_until > time.time():
             logger.warning(
-                "%s skipped — rate-limit cooldown (%.0fs remaining)",
+                "%s skipped — cooldown (%.0fs remaining)",
                 op_name, _rate_limited_until - time.time(),
             )
             raise _map_ccxt_error(
-                RuntimeError(f"rate-limit cooldown active for {op_name}"),
+                RuntimeError(f"cooldown active for {op_name}"),
                 op_name,
             )
 
     for attempt in range(_MAX_RETRIES):
         try:
             result = fn(*args, **kwargs)
-            # 成功 → 重置连续 429 计数 / success resets the counter
+            # 成功 → 重置失败计数 / success resets the counter
             with _rl_lock:
                 _consecutive_429 = 0
             return result
@@ -156,14 +141,6 @@ def _retry_ccxt(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
                 time.sleep(delay)
         except ccxt.RateLimitExceeded as exc:
             last_err = exc
-            with _rl_lock:
-                _consecutive_429 += 1
-                if _consecutive_429 >= _RATE_LIMIT_THRESHOLD:
-                    _rate_limited_until = time.time() + _RATE_LIMIT_COOLDOWN
-                    logger.warning(
-                        "%s — consecutive 429 threshold hit (%d), cooling down for %.0fs",
-                        op_name, _consecutive_429, _RATE_LIMIT_COOLDOWN,
-                    )
             delay = 5 << attempt  # 指数退避: 5s, 10s, 20s / exponential backoff
             logger.warning(
                 "%s attempt %d/%d rate-limited (%.1fs backoff): %s",
@@ -171,8 +148,16 @@ def _retry_ccxt(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
             )
             time.sleep(delay)
             continue
-        except Exception as exc:
-            raise _map_ccxt_error(exc, op_name) from exc
+    # All retries exhausted — count as failure toward circuit breaker,
+    # then raise the mapped error.
+    with _rl_lock:
+        _consecutive_429 += 1
+        if _consecutive_429 >= _RATE_LIMIT_THRESHOLD:
+            _rate_limited_until = time.time() + _RATE_LIMIT_COOLDOWN
+            logger.warning(
+                "%s — consecutive failure threshold hit (%d), cooling down for %.0fs",
+                op_name, _consecutive_429, _RATE_LIMIT_COOLDOWN,
+            )
     raise _map_ccxt_error(last_err or RuntimeError("unknown"), op_name)
 
 
@@ -232,6 +217,92 @@ def _extract_filled_qty(raw: dict, fallback_qty: float = 0.0) -> float:
                 return candidate
         if fallback_qty > 0:
             return fallback_qty
+    return 0.0
+
+
+def _extract_position_qty(raw: dict) -> float:
+    """从 ccxt/Bitget 持仓结构提取数量（contracts 为空时回退 info.total）。
+    Extract position size from ccxt dict; Bitget UTA often leaves ``contracts`` null.
+    """
+    contracts = raw.get("contracts")
+    if contracts is not None:
+        try:
+            amt = float(contracts or 0)
+            if amt > 0:
+                return abs(amt)
+        except (TypeError, ValueError):
+            pass
+
+    info = raw.get("info")
+    if isinstance(info, dict):
+        for key in ("total", "available", "holdVol", "size"):
+            try:
+                candidate = float(info.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                return abs(candidate)
+
+    notional = float(raw.get("notional", 0) or 0)
+    mark = float(raw.get("markPrice", 0) or 0)
+    if isinstance(info, dict) and mark <= 0:
+        try:
+            mark = float(info.get("markPrice", 0) or 0)
+        except (TypeError, ValueError):
+            mark = 0.0
+    if notional > 0 and mark > 0:
+        return notional / mark
+    return 0.0
+
+
+def _extract_position_entry(raw: dict) -> float:
+    """Entry price with Bitget ``openPriceAvg`` fallback."""
+    try:
+        entry = float(raw.get("entryPrice", 0) or 0)
+    except (TypeError, ValueError):
+        entry = 0.0
+    if entry > 0:
+        return entry
+    info = raw.get("info")
+    if isinstance(info, dict):
+        try:
+            return float(info.get("openPriceAvg", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _extract_position_mark(raw: dict) -> float:
+    """Mark price with Bitget ``markPrice`` info fallback."""
+    try:
+        mark = float(raw.get("markPrice", 0) or 0)
+    except (TypeError, ValueError):
+        mark = 0.0
+    if mark > 0:
+        return mark
+    info = raw.get("info")
+    if isinstance(info, dict):
+        try:
+            return float(info.get("markPrice", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _extract_position_unrealized(raw: dict) -> float:
+    """Unrealized PnL with Bitget ``unrealizedPL`` fallback."""
+    try:
+        pnl = float(raw.get("unrealizedPnl", 0) or 0)
+    except (TypeError, ValueError):
+        pnl = 0.0
+    if pnl != 0:
+        return pnl
+    info = raw.get("info")
+    if isinstance(info, dict):
+        try:
+            return float(info.get("unrealizedPL", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
     return 0.0
 
 
@@ -320,14 +391,48 @@ class BitgetExchange(ExchangeBase):
             pass
 
         self._ccxt = ccxt.bitget(exchange_config)
-        self._ccxt.markets = {}
+
+        # ccxt's Bitget implementation calls ``self.load_markets()`` at the
+        # start of EVERY ``fetch_ticker``/``set_margin_mode``/etc — making a
+        # network request to ``/api/v2/spot/public/coins`` that is easily
+        # rate-limited. The ``markets``/``markets_by_id`` property guards in the
+        # base class do NOT prevent this; the Bitget subclass calls it directly.
+        # We replace ``load_markets`` itself with a no-op and provide a
+        # ``market()`` fallback that auto-creates minimal swap entries for any
+        # symbol the caller needs — keeping all trading methods functional
+        # without ever hitting the rate-limited endpoint.
+        self._ccxt.load_markets = lambda reload=False: {}  # type: ignore[method-assign]
+        self._ccxt._markets = {}  # type: ignore[union-attr]
+        self._ccxt._markets_by_id = {}  # type: ignore[union-attr]
+
+        _orig_market = self._ccxt.market
+
+        def _auto_seed_market(symbol: str) -> dict:
+            try:
+                return _orig_market(symbol)
+            except Exception:
+                base = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
+                entry = {
+                    "id": f"{base}USDT",
+                    "symbol": symbol,
+                    "base": base, "quote": "USDT", "settle": "USDT",
+                    "settleId": "USDT",
+                    "type": "swap", "spot": False, "swap": True,
+                    "linear": True, "inverse": False,
+                    "active": True, "contract": True, "contractSize": 1,
+                    "limits": {"amount": {"min": 0.01}, "price": {"min": 0.01}},
+                    "precision": {"amount": 0.01, "price": 0.01},
+                }
+                return entry
+
+        self._ccxt.market = _auto_seed_market  # type: ignore[method-assign]
 
         # Cache for symbol precision
         self._min_qtys: dict[str, float] = {}
         self._tick_sizes: dict[str, float] = {}
         self._step_sizes: dict[str, float] = {}
 
-        # Lazy-load markets on first API call
+        # Lazy-load markets on first API call (best-effort)
         self._load_markets()
 
     # ------------------------------------------------------------------
@@ -335,37 +440,23 @@ class BitgetExchange(ExchangeBase):
     # ------------------------------------------------------------------
 
     def _load_markets(self) -> None:
-        """Load markets to cache precision and valid symbols.
+        """Load markets to cache precision and valid symbols (no-op).
 
-        One-shot: once ``_markets_loaded`` is set (even on failure), subsequent
-        calls are skipped. This prevents a cascading retry loop when the Bitget
-        API rate-limits the ``load_markets`` endpoint — without this guard every
-        order/balance call re-triggers ``load_markets``, compounding the 429 and
-        starving actual trading requests.
+        ``self._ccxt.load_markets`` was replaced with a no-op in ``__init__``
+        to avoid hitting the rate-limited ``/spot/public/coins`` endpoint.
+        Common precision values are pre-configured here instead.
         """
         if self._markets_loaded:
             return
-        try:
-            self._ccxt.load_markets()
-            for ccxt_sym, m in self._ccxt.markets.items():
-                sym = _internal_symbol(ccxt_sym)
-                limits = m.get("limits", {})
-                if "amount" in limits:
-                    self._min_qtys[sym] = float(limits["amount"].get("min", 0) or 0)
-                if "price" in limits:
-                    self._tick_sizes[sym] = float(limits["price"].get("min", 0.01) or 0.01)
-                prec = m.get("precision", {})
-                if "amount" in prec:
-                    self._step_sizes[sym] = float(prec["amount"] or 1)
-        except Exception as exc:
-            logger.warning("Bitget load_markets failed: %s (one-shot, will not retry)", exc)
-            # ccxt checks ``self.markets`` before every API call and reloads if
-            # it's ``None``/empty — which hits the rate-limited ``/spot/public/coins``
-            # endpoint. Setting ``_markets`` directly bypasses this check.
-            self._ccxt._markets = {"_": {"id": "_", "symbol": "_"}}  # type: ignore[union-attr]
-            self._ccxt.markets = self._ccxt._markets  # type: ignore[union-attr]
-        finally:
-            self._markets_loaded = True
+        for sym in ["BTCUSDT", "ETHUSDT"]:
+            self._min_qtys[sym] = 0.001
+            self._tick_sizes[sym] = 0.1
+            self._step_sizes[sym] = 0.001
+        for sym in ["PENDLEUSDT", "NEARUSDT"]:
+            self._min_qtys[sym] = 0.1
+            self._tick_sizes[sym] = 0.0001
+            self._step_sizes[sym] = 0.1
+        self._markets_loaded = True
 
     def _require_markets(self) -> None:
         """Ensure markets are loaded before trading operations."""
@@ -405,7 +496,10 @@ class BitgetExchange(ExchangeBase):
         ccxt_sym = _ccxt_symbol(symbol)
 
         def _fetch() -> dict:
-            return self._ccxt.fetch_ticker(ccxt_sym)
+            raw = self._ccxt.fetch_ticker(ccxt_sym)
+            if raw is None:
+                raise ValueError(f"fetch_ticker returned None for {symbol}")
+            return raw
 
         with self._lock:
             raw = _retry_ccxt(f"ticker({symbol})", _fetch)
@@ -416,36 +510,23 @@ class BitgetExchange(ExchangeBase):
 
         Uses ``fetch_ticker()`` per symbol (lighter) instead of ``fetch_tickers()``
         (fetches every tradable pair, hits a high-volume public endpoint that is
-        easily rate-limited). When ``symbols`` is ``None`` (caller wants everything)
-        fall back to ``fetch_tickers()``.
+        easily rate-limited). When ``symbols`` is ``None`` (caller wants everything),
+        falls back to a curated list of common USDT perpetual pairs.
         """
-        if not symbols:
-            def _fetch_all() -> dict:
-                return self._ccxt.fetch_tickers()
-
-            with self._lock:
-                raw_all = _retry_ccxt("tickers", _fetch_all)
-
-            tickers: list[dict[str, Any]] = []
-            for ccxt_sym, raw in raw_all.items():
-                sym = _internal_symbol(ccxt_sym)
-                if not sym.endswith("USDT"):
-                    continue
-                t = _ccxt_ticker_to_internal(raw)
-                if t["volume24h"] > 0:
-                    tickers.append(t)
-            tickers.sort(key=lambda x: x["volume24h"], reverse=True)
-            return tickers
-
-        # 精确查询：只获取请求的币种 / Targeted: only fetch requested symbols
+        targets = symbols or [
+            "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+            "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+            "PENDLEUSDT", "NEARUSDT", "AAVEUSDT", "UNIUSDT", "LTCUSDT",
+        ]
         result: list[dict[str, Any]] = []
-        for sym in symbols:
+        for sym in targets:
             try:
                 t = self.get_ticker(sym)
                 if t.get("last", 0) and float(t["last"]) > 0:
                     result.append(t)
             except Exception as exc:
-                logger.warning("get_ticker(%s) skipped: %s", sym, exc)
+                if symbols is not None:
+                    logger.warning("get_ticker(%s) skipped: %s", sym, exc)
         return result
 
     def get_funding_rate(self, symbol: str) -> float:
@@ -542,6 +623,19 @@ class BitgetExchange(ExchangeBase):
                 logger.debug("Bitget fill poll via fetch_order failed: %s", exc)
         return filled
 
+    @staticmethod
+    def _pos_side(side: str) -> str:
+        """Normalize trade side to Bitget UTA ``posSide`` value."""
+        return "long" if side.lower() in ("buy", "long") else "short"
+
+    def _order_params(self, side: str, *, reduce_only: bool = False) -> dict[str, Any]:
+        """Build ccxt params dict for Bitget UTA hedge-mode orders."""
+        params: dict[str, Any] = {}
+        if reduce_only:
+            params["reduceOnly"] = True
+        params["posSide"] = self._pos_side(side)
+        return params
+
     def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
         """Place a market order via ccxt."""
         self._require_auth("market_order")
@@ -554,14 +648,7 @@ class BitgetExchange(ExchangeBase):
                 f"market({symbol},{side},{amount}) rounds to {qty} — below minimum tradeable"
             )
 
-        params: dict[str, Any] = {}
-        if reduce_only:
-            params["reduceOnly"] = True
-        # UTA 统一账户需指定 posSide / UTA account requires posSide for hedge mode
-        if side.upper() in ("LONG", "BUY"):
-            params["posSide"] = "long"
-        else:
-            params["posSide"] = "short"
+        params = self._order_params(side, reduce_only=reduce_only)
 
         def _place() -> dict:
             return self._ccxt.create_order(ccxt_sym, "market", ccxt_side, qty, None, params)
@@ -590,8 +677,7 @@ class BitgetExchange(ExchangeBase):
         qty = self._round_qty(symbol, amount)
 
         def _place() -> dict:
-            params: dict[str, Any] = {"posSide": "long" if ccxt_side == "buy" else "short"}
-            return self._ccxt.create_order(ccxt_sym, "limit", ccxt_side, qty, price, params)
+            return self._ccxt.create_order(ccxt_sym, "limit", ccxt_side, qty, price, self._order_params(side))
 
         with self._lock:
             raw = _retry_ccxt(f"limit({symbol})", _place)
@@ -621,11 +707,9 @@ class BitgetExchange(ExchangeBase):
         trigger_price = self._round_price(symbol, stop_price)
 
         def _place() -> dict:
-            params: dict[str, Any] = {"reduceOnly": True}
-            params["posSide"] = "long" if ccxt_side == "buy" else "short"
             return self._ccxt.create_stop_loss_order(
                 ccxt_sym, "market", ccxt_side, qty, None, trigger_price,
-                params,
+                self._order_params(ccxt_side, reduce_only=True),
             )
 
         with self._lock:
@@ -658,11 +742,9 @@ class BitgetExchange(ExchangeBase):
         trigger_price = self._round_price(symbol, tp_price)
 
         def _place() -> dict:
-            params: dict[str, Any] = {"reduceOnly": True}
-            params["posSide"] = "long" if ccxt_side == "buy" else "short"
             return self._ccxt.create_take_profit_order(
                 ccxt_sym, "market", ccxt_side, qty, None, trigger_price,
-                params,
+                self._order_params(ccxt_side, reduce_only=True),
             )
 
         with self._lock:
@@ -859,24 +941,27 @@ class BitgetExchange(ExchangeBase):
 
         positions: list[dict[str, Any]] = []
         for pos in raw_list if isinstance(raw_list, list) else []:
-            amt = float(pos.get("contracts", 0) or 0)
-            if amt == 0:
+            amt = _extract_position_qty(pos)
+            if amt <= 0:
                 continue
             ccxt_sym = pos.get("symbol", "")
             if not ccxt_sym:
                 continue
+            info = pos.get("info")
+            if isinstance(info, dict) and info.get("symbol"):
+                ccxt_sym = str(info["symbol"])
             side = pos.get("side", "")
             direction = "LONG" if side in ("long", "LONG") else "SHORT"
-            mark = float(pos.get("markPrice", 0) or 0)
-            entry = float(pos.get("entryPrice", 0) or 0)
+            mark = _extract_position_mark(pos)
+            entry = _extract_position_entry(pos)
             positions.append({
                 "symbol": _internal_symbol(ccxt_sym),
                 "direction": direction,
                 "entry_price": entry,
                 "mark_price": mark if mark > 0 else entry,  # 标记价格供 mandate 门控检查 / mark price for mandate enforcement
-                "quantity": abs(amt),
+                "quantity": amt,
                 "notional": float(pos.get("notional", 0) or 0),
-                "unrealized_pnl": float(pos.get("unrealizedPnl", 0) or 0),
+                "unrealized_pnl": _extract_position_unrealized(pos),
             })
         return positions
 
@@ -891,8 +976,11 @@ class BitgetExchange(ExchangeBase):
     def is_valid_symbol(self, symbol: str) -> bool:
         """Check if symbol exists on Bitget swap markets."""
         self._require_markets()
+        mkt = self._ccxt.markets
+        if not mkt:
+            return True  # 市场不可用时接受所有 / accept all when markets unavailable
         ccxt_sym = _ccxt_symbol(symbol)
-        return ccxt_sym in self._ccxt.markets
+        return ccxt_sym in mkt
 
     def validate_symbols(self, symbols: list[str]) -> list[str]:
         """Filter out symbols not available on Bitget.
@@ -901,10 +989,16 @@ class BitgetExchange(ExchangeBase):
         accepted. Called once at startup when switching from Binance to Bitget.
         """
         self._require_markets()
+        # ccxt.markets may be None/empty when load_markets was rate-limited;
+        # accept all symbols in that case rather than crashing at startup.
+        mkt = self._ccxt.markets
+        if not mkt:
+            logger.warning("Bitget markets unavailable (rate-limited), accepting all whitelist symbols")
+            return list(symbols)
         valid: list[str] = []
         for sym in symbols:
             ccxt_sym = _ccxt_symbol(sym)
-            if ccxt_sym in self._ccxt.markets:
+            if ccxt_sym in mkt:
                 valid.append(sym)
             else:
                 logger.warning(

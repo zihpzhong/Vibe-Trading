@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 # Emergency stop distance when adopting an orphan exchange position (%)
 _ADOPT_STOP_PCT = 8.0
 
+# 连续 N 次交易所返回空持仓后才允许 ghost-close / consecutive empty reads before ghost-close
+EMPTY_EXCHANGE_CONFIRM_REQUIRED = 3
+
 
 def reconcile_positions(
     tracker: PositionTracker,
@@ -19,6 +22,7 @@ def reconcile_positions(
     *,
     price_lookup: Optional[Callable[[str], float]] = None,
     exchange: Any = None,
+    empty_exchange_streak: int = EMPTY_EXCHANGE_CONFIRM_REQUIRED,
 ) -> dict[str, Any]:
     """Align tracker with exchange positionRisk snapshot.
 
@@ -29,6 +33,9 @@ def reconcile_positions(
         tracker: Position tracker instance.
         exchange_positions: Output of ``exchange.get_positions()``.
         price_lookup: Optional callable(symbol) -> mark price for ghost closes.
+        empty_exchange_streak: Consecutive successful fetches where exchange returned
+            zero positions. Ghost-close is skipped until this reaches
+            ``EMPTY_EXCHANGE_CONFIRM_REQUIRED`` (guards against transient API errors).
 
     Returns:
         Summary dict with keys ``removed``, ``adopted``, ``unchanged``.
@@ -44,12 +51,20 @@ def reconcile_positions(
     # 交易所维护/API 异常返回 [] 不应导致本地持仓被误判为幽灵全平
     # Guard: skip reconcile when exchange returns zero positions but tracker has active ones
     if not exch_map and tracker.active_count > 0:
+        if empty_exchange_streak < EMPTY_EXCHANGE_CONFIRM_REQUIRED:
+            logger.warning(
+                "Reconcile: exchange returned zero positions but %d local active — "
+                "skipping ghost-close (%d/%d empty confirmations)",
+                tracker.active_count,
+                empty_exchange_streak,
+                EMPTY_EXCHANGE_CONFIRM_REQUIRED,
+            )
+            return {"removed": [], "adopted": [], "unchanged": tracker.active_count}
         logger.warning(
-            "Reconcile: exchange returned zero positions but %d local active — "
-            "skipping to prevent false ghost-close (possible API maintenance/error)",
+            "Reconcile: exchange empty for %d consecutive checks — removing %d ghost local position(s)",
+            empty_exchange_streak,
             tracker.active_count,
         )
-        return {"removed": [], "adopted": [], "unchanged": tracker.active_count}
 
     removed: list[str] = []
     adopted: list[str] = []

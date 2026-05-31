@@ -94,7 +94,10 @@ def test_place_bracket_orders_dedupes_before_place() -> None:
 
 
 def test_reconcile_gone_cancels_brackets() -> None:
-    from extensions.trading.crypto.live.reconcile import reconcile_positions
+    from extensions.trading.crypto.live.reconcile import (
+        EMPTY_EXCHANGE_CONFIRM_REQUIRED,
+        reconcile_positions,
+    )
 
     mock_exchange = MagicMock()
     mock_exchange.fetch_open_algo_orders.return_value = [
@@ -111,7 +114,10 @@ def test_reconcile_gone_cancels_brackets() -> None:
         tracker = PositionTracker(account_balance=10_000.0, max_positions=3, persist_dir=tmp)
         tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.01, 63000.0)
         tracker.set_bracket_order_ids("BTCUSDT", "sl1", None)
-        reconcile_positions(tracker, [], exchange=mock_exchange)
+        reconcile_positions(
+            tracker, [], exchange=mock_exchange,
+            empty_exchange_streak=EMPTY_EXCHANGE_CONFIRM_REQUIRED,
+        )
         mock_exchange.cancel_order.assert_called()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

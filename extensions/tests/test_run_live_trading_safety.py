@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from unittest.mock import patch
 
@@ -35,3 +36,47 @@ class TestRunLiveTradingArgs:
         )
         assert notional == 12.5
         assert run_live_trading.validate_min_order_notional(notional, min_notional=20.0) != ""
+
+
+class TestLoadRuntimeEnv:
+    def test_env_local_does_not_override_injected_bitget_key(self, tmp_path, monkeypatch) -> None:
+        main_key = "bg_main_account_xx"
+        sub_key = "bg_sub_account_xx"
+        ext_local = tmp_path / "env.local"
+        ext_local.write_text(
+            f"BITGET_API_KEY={sub_key}\nBITGET_SECRET=sub_secret\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BITGET_API_KEY", main_key)
+        monkeypatch.setenv("BITGET_SECRET", "main_secret")
+        monkeypatch.setattr(run_live_trading, "_EXT_ENV_LOCAL", ext_local)
+        monkeypatch.setattr(run_live_trading, "_AGENT_ENV", tmp_path / "missing.env")
+
+        run_live_trading._load_runtime_env()
+
+        assert os.environ["BITGET_API_KEY"] == main_key
+        assert os.environ["BITGET_SECRET"] == "main_secret"
+
+    def test_env_local_overrides_when_bitget_key_absent(self, tmp_path, monkeypatch) -> None:
+        sub_key = "bg_sub_from_local"
+        ext_local = tmp_path / "env.local"
+        ext_local.write_text(f"BITGET_API_KEY={sub_key}\n", encoding="utf-8")
+        monkeypatch.delenv("BITGET_API_KEY", raising=False)
+        monkeypatch.setattr(run_live_trading, "_EXT_ENV_LOCAL", ext_local)
+        monkeypatch.setattr(run_live_trading, "_AGENT_ENV", tmp_path / "missing.env")
+
+        run_live_trading._load_runtime_env()
+
+        assert os.environ.get("BITGET_API_KEY") == sub_key
+
+    def test_skip_env_local_flag(self, tmp_path, monkeypatch) -> None:
+        ext_local = tmp_path / "env.local"
+        ext_local.write_text("BITGET_API_KEY=should_not_load\n", encoding="utf-8")
+        monkeypatch.delenv("BITGET_API_KEY", raising=False)
+        monkeypatch.setenv("VIBE_AUT_SKIP_ENV_LOCAL", "1")
+        monkeypatch.setattr(run_live_trading, "_EXT_ENV_LOCAL", ext_local)
+        monkeypatch.setattr(run_live_trading, "_AGENT_ENV", tmp_path / "missing.env")
+
+        run_live_trading._load_runtime_env()
+
+        assert "BITGET_API_KEY" not in os.environ

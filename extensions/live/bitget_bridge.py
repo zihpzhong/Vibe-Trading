@@ -82,8 +82,9 @@ def patch_upstream() -> None:
     # 7. Patch order_guard._read_first to unwrap MCP envelopes.
     _patch_order_guard_read_first()
 
-    # 8. Patch runner prompt to add leverage guidance (3-8X self-assessment).
+    # 8. Patch runner prompt + order_guard with AGT sizing engine.
     _patch_runner_prompt()
+    _patch_order_guard_sizing()
 
     # 9. API / status surfaces (import api_server when already running as serve).
     _patch_api_server_surfaces()
@@ -180,16 +181,11 @@ def _patch_order_guard_read_first() -> None:
 
     def _patched_read_first(self, candidates: tuple[str, ...]) -> object:
         raw = _orig_read_first(self, candidates)
-        # Unwrap MCP envelope: extract structured_content or data
+        # Unwrap MCP envelope: extract structured_content or data.
+        # The ``{"result": [...]}`` unwrap is already done at the source
+        # in ``mcp._normalize_call_tool_result`` — no need to repeat here.
         if isinstance(raw, dict):
-            sc = raw.get("structured_content")
-            if sc is not None:
-                if isinstance(sc, dict) and list(sc) == ["result"]:
-                    return sc["result"]
-                return sc
-            data = raw.get("data")
-            if data is not None:
-                return data
+            return raw.get("structured_content") or raw.get("data") or raw
         return raw
 
     _og.LiveOrderGuardTool._read_first = _patched_read_first  # type: ignore[assignment]
@@ -197,30 +193,137 @@ def _patch_order_guard_read_first() -> None:
 
 
 def _patch_runner_prompt() -> None:
-    """Patch ``_pin_mandate_prompt`` to append AI self-assessed leverage guidance.
+    """Patch ``_pin_mandate_prompt`` with AGT sizing engine output each tick.
 
-    The original prompt only states ``max_leverage`` as a ceiling; this patch
-    adds an instruction telling the agent to assess market conditions and choose
-    a leverage between 3X and 8X on its own judgment. The enforcement gate
-    (``max_leverage=8.0`` in the mandate) remains the hard ceiling.
+    每 tick 注入凯利/固定比例计算后的 TARGET/FLOOR 名义仓位指引。
     """
     from src.live.runtime import runner as _runner
 
+    from extensions.live.agt_position_sizing import format_sizing_prompt_block, plan_from_account_snapshot
+
     _orig_prompt = _runner._pin_mandate_prompt
+
+    def _fetch_sizing_snapshot() -> tuple[object | None, object | None]:
+        """Best-effort live balance/positions for prompt (no tick failure on error)."""
+        try:
+            from src.config.schema import MCPServerConfig
+            from src.tools.mcp import MCPServerAdapter
+
+            cfg = MCPServerConfig(
+                type="stdio",
+                command="python3",
+                args=["extensions/live/bitget_mcp_server.py"],
+                tool_timeout=20,
+            )
+            adapter = MCPServerAdapter("bitget", cfg)
+            balance = _unwrap(lambda: adapter.call_tool("get_account", {}))()
+            positions = _unwrap(lambda: adapter.call_tool("get_positions", {}))()
+            return balance, positions
+        except Exception as exc:
+            logger.debug("sizing snapshot fetch failed: %s", exc)
+            return None, None
 
     def _patched_prompt(broker: str, mandate, now) -> str:
         base = _orig_prompt(broker, mandate, now)
-        return base + (
-            "\n\n=== LEVERAGE GUIDANCE ===\n"
-            "Assess current market conditions (volatility, trend strength, risk) "
-            "and self-select an appropriate leverage between 3X and 8X for each "
-            "position. The mandate ceiling is 8X; aim for at least 3X unless "
-            "conditions clearly warrant lower. This is an AI judgment call — "
-            "scale leverage to conviction, not to the limit."
+        if broker.strip().lower() != "bitget":
+            return base
+        caps = mandate.hard_caps
+        balance, positions = _fetch_sizing_snapshot()
+        plan = plan_from_account_snapshot(
+            balance if isinstance(balance, dict) else None,
+            positions if isinstance(positions, list) else None,
+            mandate_max_order_notional=float(caps.max_order_notional_usd or 0),
+            mandate_max_total_exposure=float(caps.max_total_exposure_usd or 0),
+            mandate_account_funding=float(caps.account_funding_usd or 0),
         )
+        return base + format_sizing_prompt_block(plan)
 
     _runner._pin_mandate_prompt = _patched_prompt  # type: ignore[assignment]
-    logger.info("bitget runner prompt patched with 3-8X leverage guidance")
+    logger.info("bitget runner prompt patched with AGT position sizing engine")
+
+
+def _patch_order_guard_sizing() -> None:
+    """Reject buy orders below computed notional floor (margin-aware sizing)."""
+    from src.live import order_guard as _og
+    from src.live.enforcement import BREACH_KIND_QUANTITATIVE, _breach
+
+    from extensions.live.agt_position_sizing import plan_from_account_snapshot, validate_entry_notional
+
+    _orig_execute = _og.LiveOrderGuardTool.execute
+
+    def _execute_with_sizing_inner(self, **kwargs: Any) -> str:
+        """Inject sizing floor after mandate checks, before allow."""
+        mandate = _og.load_mandate(self.broker)
+        if mandate is None or mandate.schema_version != _og.MANDATE_SCHEMA_VERSION:
+            return _orig_execute(self, **kwargs)
+
+        if self._is_expired(mandate):
+            return _orig_execute(self, **kwargs)
+        if _og.halt_flag_set(self.broker):
+            return _orig_execute(self, **kwargs)
+
+        extractor = _og.get_extractor(self.broker)
+        intent = extractor(self.remote_name, kwargs) if extractor is not None else None
+        if intent is None:
+            return _orig_execute(self, **kwargs)
+
+        intent = self._normalize_intent_notional(intent)
+        if intent is None:
+            return _orig_execute(self, **kwargs)
+
+        positions = self._read_first(_og._POSITIONS_TOOLS)
+        balance = self._read_first(_og._BALANCE_TOOLS)
+        daily_count = self._read_daily_count()
+
+        breach = _og.check_mandate(
+            mandate,
+            intent,
+            positions,
+            balance,
+            broker=self.broker,
+            remote_tool=self.remote_name,
+            daily_count=daily_count,
+        )
+        if breach is not None:
+            if breach.kind in (_og.BREACH_KIND_UNIVERSE, _og.BREACH_KIND_INSTRUMENT):
+                return self._deny_breach(breach, mandate=mandate, intent=intent, reauth=False)
+            return self._deny_breach(breach, mandate=mandate, intent=intent, reauth=True)
+
+        caps = mandate.hard_caps
+        pos_rows = positions if isinstance(positions, list) else []
+        bal_row = balance if isinstance(balance, dict) else None
+        plan = plan_from_account_snapshot(
+            bal_row,
+            pos_rows,
+            mandate_max_order_notional=float(caps.max_order_notional_usd or 0),
+            mandate_max_total_exposure=float(caps.max_total_exposure_usd or 0),
+            mandate_account_funding=float(caps.account_funding_usd or 0),
+        )
+        notional = float(intent.notional_usd or 0)
+        reduce_only = bool(kwargs.get("reduce_only"))
+        sizing_reason = validate_entry_notional(
+            notional,
+            plan,
+            side=intent.side or "buy",
+            is_reduce_only=reduce_only,
+        )
+        if sizing_reason:
+            sizing_breach = _breach(
+                broker=self.broker,
+                remote_tool=self.remote_name,
+                intent=intent,
+                kind=BREACH_KIND_QUANTITATIVE,
+                limit="agt_min_notional_usd",
+                limit_value=plan.notional_min_usdt,
+                attempted_value=notional,
+                detail=sizing_reason,
+            )
+            return self._deny_breach(sizing_breach, mandate=mandate, intent=intent, reauth=False)
+
+        return self._allow(mandate=mandate, intent=intent, kwargs=kwargs)
+
+    _og.LiveOrderGuardTool.execute = _execute_with_sizing_inner  # type: ignore[assignment]
+    logger.info("bitget order_guard patched with AGT min-notional sizing floor")
 
 
 def _patch_api_server_surfaces() -> None:
@@ -355,11 +458,11 @@ def _unwrap(read_fn):  # type: ignore[no-untyped-def]
                 f"bitget MCP call failed: {result.get('error', str(result))}"
             )
 
+        # The ``{"result": [...]}`` unwrap is already done at the source
+        # in ``mcp._normalize_call_tool_result``. structured_content is the
+        # canonical payload field; data and text are fallbacks.
         sc = result.get("structured_content")
         if sc is not None:
-            if isinstance(sc, dict) and list(sc) == ["result"]:
-                # FastMCP wraps list returns in {"result": [...]}; unwrap it.
-                return sc["result"]
             return sc
         data = result.get("data")
         if data is not None:

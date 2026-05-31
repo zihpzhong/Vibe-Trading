@@ -98,3 +98,7 @@ claudedocs/
 .deepseek/
 .cursor/
 .codegraph/uv.lock
+
+# Bitget account-specific env files
+agent/.env.agt
+agent/.env.aut

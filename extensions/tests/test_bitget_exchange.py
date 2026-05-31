@@ -221,6 +221,48 @@ class TestBitgetExchangeBalance:
         ex = BitgetExchange()
         assert ex.get_positions() == []
 
+    @patch("ccxt.bitget")
+    def test_get_positions_bitget_null_contracts_uses_info_total(self, mock_bitget: MagicMock) -> None:
+        """Bitget UTA returns contracts=null; size lives in info.total."""
+        mock_instance = MagicMock()
+        mock_instance.fetch_positions.return_value = [
+            {
+                "symbol": "PENDLE/USDT:USDT",
+                "side": "long",
+                "contracts": None,
+                "entryPrice": None,
+                "markPrice": None,
+                "notional": 25.5,
+                "unrealizedPnl": None,
+                "info": {
+                    "symbol": "PENDLEUSDT",
+                    "holdSide": "long",
+                    "total": "19",
+                    "openPriceAvg": "1.3444",
+                    "markPrice": "1.35",
+                    "unrealizedPL": "0.10",
+                },
+            },
+        ]
+        mock_bitget.return_value = mock_instance
+
+        with patch.dict("os.environ", {
+            "BITGET_API_KEY": "k",
+            "BITGET_SECRET": "s",
+            "BITGET_PASSPHRASE": "p",
+        }):
+            from extensions.trading.crypto.live._bitget_exchange import BitgetExchange
+            ex = BitgetExchange()
+            positions = ex.get_positions()
+
+        assert len(positions) == 1
+        assert positions[0]["symbol"] == "PENDLEUSDT"
+        assert positions[0]["direction"] == "LONG"
+        assert positions[0]["quantity"] == 19.0
+        assert positions[0]["entry_price"] == 1.3444
+        assert positions[0]["mark_price"] == 1.35
+        assert positions[0]["unrealized_pnl"] == 0.10
+
 
 class TestBitgetExchangeSymbolConversion:
     """Symbol format conversion helpers."""
@@ -236,6 +278,8 @@ class TestBitgetExchangeSymbolConversion:
         from extensions.trading.crypto.live._bitget_exchange import _ccxt_symbol, _internal_symbol
         assert _internal_symbol(_ccxt_symbol("BTCUSDT")) == "BTCUSDT"
         assert _internal_symbol(_ccxt_symbol("SOLUSDT")) == "SOLUSDT"
+        assert _internal_symbol("NEARUSDT") == "NEARUSDT"
+        assert _internal_symbol("PENDLEUSDT") == "PENDLEUSDT"
 
 
 class TestBitgetExchangeValidateSymbols:

@@ -64,8 +64,12 @@ _EXT_ENV_LOCAL = _EXT_ROOT / "config" / ".env.local"
 
 
 def _load_runtime_env() -> None:
-    """加载 agent/.env 与 extensions/config/.env.local（若存在）。
-    Load agent/.env and extensions/config/.env.local when present.
+    """加载 agent/.env；可选加载 .env.local（不覆盖已注入的 Bitget 凭证）。
+    Load agent/.env; optionally .env.local without clobbering injected Bitget keys.
+
+    Docker ``live-trading`` 通过 ``env_file: agent/.env.aut`` 注入主账号 Key；
+    ``extensions/config/.env.local`` 为 AGT 子账号专用，若 ``override=True`` 会
+    错误覆盖 AUT 凭证（表现为余额 ~47 USDT、持仓与 108 主账号不一致）。
     """
     try:
         from dotenv import load_dotenv
@@ -73,7 +77,14 @@ def _load_runtime_env() -> None:
         return
     if _AGENT_ENV.is_file():
         load_dotenv(_AGENT_ENV, override=False)
-    if _EXT_ENV_LOCAL.is_file():
+    if os.environ.get("VIBE_AUT_SKIP_ENV_LOCAL", "").strip().lower() in ("1", "true", "yes"):
+        return
+    if not _EXT_ENV_LOCAL.is_file():
+        return
+    # 已注入 BITGET_*（Docker env_file / shell）时禁止 .env.local 覆盖 / never override injected keys
+    if os.environ.get("BITGET_API_KEY", "").strip():
+        load_dotenv(_EXT_ENV_LOCAL, override=False)
+    else:
         load_dotenv(_EXT_ENV_LOCAL, override=True)
 
 
@@ -377,25 +388,36 @@ def main() -> int:
 
     # ---- 检查实际账户余额（仅 futures） ----
     actual_usdt_balance = None
-    try:
-        actual_balance = exchange.get_account_balance()
-        if actual_balance:
-            actual_usdt_balance = actual_balance.get("USDT", 0)
-            if actual_usdt_balance < args.balance:
-                log.warning(
-                    "Futures wallet USDT balance: %.2f (--balance=%.2f may be inaccurate)",
-                    actual_usdt_balance, args.balance,
-                )
-                if actual_usdt_balance < 10:
-                    log.error(
-                        "Insufficient futures wallet balance (%.2f USDT). "
-                        "Please transfer USDT from Spot wallet to Futures wallet on Binance.",
+    for _retry in range(3):
+        try:
+            actual_balance = exchange.get_account_balance()
+            if actual_balance:
+                actual_usdt_balance = actual_balance.get("USDT", 0)
+                # 如果余额异常低（代理未就绪），稍后重试
+                if actual_usdt_balance is not None and actual_usdt_balance < 100:
+                    log.warning(
+                        "Futures wallet USDT balance: %.2f — possible proxy issue, retrying...",
                         actual_usdt_balance,
                     )
-            else:
-                log.info("Futures wallet USDT balance: %.2f", actual_usdt_balance)
-    except Exception:
-        log.info("Could not query account balance (non-fatal)")
+                    time.sleep(3)
+                    continue
+                if actual_usdt_balance < args.balance:
+                    log.warning(
+                        "Futures wallet USDT balance: %.2f (--balance=%.2f may be inaccurate)",
+                        actual_usdt_balance, args.balance,
+                    )
+                    if actual_usdt_balance < 10:
+                        log.error(
+                            "Insufficient futures wallet balance (%.2f USDT). "
+                            "Please transfer USDT from Spot wallet to Futures wallet on Binance.",
+                            actual_usdt_balance,
+                        )
+                else:
+                    log.info("Futures wallet USDT balance: %.2f", actual_usdt_balance)
+                break
+        except Exception:
+            log.info("Could not query account balance (non-fatal)")
+            break
 
     # ---- 设置合约模式：逐仓 + 单向持仓 ----
     if hasattr(exchange, "set_position_mode") and not args.mock:
@@ -420,13 +442,13 @@ def main() -> int:
         cooldown_minutes=_signal_cooldown,
     )
     # 确保 _load() 不覆盖构造函数传入的交易所真实余额
+    # 当 API 返回的余额明显异常（低于 CLI 值的一半）时，
+    # 使用 CLI 参数值而非 API 值，避免启动时代理未就绪导致的余额错误
     if actual_usdt_balance is not None:
-        positions.account_balance = actual_usdt_balance
-        # 同步 initial_balance，避免 _load() 留下的旧 JSON 值
-        # 影响绩效指标准确性
-        positions._initial_balance = actual_usdt_balance
-        # 用交易所真实余额对齐 rolling 峰值，避免 equity_history 虚高误触发熔断
-        positions.initialize_rolling_peak(actual_usdt_balance)
+        use_balance = actual_usdt_balance if actual_usdt_balance >= args.balance / 2 else args.balance
+        positions.account_balance = use_balance
+        positions._initial_balance = use_balance
+        positions.initialize_rolling_peak(use_balance)
 
     # ---- Phase 2 分析引擎 ----
     phase2_analyzer = Phase2Analyzer() if not args.no_phase2 else None
@@ -743,6 +765,7 @@ def main() -> int:
     cycle_count = 0
     total_orders = 0
     logged_close_watermark = ""  # 避免每轮重复 log 同一条平仓记录 / avoid re-logging same closes each cycle
+    _empty_exchange_streak = 0  # 连续空持仓 API 计数 / consecutive empty exchange position fetches
 
     console.print()
     console.print(Panel.fit(
@@ -957,6 +980,10 @@ def main() -> int:
             if not args.mock and not args.dry_run and hasattr(exchange, "get_positions"):
                 try:
                     exch_pos = exchange.get_positions()
+                    if exch_pos:
+                        _empty_exchange_streak = 0
+                    else:
+                        _empty_exchange_streak += 1
 
                     def _mark_price(sym: str) -> float:
                         try:
@@ -968,6 +995,7 @@ def main() -> int:
                         positions, exch_pos,
                         price_lookup=_mark_price,
                         exchange=exchange if config.use_exchange_bracket_orders and not args.mock else None,
+                        empty_exchange_streak=_empty_exchange_streak,
                     )
                     if summary.get("removed") or summary.get("adopted"):
                         console.print(
