@@ -29,6 +29,11 @@ _PATCHED = False
 #: Live broker keys registered by this extension (stdio MCP, no OAuth).
 _EXTRA_LIVE_KEYS: frozenset[str] = frozenset({"bitget"})
 
+# Sizing plan cache — refreshed every N ticks to reduce MCP subprocess + LLM tokens.
+# 缓存 sizing plan 减少每 tick broker API 调用 / 每次第 5 tick 刷新一次
+_SIZING_CACHE: dict[str, Any] = {"tick_count": 0, "plan": None, "adapter": None}
+_SIZING_REFRESH_INTERVAL = 5
+
 
 def patch_upstream() -> None:
     """Register ``bitget`` in the upstream live-broker pipeline at runtime.
@@ -192,10 +197,57 @@ def _patch_order_guard_read_first() -> None:
     logger.info("bitget order_guard._read_first patched to unwrap MCP envelopes")
 
 
+def _get_sizing_adapter() -> Any | None:
+    """Get or create cached MCP adapter for sizing data (reuse subprocess)."""
+    from src.config.schema import MCPServerConfig
+    from src.tools.mcp import MCPServerAdapter
+
+    if _SIZING_CACHE.get("adapter") is not None:
+        try:
+            return _SIZING_CACHE["adapter"]
+        except Exception:
+            pass  # stale adapter, rebuild below
+    cfg = MCPServerConfig(
+        type="stdio",
+        command="python3",
+        args=["extensions/live/bitget_mcp_server.py"],
+        tool_timeout=20,
+    )
+    adapter = MCPServerAdapter("bitget", cfg)
+    _SIZING_CACHE["adapter"] = adapter
+    return adapter
+
+
+def _maybe_refresh_sizing() -> tuple[Any | None, Any | None]:
+    """Return cached sizing snapshot; refresh from broker every 5 ticks.
+
+    缓存 sizing plan，每第 5 tick 从 broker 刷新一次。减少 ~80% broker API 调用。
+    """
+    tick = _SIZING_CACHE["tick_count"]
+    # Increment tick counter, check if refresh is due (every 5th tick)
+    # 递增 tick 计数，判断是否需要刷新（每 5 tick 一次）
+    if tick % _SIZING_REFRESH_INTERVAL == 0 or _SIZING_CACHE["plan"] is None:
+        try:
+            adapter = _get_sizing_adapter()
+            if adapter is None:
+                raise RuntimeError("no sizing adapter")
+            balance = _unwrap(lambda: adapter.call_tool("get_account", {}))()
+            positions = _unwrap(lambda: adapter.call_tool("get_positions", {}))()
+            _SIZING_CACHE["snapshot"] = (balance, positions)
+        except Exception as exc:
+            logger.debug("sizing snapshot refresh failed: %s", exc)
+            # Keep stale cache on failure — stale data is safer than no data
+    _SIZING_CACHE["tick_count"] = tick + 1
+    return _SIZING_CACHE.get("snapshot", (None, None))
+
+
 def _patch_runner_prompt() -> None:
     """Patch ``_pin_mandate_prompt`` with AGT sizing engine output each tick.
 
-    每 tick 注入凯利/固定比例计算后的 TARGET/FLOOR 名义仓位指引。
+    Sizing plan cached & refreshed every ``_SIZING_REFRESH_INTERVAL`` ticks to
+    reduce broker API calls and token consumption.
+
+    每 tick 注入紧凑凯利仓位指引。sizing 数据缓存后每 5 tick 刷新一次。
     """
     from src.live.runtime import runner as _runner
 
@@ -203,32 +255,12 @@ def _patch_runner_prompt() -> None:
 
     _orig_prompt = _runner._pin_mandate_prompt
 
-    def _fetch_sizing_snapshot() -> tuple[object | None, object | None]:
-        """Best-effort live balance/positions for prompt (no tick failure on error)."""
-        try:
-            from src.config.schema import MCPServerConfig
-            from src.tools.mcp import MCPServerAdapter
-
-            cfg = MCPServerConfig(
-                type="stdio",
-                command="python3",
-                args=["extensions/live/bitget_mcp_server.py"],
-                tool_timeout=20,
-            )
-            adapter = MCPServerAdapter("bitget", cfg)
-            balance = _unwrap(lambda: adapter.call_tool("get_account", {}))()
-            positions = _unwrap(lambda: adapter.call_tool("get_positions", {}))()
-            return balance, positions
-        except Exception as exc:
-            logger.debug("sizing snapshot fetch failed: %s", exc)
-            return None, None
-
     def _patched_prompt(broker: str, mandate, now) -> str:
         base = _orig_prompt(broker, mandate, now)
         if broker.strip().lower() != "bitget":
             return base
         caps = mandate.hard_caps
-        balance, positions = _fetch_sizing_snapshot()
+        balance, positions = _maybe_refresh_sizing()
         plan = plan_from_account_snapshot(
             balance if isinstance(balance, dict) else None,
             positions if isinstance(positions, list) else None,

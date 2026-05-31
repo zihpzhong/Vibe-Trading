@@ -512,33 +512,25 @@ def validate_entry_notional(
 
 
 def format_sizing_prompt_block(plan: EntrySizePlan) -> str:
-    """Runner prompt section with Kelly-computed targets."""
+    """Compact Kelly sizing block — all numbers, minimal labels (~100 tokens)."""
     k = plan.kelly
     st = plan.stats
-    edge_note = (
-        "edge POSITIVE — new entries allowed"
-        if k.edge_positive
-        else "edge ≤ 0 — DO NOT open new longs (Kelly says no bet)"
-    )
+    edge_tag = "POS" if k.edge_positive else "NEG"
+    # single-line aggregate — every token carries signal
     return (
-        "\n\n=== AGT KELLY POSITION SIZING (mandatory) ===\n"
-        "Gate limits NOTIONAL; margin ≈ notional / leverage.\n"
-        f"- Equity ${plan.equity_usdt:.2f}, available ${plan.available_usdt:.2f}, "
-        f"exposure ${plan.exposure_notional_usdt:.2f}, "
-        f"headroom ${plan.exposure_headroom_usdt:.2f}, open {plan.open_positions}\n"
-        f"- Stats: WR={k.win_rate:.1%}, payoff={k.payoff_ratio:.2f} "
-        f"({st.sample_size} trades, raw={st.source}, blended={k.source})\n"
-        f"- Kelly f*={k.kelly_full:.2%}, f_used={k.kelly_scaled:.2%} "
-        f"(fraction={load_sizing_config().kelly_fraction:.2f}), "
-        f"{edge_note}\n"
-        f"- Margin target {k.margin_pct:.1%} of funding, floor {k.floor_margin_pct:.1%}\n"
-        f"- Conviction {plan.conviction_score:.0f}/10 (×{plan.conviction_multiplier:.2f}); "
-        "7-10 full, 5-6 half, <5 no entries\n"
-        f"- TARGET: margin ~${plan.margin_target_usdt:.2f} → "
-        f"notional ~${plan.notional_target_usdt:.2f} at {plan.recommended_leverage:.0f}X\n"
-        f"- FLOOR (enforced): notional ≥ ${plan.notional_min_usdt:.2f}\n"
-        f"- CEILING: notional ≤ ${plan.notional_max_usdt:.2f}\n"
-        "Use ``notional_usd`` ≈ TARGET (or half for conviction 5-6). Below FLOOR rejected."
+        "\n\n[SIZING] "
+        f"Eq={plan.equity_usdt:.0f} Avail={plan.available_usdt:.0f} "
+        f"Expo={plan.exposure_notional_usdt:.0f} "
+        f"Head={plan.exposure_headroom_usdt:.0f} Open={plan.open_positions} | "
+        f"f*={k.kelly_full:.1%} WR={k.win_rate:.0%} "
+        f"Payoff={k.payoff_ratio:.2f}(n={st.sample_size} {st.source}) | "
+        f"Mgn={k.margin_pct:.1%} Flr={k.floor_margin_pct:.1%} | "
+        f"Edge={edge_tag} Conv={plan.conviction_score:.0f}/10 "
+        f"(×{plan.conviction_multiplier:.2f}) | "
+        f"Tgt=${plan.notional_target_usdt:.0f} "
+        f"Flr=${plan.notional_min_usdt:.0f} "
+        f"Ceil=${plan.notional_max_usdt:.0f} "
+        f"Lev={plan.recommended_leverage:.0f}X"
     )
 
 
