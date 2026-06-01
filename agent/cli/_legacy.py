@@ -12,6 +12,8 @@ Usage:
 
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import argparse
 import csv
 import json
@@ -24,7 +26,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import warnings
 warnings.filterwarnings("ignore", message=".*Importing verbose from langchain.*")
@@ -60,6 +62,9 @@ EXIT_USAGE_ERROR = 2
 RICH_TAG_PATTERN = re.compile(r"\[/?[^\]]+\]")
 
 from cli._version import __version__ as _VERSION  # noqa: E402 — single source of truth
+
+if TYPE_CHECKING:
+    from src.agent.loop import AgentLoop
 
 # Agent color assignments for swarm display
 _AGENT_STYLES = ["cyan", "magenta", "green", "yellow", "blue", "bright_red", "bright_cyan", "bright_magenta"]
@@ -1977,7 +1982,7 @@ class _SwarmDashboard:
             color = "green" if self.final_status == "completed" else "red"
             title_status = f"[{color}]{self.final_status.upper()}[/{color}]"
         else:
-            title_status = f"[cyan]RUNNING[/cyan]"
+            title_status = "[cyan]RUNNING[/cyan]"
 
         title = f"{self.preset}  {title_status}  {mins}:{secs:02d}"
 
@@ -2145,7 +2150,7 @@ def cmd_swarm_run_live(preset: str, vars_json: Optional[str] = None) -> None:
         token_str = f"\nTokens: ~{tokens_in + tokens_out:,} (in: {tokens_in:,} out: {tokens_out:,})"
 
     if current.final_report:
-        console.print(f"\n[bold]\u2500\u2500 Final Report \u2500\u2500[/bold]")
+        console.print("\n[bold]\u2500\u2500 Final Report \u2500\u2500[/bold]")
         console.print(current.final_report[:2000])
 
     console.print(f"\n[{status_color}]{current.status.value.upper()}[/{status_color}]  Time: {mins}m {secs}s{token_str}")
@@ -2696,27 +2701,15 @@ def cmd_provider_login(provider: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Live trading channel (`vibe-trading live ...`) — SPEC.md §9 Decision 1.
+# Live connector runtime internals.
 #
 # Every state-changing verb here is a PRIVILEGED USER-SIDE action: none is
 # reachable from the agent loop / tool registry. There is deliberately NO
 # `live commit` verb — committing a mandate happens only through the consent
-# flow's `POST /mandate/commit`, never the CLI (the CLI cannot create or widen
-# a mandate). The verbs are:
-#
-#   live authorize <broker>  Desktop OAuth bootstrap (opens browser, writes
-#                            the token cache). The only way to turn on the channel.
-#   live run [<broker>]      Run the persistent runner in the FOREGROUND (tails
-#                            the heartbeat; Ctrl+C stops it). SPEC §7.5.
-#   live start [<broker>]    Start the persistent runner in the background.
-#   live stop [<broker>]     Stop the persistent runner.
-#   live status              Per-broker auth state + active mandate (limits +
-#                            expires_at countdown) + halt state + runner
-#                            liveness / last-tick (read-only).
-#   live mandate [<broker>]  Print the committed mandate (read-only).
-#   live halt [<broker>]     Trip the kill switch (writes the HALT sentinel).
-#   live resume [<broker>]   Clear the halt (explicit privileged re-enable).
-#   live revoke <broker>     Revoke OAuth token + delete the mandate (full off).
+# flow's `POST /mandate/commit`, never a CLI command (the CLI cannot create or
+# widen a mandate). The public CLI surface is `vibe-trading connector ...`;
+# `cmd_live_*` helpers remain only as the broker-runtime implementation behind
+# connector profiles.
 # ---------------------------------------------------------------------------
 
 _DEFAULT_LIVE_BROKER = "robinhood"
@@ -2834,7 +2827,7 @@ def cmd_live_authorize(broker: str) -> int:
     )
     console.print(
         "[dim]The channel is read-only until you commit a mandate and enable "
-        "order tools. Use `vibe-trading live status` to check state.[/dim]"
+        "order tools. Use `vibe-trading connector status` to check state.[/dim]"
     )
     return EXIT_SUCCESS
 
@@ -3043,7 +3036,7 @@ def cmd_live_halt(broker: Optional[str] = None) -> int:
 
     With no broker, trips the global switch (halts all brokers); with a broker,
     trips only that broker's sentinel. The gate rejects all order attempts until
-    the switch is cleared with ``live resume``.
+    the switch is cleared with ``vibe-trading connector resume``.
 
     Args:
         broker: Broker key, or ``None`` for the global switch.
@@ -3058,7 +3051,7 @@ def cmd_live_halt(broker: Optional[str] = None) -> int:
     scope = target or "ALL brokers"
     console.print(f"[bold red]Live trading halted[/bold red] for {scope}.")
     console.print(f"[dim]Sentinel: {path}[/dim]")
-    console.print("[dim]Run `vibe-trading live resume` to re-enable.[/dim]")
+    console.print("[dim]Run `vibe-trading connector resume` to re-enable.[/dim]")
     return EXIT_SUCCESS
 
 
@@ -3166,7 +3159,7 @@ def cmd_live_start(broker: Optional[str] = None) -> int:
 
     runner_id = result.get("runner_id") or _runner_id_for(key)
     console.print(f"[green]Live runner started[/green] for {key} [dim]({runner_id})[/dim].")
-    console.print("[dim]Check it with `vibe-trading live status`.[/dim]")
+    console.print("[dim]Check it with `vibe-trading connector status`.[/dim]")
     return EXIT_SUCCESS
 
 
@@ -3175,7 +3168,7 @@ def cmd_live_stop(broker: Optional[str] = None) -> int:
 
     Relays a stop request to ``POST /live/runner/stop``. Stopping the runner
     halts autonomous activity but does NOT clear a tripped kill switch or revoke
-    the mandate — use ``live resume`` / ``live revoke`` for those.
+    the mandate — use ``connector resume`` / ``connector revoke`` for those.
 
     Args:
         broker: Broker key, or ``None`` for the default broker (``robinhood``).
@@ -3266,31 +3259,615 @@ def cmd_live_run(broker: Optional[str] = None) -> int:
     return EXIT_SUCCESS
 
 
-def _dispatch_live(args: argparse.Namespace) -> int:
-    """Route a parsed ``live`` subcommand to its handler."""
-    sub = getattr(args, "live_command", None)
-    if sub == "authorize":
-        return cmd_live_authorize(args.live_broker)
-    if sub == "run":
-        return cmd_live_run(getattr(args, "live_broker", None))
-    if sub == "start":
-        return cmd_live_start(getattr(args, "live_broker", None))
-    if sub == "stop":
-        return cmd_live_stop(getattr(args, "live_broker", None))
-    if sub == "status":
-        return cmd_live_status(getattr(args, "live_broker", None))
-    if sub == "mandate":
-        return cmd_live_mandate(getattr(args, "live_broker", None))
-    if sub == "halt":
-        return cmd_live_halt(getattr(args, "live_broker", None))
-    if sub == "resume":
-        return cmd_live_resume(getattr(args, "live_broker", None))
-    if sub == "revoke":
-        return cmd_live_revoke(args.live_broker)
-    console.print(
-        "[red]live requires a subcommand.[/red] "
-        "Try: vibe-trading live status"
+# ---------------------------------------------------------------------------
+# Trading connector commands
+# ---------------------------------------------------------------------------
+
+def _profile_id(value: Optional[str]) -> Optional[str]:
+    """Normalize an optional connector profile id."""
+    if value is None:
+        return None
+    text = value.strip().lower()
+    return text or None
+
+
+def _selected_profile_or(value: Optional[str]):
+    """Resolve the selected or explicit trading profile."""
+    from src.trading.profiles import profile_by_id
+
+    return profile_by_id(_profile_id(value))
+
+
+def cmd_connector_list() -> int:
+    """List selectable trading connector profiles."""
+    from src.trading.profiles import list_profiles, load_selected_profile_id
+
+    selected = load_selected_profile_id()
+    table = Table(title="Trading Connectors", box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Selected", justify="center", width=8)
+    table.add_column("Profile")
+    table.add_column("Connector")
+    table.add_column("Env")
+    table.add_column("Transport")
+    table.add_column("Capabilities")
+    for profile in list_profiles():
+        table.add_row(
+            "[green]*[/green]" if profile.id == selected else "",
+            f"[cyan]{profile.id}[/cyan]\n[dim]{profile.label}[/dim]",
+            profile.connector,
+            profile.environment,
+            profile.transport,
+            ", ".join(profile.capabilities),
+        )
+    console.print(table)
+    console.print("[dim]Use `vibe-trading connector use <profile>` to set the default profile.[/dim]")
+    return EXIT_SUCCESS
+
+
+def cmd_connector_use(profile_id: str) -> int:
+    """Select the default trading connector profile."""
+    from src.trading.profiles import profile_by_id, save_selected_profile_id
+
+    try:
+        profile = profile_by_id(profile_id)
+        path = save_selected_profile_id(profile.id)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return EXIT_USAGE_ERROR
+    console.print(f"[green]Selected trading connector[/green] {profile.id}")
+    console.print(f"[dim]{profile.label} · {profile.environment} · {profile.transport}[/dim]")
+    console.print(f"[dim]Config: {path}[/dim]")
+    return EXIT_SUCCESS
+
+
+def cmd_connector_configure(
+    profile_id: str,
+    *,
+    host: str = "127.0.0.1",
+    port: int | None = None,
+    client_id: int = 77,
+    account: str | None = None,
+    yes: bool = False,
+) -> int:
+    """Configure a local connector profile."""
+    from src.trading.connectors.ibkr.local import IBKRLocalConfig, config_path, save_config
+
+    try:
+        profile = _selected_profile_or(profile_id)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return EXIT_USAGE_ERROR
+    if profile.transport != "local_tws" or profile.connector != "ibkr":
+        console.print(f"[red]{profile.id} is not a local TWS/Gateway profile.[/red]")
+        return EXIT_USAGE_ERROR
+
+    path = config_path()
+    if path.exists() and not yes:
+        console.print(f"[yellow]Local connector config already exists:[/yellow] {path}")
+        try:
+            if not Confirm.ask("Overwrite it?", default=False):
+                console.print("[dim]Aborted.[/dim]")
+                return EXIT_SUCCESS
+        except EOFError:
+            console.print("[dim]No input available; use --yes for non-interactive setup.[/dim]")
+            return EXIT_USAGE_ERROR
+
+    cfg = IBKRLocalConfig.from_mapping(
+        {
+            **profile.config,
+            "host": host,
+            "port": port or profile.config.get("port"),
+            "clientId": client_id,
+            "account": account,
+            "readonly": True,
+        }
     )
+    path = save_config(cfg)
+    console.print(f"[green]Configured[/green] {profile.id} [dim]({path})[/dim]")
+    console.print(f"[dim]Run `vibe-trading connector check {profile.id}` to verify it.[/dim]")
+    return EXIT_SUCCESS
+
+
+def cmd_connector_check(
+    profile_id: Optional[str] = None,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+) -> int:
+    """Check selected or explicit trading connector profile."""
+    from src.trading.service import check_connection
+
+    try:
+        profile = _selected_profile_or(profile_id)
+        report = check_connection(profile.id, host=host, port=port, client_id=client_id, account=account)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Connector check failed:[/red] {exc}")
+        return EXIT_RUN_FAILED
+
+    title = f"Trading Connector: {profile.id}"
+    if profile.transport == "local_tws":
+        table = Table(title=title, box=box.SIMPLE_HEAVY, show_lines=False)
+        table.add_column("Endpoint")
+        table.add_column("Profile")
+        table.add_column("Address")
+        table.add_column("State")
+        for row in report.get("ports", []):
+            open_state = "[green]open[/green]" if row.get("open") else "[dim]closed[/dim]"
+            table.add_row(
+                str(row.get("label")),
+                str(row.get("profile")),
+                f"{row.get('host')}:{row.get('port')}",
+                open_state,
+            )
+        console.print(table)
+        target = report.get("target", {})
+        target_state = "open" if target.get("open") else "closed"
+        console.print(f"Target: [bold]{target.get('host')}:{target.get('port')}[/bold] ({target_state})")
+        sdk = report.get("sdk", {})
+        if not sdk.get("installed"):
+            console.print("[yellow]Missing optional dependency:[/yellow] pip install 'ib_async>=2.0'")
+        if report.get("account"):
+            accounts = ", ".join(report["account"].get("accounts", [])) or "(none)"
+            console.print(f"Accounts: [cyan]{rich_escape(accounts)}[/cyan]")
+    else:
+        table = Table(title=title, box=box.SIMPLE_HEAVY, show_lines=False)
+        table.add_column("Field", style="cyan")
+        table.add_column("Value")
+        table.add_row("Connector", profile.connector)
+        table.add_row("Environment", profile.environment)
+        table.add_row("Transport", profile.transport)
+        table.add_row("Configured", "yes" if report.get("configured") else "[red]no[/red]")
+        table.add_row("OAuth token", "present" if report.get("oauth_token_present") else "[yellow]missing[/yellow]")
+        table.add_row("Capabilities", ", ".join(report.get("capabilities", [])))
+        console.print(table)
+
+    if report.get("status") not in {"ok"}:
+        console.print(f"[red]{rich_escape(str(report.get('error') or report.get('status') or 'not ready'))}[/red]")
+        return EXIT_RUN_FAILED
+    console.print("[green]Connector profile is ready.[/green]")
+    return EXIT_SUCCESS
+
+
+def _print_connector_account(result: dict[str, Any]) -> int:
+    accounts = ", ".join(result.get("accounts", [])) or "(none)"
+    console.print(f"Accounts: [cyan]{rich_escape(accounts)}[/cyan]")
+    rows = result.get("summary", [])
+    if not rows:
+        console.print("[dim]No account summary returned.[/dim]")
+        return EXIT_SUCCESS
+    table = Table(title=f"Account Summary · {result.get('profile_id')}", box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Account")
+    table.add_column("Tag")
+    table.add_column("Value", justify="right")
+    table.add_column("Currency")
+    for row in rows:
+        table.add_row(
+            str(row.get("account") or ""),
+            str(row.get("tag") or ""),
+            str(row.get("value") or ""),
+            str(row.get("currency") or ""),
+        )
+    console.print(table)
+    return EXIT_SUCCESS
+
+
+def cmd_connector_account(
+    profile_id: Optional[str] = None,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+) -> int:
+    """Print account summary from a connector profile."""
+    from src.trading.service import get_account
+
+    try:
+        result = get_account(_profile_id(profile_id), host=host, port=port, client_id=client_id, account=account)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Connector account failed:[/red] {exc}")
+        return EXIT_RUN_FAILED
+    if result.get("status") == "error":
+        console.print(f"[red]{rich_escape(str(result.get('error')))}[/red]")
+        return EXIT_RUN_FAILED
+    return _print_connector_account(result)
+
+
+def cmd_connector_positions(
+    profile_id: Optional[str] = None,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+) -> int:
+    """Print positions from a connector profile."""
+    from src.trading.service import get_positions
+
+    try:
+        result = get_positions(_profile_id(profile_id), host=host, port=port, client_id=client_id, account=account)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Connector positions failed:[/red] {exc}")
+        return EXIT_RUN_FAILED
+    if result.get("status") == "error":
+        console.print(f"[red]{rich_escape(str(result.get('error')))}[/red]")
+        return EXIT_RUN_FAILED
+    rows = result.get("positions", [])
+    if not rows:
+        console.print("[dim]No positions returned.[/dim]")
+        return EXIT_SUCCESS
+    table = Table(title=f"Positions · {result.get('profile_id')}", box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Account")
+    table.add_column("Symbol")
+    table.add_column("Type")
+    table.add_column("Qty", justify="right")
+    table.add_column("Avg Cost", justify="right")
+    table.add_column("Currency")
+    for row in rows:
+        table.add_row(
+            str(row.get("account") or ""),
+            str(row.get("local_symbol") or row.get("symbol") or ""),
+            str(row.get("sec_type") or ""),
+            str(row.get("position") or ""),
+            str(row.get("avg_cost") or ""),
+            str(row.get("currency") or ""),
+        )
+    console.print(table)
+    return EXIT_SUCCESS
+
+
+def cmd_connector_orders(
+    profile_id: Optional[str] = None,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+    include_executions: bool = False,
+) -> int:
+    """Print open orders from a connector profile."""
+    from src.trading.service import get_open_orders
+
+    try:
+        result = get_open_orders(
+            _profile_id(profile_id),
+            host=host,
+            port=port,
+            client_id=client_id,
+            account=account,
+            include_executions=include_executions,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Connector orders failed:[/red] {exc}")
+        return EXIT_RUN_FAILED
+    if result.get("status") == "error":
+        console.print(f"[red]{rich_escape(str(result.get('error')))}[/red]")
+        return EXIT_RUN_FAILED
+    orders = result.get("open_orders", [])
+    if not orders:
+        console.print("[dim]No open orders returned.[/dim]")
+        return EXIT_SUCCESS
+    table = Table(title=f"Open Orders · {result.get('profile_id')}", box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Account")
+    table.add_column("Symbol")
+    table.add_column("Action")
+    table.add_column("Type")
+    table.add_column("Qty", justify="right")
+    table.add_column("Limit", justify="right")
+    table.add_column("Status")
+    for row in orders:
+        contract = row.get("contract") or {}
+        order = row.get("order") or row
+        order_status = row.get("status") or {}
+        table.add_row(
+            str(order.get("account") or ""),
+            str(contract.get("local_symbol") or contract.get("symbol") or ""),
+            str(order.get("action") or ""),
+            str(order.get("order_type") or ""),
+            str(order.get("total_quantity") or ""),
+            str(order.get("limit_price") or ""),
+            str(order_status.get("status") or ""),
+        )
+    console.print(table)
+    return EXIT_SUCCESS
+
+
+def cmd_connector_quote(
+    symbol: str,
+    profile_id: Optional[str] = None,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+    exchange: str = "SMART",
+    currency: str = "USD",
+    sec_type: str = "STK",
+) -> int:
+    """Print a quote from a connector profile."""
+    from src.trading.service import get_quote
+
+    try:
+        result = get_quote(
+            symbol,
+            _profile_id(profile_id),
+            host=host,
+            port=port,
+            client_id=client_id,
+            account=account,
+            exchange=exchange,
+            currency=currency,
+            sec_type=sec_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Connector quote failed:[/red] {exc}")
+        return EXIT_RUN_FAILED
+    if result.get("status") == "error":
+        console.print(f"[red]{rich_escape(str(result.get('error')))}[/red]")
+        return EXIT_RUN_FAILED
+    quote = result.get("quote", {})
+    table = Table(title=f"Quote {result.get('symbol', symbol)} · {result.get('profile_id')}", box=box.SIMPLE_HEAVY)
+    table.add_column("Bid", justify="right")
+    table.add_column("Ask", justify="right")
+    table.add_column("Last", justify="right")
+    table.add_column("Close", justify="right")
+    table.add_column("Volume", justify="right")
+    table.add_row(
+        str(quote.get("bid") or ""),
+        str(quote.get("ask") or ""),
+        str(quote.get("last") or ""),
+        str(quote.get("close") or ""),
+        str(quote.get("volume") or ""),
+    )
+    console.print(table)
+    return EXIT_SUCCESS
+
+
+def cmd_connector_history(
+    symbol: str,
+    profile_id: Optional[str] = None,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+    exchange: str = "SMART",
+    currency: str = "USD",
+    sec_type: str = "STK",
+    duration: str = "30 D",
+    bar_size: str = "1 day",
+    what_to_show: str = "TRADES",
+    use_rth: bool = True,
+) -> int:
+    """Print historical bars from a connector profile."""
+    from src.trading.service import get_history
+
+    try:
+        result = get_history(
+            symbol,
+            _profile_id(profile_id),
+            host=host,
+            port=port,
+            client_id=client_id,
+            account=account,
+            exchange=exchange,
+            currency=currency,
+            sec_type=sec_type,
+            duration=duration,
+            bar_size=bar_size,
+            what_to_show=what_to_show,
+            use_rth=use_rth,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Connector history failed:[/red] {exc}")
+        return EXIT_RUN_FAILED
+    if result.get("status") == "error":
+        console.print(f"[red]{rich_escape(str(result.get('error')))}[/red]")
+        return EXIT_RUN_FAILED
+    rows = result.get("bars", [])
+    if not rows:
+        console.print("[dim]No historical bars returned.[/dim]")
+        return EXIT_SUCCESS
+    table = Table(title=f"History {result.get('symbol', symbol)} · {result.get('profile_id')}", box=box.SIMPLE_HEAVY)
+    table.add_column("Date")
+    table.add_column("Open", justify="right")
+    table.add_column("High", justify="right")
+    table.add_column("Low", justify="right")
+    table.add_column("Close", justify="right")
+    table.add_column("Volume", justify="right")
+    for row in rows[-20:]:
+        table.add_row(
+            str(row.get("date") or ""),
+            str(row.get("open") or ""),
+            str(row.get("high") or ""),
+            str(row.get("low") or ""),
+            str(row.get("close") or ""),
+            str(row.get("volume") or ""),
+        )
+    console.print(table)
+    return EXIT_SUCCESS
+
+
+def _live_profile_connector(
+    profile_id: Optional[str],
+    *,
+    require_runner: bool = False,
+) -> tuple[int, Optional[str]]:
+    """Resolve a profile to a live-capable connector key."""
+    try:
+        profile = _selected_profile_or(profile_id)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return EXIT_USAGE_ERROR, None
+    if profile.environment != "live" or profile.transport != "remote_mcp":
+        console.print(f"[red]{profile.id} is not a live remote MCP connector profile.[/red]")
+        return EXIT_USAGE_ERROR, None
+    if require_runner:
+        from src.trading.service import profile_supports_live_runner
+
+        if not profile_supports_live_runner(profile):
+            console.print(f"[red]{profile.id} does not support live runner management.[/red]")
+            return EXIT_USAGE_ERROR, None
+    return EXIT_SUCCESS, profile.connector
+
+
+def cmd_connector_authorize(profile_id: Optional[str]) -> int:
+    """Authorize a remote MCP connector profile."""
+    code, broker = _live_profile_connector(profile_id)
+    if code != EXIT_SUCCESS or broker is None:
+        return code
+    return cmd_live_authorize(broker)
+
+
+def cmd_connector_status(profile_id: Optional[str]) -> int:
+    """Show connector status."""
+    try:
+        profile = _selected_profile_or(profile_id)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return EXIT_USAGE_ERROR
+    if profile.environment == "live" and profile.transport == "remote_mcp":
+        check_code = cmd_connector_check(profile.id)
+        if check_code != EXIT_SUCCESS:
+            return check_code
+        return cmd_live_status(profile.connector)
+    return cmd_connector_check(profile.id)
+
+
+def cmd_connector_start(profile_id: Optional[str]) -> int:
+    """Start a live remote MCP connector runner."""
+    code, broker = _live_profile_connector(profile_id, require_runner=True)
+    if code != EXIT_SUCCESS or broker is None:
+        return code
+    return cmd_live_start(broker)
+
+
+def cmd_connector_stop(profile_id: Optional[str]) -> int:
+    """Stop a live remote MCP connector runner."""
+    code, broker = _live_profile_connector(profile_id, require_runner=True)
+    if code != EXIT_SUCCESS or broker is None:
+        return code
+    return cmd_live_stop(broker)
+
+
+def cmd_connector_halt(profile_id: Optional[str]) -> int:
+    """Trip the halt switch for a live remote MCP connector profile."""
+    code, broker = _live_profile_connector(profile_id, require_runner=True)
+    if code != EXIT_SUCCESS or broker is None:
+        return code
+    return cmd_live_halt(broker)
+
+
+def cmd_connector_resume(profile_id: Optional[str]) -> int:
+    """Clear the halt switch for a live remote MCP connector profile."""
+    code, broker = _live_profile_connector(profile_id, require_runner=True)
+    if code != EXIT_SUCCESS or broker is None:
+        return code
+    return cmd_live_resume(broker)
+
+
+def cmd_connector_revoke(profile_id: Optional[str]) -> int:
+    """Revoke a live remote MCP connector profile."""
+    code, broker = _live_profile_connector(profile_id)
+    if code != EXIT_SUCCESS or broker is None:
+        return code
+    return cmd_live_revoke(broker)
+
+
+def _dispatch_connector(args: argparse.Namespace) -> int:
+    """Route parsed ``connector`` subcommands."""
+    sub = getattr(args, "connector_command", None)
+    if sub == "list":
+        return cmd_connector_list()
+    if sub == "use":
+        return cmd_connector_use(args.profile)
+    if sub == "configure":
+        return cmd_connector_configure(
+            args.profile,
+            host=args.host,
+            port=args.port,
+            client_id=args.client_id,
+            account=args.account,
+            yes=args.yes,
+        )
+    if sub == "check":
+        return cmd_connector_check(
+            args.profile,
+            host=args.host,
+            port=args.port,
+            client_id=args.client_id,
+            account=args.account,
+        )
+    if sub == "account":
+        return cmd_connector_account(
+            args.profile,
+            host=args.host,
+            port=args.port,
+            client_id=args.client_id,
+            account=args.account,
+        )
+    if sub == "positions":
+        return cmd_connector_positions(
+            args.profile,
+            host=args.host,
+            port=args.port,
+            client_id=args.client_id,
+            account=args.account,
+        )
+    if sub == "orders":
+        return cmd_connector_orders(
+            args.profile,
+            host=args.host,
+            port=args.port,
+            client_id=args.client_id,
+            account=args.account,
+            include_executions=args.include_executions,
+        )
+    if sub == "quote":
+        return cmd_connector_quote(
+            args.symbol,
+            args.profile,
+            host=args.host,
+            port=args.port,
+            client_id=args.client_id,
+            account=args.account,
+            exchange=args.exchange,
+            currency=args.currency,
+            sec_type=args.sec_type,
+        )
+    if sub == "history":
+        return cmd_connector_history(
+            args.symbol,
+            args.profile,
+            host=args.host,
+            port=args.port,
+            client_id=args.client_id,
+            account=args.account,
+            exchange=args.exchange,
+            currency=args.currency,
+            sec_type=args.sec_type,
+            duration=args.duration,
+            bar_size=args.bar_size,
+            what_to_show=args.what_to_show,
+            use_rth=not args.no_rth,
+        )
+    if sub == "authorize":
+        return cmd_connector_authorize(args.profile)
+    if sub == "status":
+        return cmd_connector_status(args.profile)
+    if sub == "start":
+        return cmd_connector_start(args.profile)
+    if sub == "stop":
+        return cmd_connector_stop(args.profile)
+    if sub == "halt":
+        return cmd_connector_halt(args.profile)
+    if sub == "resume":
+        return cmd_connector_resume(args.profile)
+    if sub == "revoke":
+        return cmd_connector_revoke(args.profile)
+    console.print("[red]connector requires a subcommand.[/red] Try: vibe-trading connector list")
     return EXIT_USAGE_ERROR
 
 
@@ -3381,69 +3958,87 @@ def _build_parser() -> argparse.ArgumentParser:
     memory_forget_parser.add_argument("name", help="Memory title or filename stem")
     memory_forget_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
 
-    # Live trading channel (SPEC.md §9 Decision 1). Every verb is a privileged
-    # user-side action; there is intentionally NO `live commit` verb.
-    live_parser = subparsers.add_parser("live", help="Manage the live trading channel")
-    live_subparsers = live_parser.add_subparsers(dest="live_command")
+    connector_parser = subparsers.add_parser("connector", help="Manage trading connector profiles")
+    connector_subparsers = connector_parser.add_subparsers(dest="connector_command")
 
-    live_authorize = live_subparsers.add_parser(
-        "authorize", help="Desktop OAuth bootstrap — opens browser, turns the channel on"
-    )
-    live_authorize.add_argument("live_broker", metavar="broker", help="Broker key, e.g. robinhood")
+    connector_subparsers.add_parser("list", help="List selectable connector profiles")
 
-    live_run = live_subparsers.add_parser(
-        "run", help="Run the persistent runner in the foreground (Ctrl+C to stop)"
-    )
-    live_run.add_argument(
-        "live_broker", metavar="broker", nargs="?", default=None, help="Broker key (default: robinhood)"
-    )
+    connector_use = connector_subparsers.add_parser("use", help="Select the default connector profile")
+    connector_use.add_argument("profile", help="Profile id, e.g. ibkr-paper-local")
 
-    live_start = live_subparsers.add_parser(
-        "start", help="Start the persistent runner in the background"
-    )
-    live_start.add_argument(
-        "live_broker", metavar="broker", nargs="?", default=None, help="Broker key (default: robinhood)"
-    )
+    def _add_connector_profile_arg(p: argparse.ArgumentParser, *, required: bool = False) -> None:
+        if required:
+            p.add_argument("profile", help="Connector profile id")
+        else:
+            p.add_argument("profile", nargs="?", default=None, help="Connector profile id (default: selected)")
 
-    live_stop = live_subparsers.add_parser(
-        "stop", help="Stop the persistent runner"
-    )
-    live_stop.add_argument(
-        "live_broker", metavar="broker", nargs="?", default=None, help="Broker key (default: robinhood)"
-    )
+    def _add_connector_local(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--host", default=None)
+        p.add_argument("--port", type=int, default=None)
+        p.add_argument("--client-id", dest="client_id", type=int, default=None)
+        p.add_argument("--account", default=None, help="Optional account code")
 
-    live_status = live_subparsers.add_parser(
-        "status", help="Show auth state, active mandate, and halt state (read-only)"
-    )
-    live_status.add_argument(
-        "live_broker", metavar="broker", nargs="?", default=None, help="Broker key (default: robinhood)"
-    )
+    def _add_connector_contract(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--exchange", default="SMART")
+        p.add_argument("--currency", default="USD")
+        p.add_argument("--sec-type", dest="sec_type", default="STK")
 
-    live_mandate = live_subparsers.add_parser(
-        "mandate", help="Print the committed mandate (read-only)"
-    )
-    live_mandate.add_argument(
-        "live_broker", metavar="broker", nargs="?", default=None, help="Broker key (default: robinhood)"
-    )
+    connector_configure = connector_subparsers.add_parser("configure", help="Configure a local connector profile")
+    _add_connector_profile_arg(connector_configure, required=True)
+    connector_configure.add_argument("--host", default="127.0.0.1")
+    connector_configure.add_argument("--port", type=int, default=None)
+    connector_configure.add_argument("--client-id", dest="client_id", type=int, default=77)
+    connector_configure.add_argument("--account", default=None)
+    connector_configure.add_argument("-y", "--yes", action="store_true", help="Overwrite without prompting")
 
-    live_halt = live_subparsers.add_parser(
-        "halt", help="Trip the kill switch (writes the HALT sentinel)"
-    )
-    live_halt.add_argument(
-        "live_broker", metavar="broker", nargs="?", default=None, help="Broker key (default: global)"
-    )
+    connector_check = connector_subparsers.add_parser("check", help="Check selected connector readiness")
+    _add_connector_profile_arg(connector_check)
+    _add_connector_local(connector_check)
 
-    live_resume = live_subparsers.add_parser(
-        "resume", help="Clear the halt (explicit privileged re-enable)"
-    )
-    live_resume.add_argument(
-        "live_broker", metavar="broker", nargs="?", default=None, help="Broker key (default: global)"
-    )
+    connector_status = connector_subparsers.add_parser("status", help="Show selected connector status")
+    _add_connector_profile_arg(connector_status)
 
-    live_revoke = live_subparsers.add_parser(
-        "revoke", help="Revoke OAuth token + delete mandate (full off)"
-    )
-    live_revoke.add_argument("live_broker", metavar="broker", help="Broker key, e.g. robinhood")
+    connector_authorize = connector_subparsers.add_parser("authorize", help="Authorize a remote MCP connector profile")
+    _add_connector_profile_arg(connector_authorize)
+
+    connector_account = connector_subparsers.add_parser("account", help="Read account summary")
+    _add_connector_profile_arg(connector_account)
+    _add_connector_local(connector_account)
+
+    connector_positions = connector_subparsers.add_parser("positions", help="Read current positions")
+    _add_connector_profile_arg(connector_positions)
+    _add_connector_local(connector_positions)
+
+    connector_orders = connector_subparsers.add_parser("orders", help="Read open orders")
+    _add_connector_profile_arg(connector_orders)
+    _add_connector_local(connector_orders)
+    connector_orders.add_argument("--include-executions", action="store_true")
+
+    connector_quote = connector_subparsers.add_parser("quote", help="Read a quote snapshot")
+    connector_quote.add_argument("symbol")
+    _add_connector_profile_arg(connector_quote)
+    _add_connector_local(connector_quote)
+    _add_connector_contract(connector_quote)
+
+    connector_history = connector_subparsers.add_parser("history", help="Read historical bars")
+    connector_history.add_argument("symbol")
+    _add_connector_profile_arg(connector_history)
+    _add_connector_local(connector_history)
+    _add_connector_contract(connector_history)
+    connector_history.add_argument("--duration", default="30 D")
+    connector_history.add_argument("--bar-size", dest="bar_size", default="1 day")
+    connector_history.add_argument("--what-to-show", dest="what_to_show", default="TRADES")
+    connector_history.add_argument("--no-rth", action="store_true", help="Include outside-regular-hours data when available")
+
+    for name, help_text in (
+        ("start", "Start the selected live connector runner"),
+        ("stop", "Stop the selected live connector runner"),
+        ("halt", "Trip the selected live connector kill switch"),
+        ("resume", "Clear the selected live connector kill switch"),
+        ("revoke", "Revoke the selected live connector OAuth token and mandate"),
+    ):
+        p = connector_subparsers.add_parser(name, help=help_text)
+        _add_connector_profile_arg(p)
 
     # Alpha Zoo subcommands (registered via cli_handlers.add_subparser)
     from src.factors.cli_handlers import add_subparser as _add_alpha_subparser
@@ -3948,8 +4543,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "hypothesis":
         from src.hypotheses.cli_handlers import dispatch as _hyp_dispatch
         return _coerce_exit_code(_hyp_dispatch(args))
-    if args.command == "live":
-        return _coerce_exit_code(_dispatch_live(args))
+    if args.command == "connector":
+        return _coerce_exit_code(_dispatch_connector(args))
     if args.command == "memory":
         if args.memory_command == "list":
             return _coerce_exit_code(cmd_memory_list(args.memory_type))

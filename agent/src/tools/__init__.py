@@ -193,15 +193,28 @@ def build_registry(
                     if not should_register_live_channel(
                         interactive=interactive, url=server_url, cache_dir=cache_dir
                     ):
+                        profile_hint = (
+                            "ibkr-live-official-mcp-readonly"
+                            if server_name.strip().lower() == "ibkr"
+                            else f"{server_name}-live-mcp"
+                        )
                         skip_msg = (
-                            f"Robinhood live channel configured but not authorized — "
-                            f"run `vibe-trading live authorize {server_name}` on a "
-                            f"desktop session"
+                            f"{server_name} live connector configured but not authorized — "
+                            f"run `vibe-trading connector authorize {profile_hint}` "
+                            f"on a desktop session"
                         )
                         logger.warning(skip_msg)
                         if warn_callback is not None:
                             warn_callback(skip_msg)
                         continue
+                    info_msg = (
+                        f"{server_name} live connector is available through trading_* tools; "
+                        "broker-specific MCP wrappers are hidden from the agent registry"
+                    )
+                    logger.info(info_msg)
+                    if warn_callback is not None:
+                        warn_callback(info_msg)
+                    continue
 
                 wrappers = build_mcp_tool_wrappers(
                     server_name,

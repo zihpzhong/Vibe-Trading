@@ -21,12 +21,11 @@ import ast
 import re
 from pathlib import Path
 
-import pytest
-
 import src.live.mandate.store as store
 
 AGENT_DIR = Path(__file__).resolve().parent.parent
 LIVE_DIR = AGENT_DIR / "src" / "live"
+TRADING_DIR = AGENT_DIR / "src" / "trading"
 
 _FORBIDDEN_NAME = re.compile(
     r"^(_)?(set|write|update|grant|authorize|enable|widen)_(mandate|limit|live|authorization)([_a-z]*)?$"
@@ -71,7 +70,7 @@ def test_agent_reachable_modules_never_open_mandate_for_write() -> None:
         LIVE_DIR / "order_guard.py",
         LIVE_DIR / "enforcement.py",
         LIVE_DIR / "extractors" / "__init__.py",
-        LIVE_DIR / "extractors" / "robinhood.py",
+        TRADING_DIR / "connectors" / "robinhood" / "extractor.py",
         LIVE_DIR / "mandate" / "store.py",
     ]
     write_modes = {"w", "wb", "a", "ab", "w+", "r+", "x"}

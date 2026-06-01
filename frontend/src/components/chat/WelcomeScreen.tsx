@@ -1,4 +1,4 @@
-﻿import { Bot, TrendingUp, Globe, Sparkles, Users, UserCircle2, NotebookPen } from "lucide-react";
+﻿import { Bot, TrendingUp, Globe, Sparkles, Users, UserCircle2, NotebookPen, Landmark } from "lucide-react";
 
 interface Example {
   title: string;
@@ -105,6 +105,28 @@ const CATEGORIES: Category[] = [
     ],
   },
   {
+    label: "Trading Connectors",
+    icon: <Landmark className="h-4 w-4" />,
+    color: "text-cyan-400 border-cyan-500/30 hover:border-cyan-500/60 hover:bg-cyan-500/5",
+    examples: [
+      {
+        title: "Check Selected Connector",
+        desc: "List connector profiles and verify the selected one",
+        prompt: "List my trading connector profiles, show which one is selected, then check that selected connector. If it is not ready, tell me exactly what setup step is missing. Do not place or modify orders.",
+      },
+      {
+        title: "Analyze Connector Portfolio",
+        desc: "Read account summary and positions from the selected connector",
+        prompt: "Use the selected trading connector profile to summarize my account, positions, concentration, cash, and portfolio risk. Do not place or modify orders.",
+      },
+      {
+        title: "Quote & Trend",
+        desc: "Fetch a quote plus recent daily bars through the selected connector",
+        prompt: "Use the selected trading connector to fetch an AAPL quote and 30 daily bars, then summarize the current quote versus the recent trend. Keep it read-only.",
+      },
+    ],
+  },
+  {
     label: "Shadow Account",
     icon: <UserCircle2 className="h-4 w-4" />,
     color: "text-emerald-400 border-emerald-500/30 hover:border-emerald-500/60 hover:bg-emerald-500/5",
@@ -129,10 +151,11 @@ const CATEGORIES: Category[] = [
 ];
 
 const CAPABILITY_CHIPS = [
-  "70 Finance Skills",
+  "77 Finance Skills",
   "29 Swarm Presets",
-  "32 Agent Tools",
+  "44 Agent Tools",
   "3 Markets: A-Share · Crypto · HK/US",
+  "Trading Connector Profiles",
   "Minute to Daily Timeframes",
   "4 Portfolio Optimizers",
   "15+ Risk Metrics",
@@ -213,5 +236,3 @@ export function WelcomeScreen({ onExample }: Props) {
     </div>
   );
 }
-
-

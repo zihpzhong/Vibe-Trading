@@ -23,13 +23,13 @@ import src.live.enforcement as enforcement
 import src.live.order_guard as order_guard
 import src.live.paths as paths
 from src.live.classification import ToolClass
-from src.live.extractors.robinhood import extract_order_intent
+from src.trading.connectors.robinhood.extractor import extract_order_intent
 from src.live.mandate.model import (
     MANDATE_SCHEMA_VERSION,
     AssetClass,
     InstrumentType,
 )
-from src.live.robinhood_classification import ROBINHOOD_TOOL_CLASS
+from src.trading.connectors.robinhood.classification import ROBINHOOD_TOOL_CLASS
 from src.tools.mcp import MCPRemoteToolSpec
 
 

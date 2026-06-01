@@ -418,6 +418,8 @@ class MCPServerAdapter:
                     token_storage=_build_token_store(oauth_config.cache_dir),
                     callback_port=oauth_config.callback_port,
                     client_id=oauth_config.client_id,
+                    client_secret=oauth_config.client_secret,
+                    client_metadata_url=oauth_config.client_metadata_url,
                 )
             transport = StreamableHttpTransport(
                 url=self.server_config.url,

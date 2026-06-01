@@ -14,22 +14,26 @@ from __future__ import annotations
 
 import logging
 
-from src.config.schema import LIVE_BROKER_SERVER_KEYS, is_live_broker_url
+from src.config.schema import (
+    LIVE_BROKER_SERVER_KEYS,
+    is_live_broker_url,
+    live_broker_key_for_url,
+)
 from src.live.classification import ToolClass, classify_tool
 from src.live.halt import halt_flag_set
 from src.live.order_guard import LiveOrderGuardTool
-from src.live.robinhood_classification import ROBINHOOD_TOOL_CLASS
 from src.tools.mcp import MCPRemoteTool
+from src.trading.connectors.ibkr.classification import IBKR_TOOL_CLASS
+from src.trading.connectors.robinhood.classification import ROBINHOOD_TOOL_CLASS
 
 logger = logging.getLogger(__name__)
 
 #: Per-broker curated classification maps (Tier 2). Keyed by broker name; an
 #: aliased server key resolves to its broker via :func:`_broker_for`.
-_BROKER_CURATED_MAPS = {"robinhood": ROBINHOOD_TOOL_CLASS}
-
-#: URL host suffix -> broker name, so a live-broker URL under an arbitrary key
-#: still resolves to the right curated map / mandate / halt namespace.
-_HOST_SUFFIX_TO_BROKER = {"robinhood.com": "robinhood"}
+_BROKER_CURATED_MAPS = {
+    "robinhood": ROBINHOOD_TOOL_CLASS,
+    "ibkr": IBKR_TOOL_CLASS,
+}
 
 
 def is_live_broker(server_name: str, url: str = "") -> bool:
@@ -71,13 +75,8 @@ def _broker_for(server_name: str, url: str = "") -> str:
     key = server_name.strip().lower()
     if key in LIVE_BROKER_SERVER_KEYS:
         return key
-    from src.config.schema import _url_host
 
-    host = _url_host(url)
-    for suffix, broker in _HOST_SUFFIX_TO_BROKER.items():
-        if host == suffix or host.endswith(f".{suffix}"):
-            return broker
-    return key
+    return live_broker_key_for_url(url) or key
 
 
 #: FastMCP's OAuth token cache collection name (``TokenStorageAdapter``).

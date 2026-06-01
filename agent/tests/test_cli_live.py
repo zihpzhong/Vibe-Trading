@@ -1,11 +1,11 @@
-"""Tests for the `vibe-trading live` CLI surface + REPL intercepts (P6).
+"""Tests for the connector-first live CLI surface + REPL intercepts (P6).
 
 Covers SPEC.md §9 Decision 1 (CLI surface table) and Consent §2/§4:
 
-* The ``live`` subcommand group dispatches each verb to the right handler.
-* ``live halt`` / ``live resume`` trip and clear the kill switch on disk.
-* ``live status`` / ``live mandate`` are read-only and reflect disk state.
-* ``live revoke`` deletes the token cache + mandate.
+* The ``connector`` subcommand group dispatches each verb to the right handler.
+* Connector live commands trip/clear the kill switch on disk.
+* Live status/mandate helpers are read-only and reflect disk state.
+* Connector revoke deletes the token cache + mandate.
 * The REPL intercepts a bare numeric pick as a COMMIT — it calls the commit
   endpoint directly and NEVER routes the pick to the agent/model.
 * The REPL intercepts a bare "停"/"stop"/"/halt" turn — it trips the kill
@@ -91,60 +91,55 @@ def _write_mandate(root: Path, broker: str = "robinhood", *, schema_version: int
 # ---------------------------------------------------------------------------
 
 
-class TestLiveDispatch:
+class TestConnectorLiveDispatch:
     def _dispatch(self, argv: list[str]) -> int:
-        from cli._legacy import _build_parser, _dispatch_live
+        from cli._legacy import _build_parser, _dispatch_connector
 
         args = _build_parser().parse_args(argv)
-        return _dispatch_live(args)
+        return _dispatch_connector(args)
 
     def test_authorize_routes_to_handler(self) -> None:
-        with patch("cli._legacy.cmd_live_authorize", return_value=0) as m:
-            assert self._dispatch(["live", "authorize", "robinhood"]) == 0
-        m.assert_called_once_with("robinhood")
+        with patch("cli._legacy.cmd_connector_authorize", return_value=0) as m:
+            assert self._dispatch(["connector", "authorize", "robinhood-live-mcp"]) == 0
+        m.assert_called_once_with("robinhood-live-mcp")
 
     def test_status_routes_with_broker(self) -> None:
-        with patch("cli._legacy.cmd_live_status", return_value=0) as m:
-            self._dispatch(["live", "status", "robinhood"])
-        m.assert_called_once_with("robinhood")
+        with patch("cli._legacy.cmd_connector_status", return_value=0) as m:
+            self._dispatch(["connector", "status", "robinhood-live-mcp"])
+        m.assert_called_once_with("robinhood-live-mcp")
 
-    def test_status_routes_default_broker_none(self) -> None:
-        with patch("cli._legacy.cmd_live_status", return_value=0) as m:
-            self._dispatch(["live", "status"])
-        m.assert_called_once_with(None)
-
-    def test_mandate_routes(self) -> None:
-        with patch("cli._legacy.cmd_live_mandate", return_value=0) as m:
-            self._dispatch(["live", "mandate"])
+    def test_status_routes_default_profile_none(self) -> None:
+        with patch("cli._legacy.cmd_connector_status", return_value=0) as m:
+            self._dispatch(["connector", "status"])
         m.assert_called_once_with(None)
 
     def test_halt_routes(self) -> None:
-        with patch("cli._legacy.cmd_live_halt", return_value=0) as m:
-            self._dispatch(["live", "halt"])
+        with patch("cli._legacy.cmd_connector_halt", return_value=0) as m:
+            self._dispatch(["connector", "halt"])
         m.assert_called_once_with(None)
 
     def test_resume_routes(self) -> None:
-        with patch("cli._legacy.cmd_live_resume", return_value=0) as m:
-            self._dispatch(["live", "resume", "robinhood"])
-        m.assert_called_once_with("robinhood")
+        with patch("cli._legacy.cmd_connector_resume", return_value=0) as m:
+            self._dispatch(["connector", "resume", "robinhood-live-mcp"])
+        m.assert_called_once_with("robinhood-live-mcp")
 
     def test_revoke_routes(self) -> None:
-        with patch("cli._legacy.cmd_live_revoke", return_value=0) as m:
-            self._dispatch(["live", "revoke", "robinhood"])
-        m.assert_called_once_with("robinhood")
+        with patch("cli._legacy.cmd_connector_revoke", return_value=0) as m:
+            self._dispatch(["connector", "revoke", "robinhood-live-mcp"])
+        m.assert_called_once_with("robinhood-live-mcp")
 
     def test_no_subcommand_is_usage_error(self) -> None:
         from cli._legacy import EXIT_USAGE_ERROR
 
-        assert self._dispatch(["live"]) == EXIT_USAGE_ERROR
+        assert self._dispatch(["connector"]) == EXIT_USAGE_ERROR
 
-    def test_no_live_commit_verb_exists(self) -> None:
-        """SPEC: the CLI live group must not be able to create/widen a mandate."""
+    def test_no_connector_commit_verb_exists(self) -> None:
+        """SPEC: the CLI connector group must not be able to create/widen a mandate."""
         from cli._legacy import _build_parser
 
         parser = _build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["live", "commit", "robinhood"])
+            parser.parse_args(["connector", "commit", "robinhood-live-mcp"])
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +177,58 @@ class TestLiveHaltResume:
         from cli._legacy import cmd_live_resume
 
         assert cmd_live_resume(None) == 0
+
+
+class TestConnectorHaltResume:
+    def test_halt_without_profile_rejects_default_paper_profile(
+        self, live_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli._legacy import EXIT_USAGE_ERROR, cmd_connector_halt
+        from src.trading import profiles
+
+        monkeypatch.setattr(profiles, "get_runtime_root", lambda: live_root)
+
+        assert cmd_connector_halt(None) == EXIT_USAGE_ERROR
+        assert not (live_root / "live" / "HALT").exists()
+
+    def test_halt_without_profile_uses_selected_connector(
+        self, live_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from cli._legacy import cmd_connector_halt
+        from src.live.halt import halt_flag_set
+        from src.trading import profiles
+
+        monkeypatch.setattr(profiles, "get_runtime_root", lambda: live_root)
+        profiles.save_selected_profile_id("robinhood-live-mcp")
+
+        assert cmd_connector_halt(None) == 0
+        assert (live_root / "live" / "robinhood" / "HALT").exists()
+        assert not (live_root / "live" / "HALT").exists()
+        assert halt_flag_set("robinhood") is True
+
+        out = capsys.readouterr().out
+        assert "vibe-trading connector resume" in out
+        assert "vibe-trading live" not in out
+
+    def test_resume_without_profile_uses_selected_connector(
+        self, live_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli._legacy import cmd_connector_halt, cmd_connector_resume
+        from src.live.halt import halt_flag_set
+        from src.trading import profiles
+
+        monkeypatch.setattr(profiles, "get_runtime_root", lambda: live_root)
+        profiles.save_selected_profile_id("robinhood-live-mcp")
+
+        cmd_connector_halt(None)
+        assert cmd_connector_resume(None) == 0
+        assert halt_flag_set("robinhood") is False
+
+    def test_halt_with_explicit_non_live_profile_fails(self, live_root: Path) -> None:
+        from cli._legacy import EXIT_USAGE_ERROR, cmd_connector_halt
+
+        assert cmd_connector_halt("ibkr-paper-local") == EXIT_USAGE_ERROR
+        assert not (live_root / "live" / "HALT").exists()
 
 
 # ---------------------------------------------------------------------------

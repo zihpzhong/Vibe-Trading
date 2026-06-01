@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 import pytest
 from fastmcp.client.client import CallToolResult
@@ -39,7 +38,7 @@ from src.config.schema import (
 from src.live.mandate.model import MANDATE_SCHEMA_VERSION
 from src.live.order_guard import LiveOrderGuardTool
 from src.live.registry import is_live_broker, wrap_live_broker_tools
-from src.live.robinhood_classification import ROBINHOOD_TOOL_CLASS
+from src.trading.connectors.robinhood.classification import ROBINHOOD_TOOL_CLASS
 from src.live.classification import ToolClass
 from src.tools.mcp import MCPRemoteTool, build_mcp_tool_wrappers
 

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useMemo, useCallback, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2 } from "lucide-react";
+import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark } from "lucide-react";
 import { toast } from "sonner";
 import { useAgentStore } from "@/stores/agent";
 import { useSSE } from "@/hooks/useSSE";
@@ -41,8 +41,12 @@ const act = () => useAgentStore.getState();
 
 /** Poll cadence for the shared `GET /live/status` snapshot. */
 const LIVE_STATUS_POLL_INTERVAL_MS = 15_000;
+const CONNECTOR_CHECK_PROMPT =
+  "List my trading connector profiles, show which one is selected, then check that selected connector. If it is not ready, tell me exactly what setup step is missing. Do not place or modify orders.";
+const CONNECTOR_PORTFOLIO_PROMPT =
+  "Use the selected trading connector profile to summarize my account, positions, concentration, cash, and portfolio risk. Do not place or modify orders.";
 
-/* ---------- Live trading channel ----------
+/* ---------- Connector runtime channel ----------
  * Mandate proposals and live-action chips render as standalone timeline items,
  * never folded into the thinking timeline (SPEC Consent §2 grouping note). They
  * are driven by dedicated state rather than the chat message store because they
@@ -59,6 +63,23 @@ interface LiveActionItem {
   action: LiveAction;
 }
 type LiveItem = ProposalItem | LiveActionItem;
+
+function normalizeBrokerScope(broker: string | null | undefined): string | null {
+  const normalized = broker?.trim().toLowerCase();
+  return normalized || null;
+}
+
+function isGlobalLiveHalt(halt: LiveHalted | null): boolean {
+  return halt != null && normalizeBrokerScope(halt.broker) == null;
+}
+
+function haltScopeStillActive(halt: LiveHalted, status: LiveStatus): boolean {
+  const broker = normalizeBrokerScope(halt.broker);
+  if (!broker) return status.global_halted;
+  return status.global_halted || status.brokers.some((item) => (
+    normalizeBrokerScope(item.auth.broker) === broker && item.halted
+  ));
+}
 
 function liveActionStyle(kind: string): { icon: typeof Activity; tone: string } {
   switch (kind) {
@@ -87,7 +108,7 @@ function LiveActionChip({ action }: { action: LiveAction }) {
       <div className="flex-1 min-w-0">
         <div className={["inline-flex max-w-full flex-wrap items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs", tone].join(" ")}>
           <Icon className="h-3 w-3 shrink-0" />
-          <span className="shrink-0 font-medium uppercase tracking-wide text-[10px]">LIVE</span>
+          <span className="shrink-0 font-medium uppercase tracking-wide text-[10px]">RUNTIME</span>
           <span className="shrink-0 font-medium">{liveActionLabel(action)}</span>
           {action.intent_normalized && (
             <span className="truncate text-foreground/80">· {action.intent_normalized}</span>
@@ -183,12 +204,15 @@ export function Agent() {
   const [searchParams, setSearchParams] = useSearchParams();
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
+  const lastCompositionEndRef = useRef(0);
   const sseSessionRef = useRef<string | null>(null);
   const prevSseStatusRef = useRef<string>("disconnected");
   const genRef = useRef(0);
   const pendingGoalSessionRef = useRef<string | null>(null);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastEventRef = useRef(0);
+  const sseTimeoutMsRef = useRef(90_000);
 
   /* tool_progress coalescing — keep latest payload per-tool, flush once per rAF. */
   const pendingProgressRef = useRef<Map<string, NonNullable<ToolCallEntry["progress"]>>>(new Map());
@@ -206,7 +230,7 @@ export function Agent() {
   const [goalEditActive, setGoalEditActive] = useState(false);
   const [goalEditValue, setGoalEditValue] = useState("");
 
-  /* Live trading channel state (SPEC Consent §1/§4/§5) */
+  /* Connector runtime channel state (SPEC Consent §1/§4/§5) */
   const [liveItems, setLiveItems] = useState<LiveItem[]>([]);
   const [committedMandates, setCommittedMandates] = useState<Record<string, MandateCommitted>>({});
   const [liveHalted, setLiveHalted] = useState<LiveHalted | null>(null);
@@ -215,7 +239,7 @@ export function Agent() {
    * (commit / halt / resume / runner-affecting action) rather than waiting a tick. */
   const [liveStatusRefresh, setLiveStatusRefresh] = useState(0);
   /* Shared `GET /live/status` snapshot. Owned here (single poller) and passed down
-   * to RunnerStatus, so the global kill switch can be shown whenever live trading
+   * to RunnerStatus, so the global kill switch can be shown whenever connector runtime
    * could be active out-of-band (CLI/another session), not only off in-session SSE
    * items (audit M2: always-available global halt — SPEC Consent §4). */
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
@@ -329,20 +353,33 @@ export function Agent() {
           if (metrics && Object.keys(metrics).length > 0) {
             agentMsgs.push({ id: m.message_id, type: "run_complete", content: "", runId, metrics, timestamp: ts + 1 });
           } else {
+            // Fetch run data to check report-worthiness; show fallback card if fetch fails
+            let fetchedMetrics: Record<string, number> | undefined;
+            let fetchedCurve: Array<{ time: string; equity: number }> | undefined;
+            let showCard = false;
             try {
               const runData = await api.getRun(runId);
               if (isReportWorthyRun(runData)) {
-                agentMsgs.push({
-                  id: m.message_id,
-                  type: "run_complete",
-                  content: "",
-                  runId,
-                  metrics: runData.metrics,
-                  equityCurve: runData.equity_curve?.map((e) => ({ time: e.time, equity: e.equity })),
-                  timestamp: ts + 1,
-                });
+                fetchedMetrics = runData.metrics;
+                fetchedCurve = runData.equity_curve?.map((e) => ({ time: e.time, equity: Number(e.equity) }));
+                showCard = true;
               }
-            } catch { /* ignore non-report attempt directories */ }
+              // succeeded but not report-worthy (plain chat turn) → skip card
+            } catch {
+              // fetch failed (auth/404/network) → can't tell, show link as fallback
+              showCard = true;
+            }
+            if (showCard) {
+              agentMsgs.push({
+                id: m.message_id,
+                type: "run_complete",
+                content: "",
+                runId,
+                metrics: fetchedMetrics,
+                equityCurve: fetchedCurve,
+                timestamp: ts + 1,
+              });
+            }
           }
         } else {
           agentMsgs.push({ id: m.message_id, type: "answer", content: m.content, timestamp: ts });
@@ -463,19 +500,28 @@ export function Agent() {
 
         // Show RunCompleteCard when the turn produced backtest metrics or a shadow report
         if (runId) {
+          let runMetrics: Record<string, number> | undefined;
+          let runCurve: Array<{ time: string; equity: number }> | undefined;
+          let showCard = false;
           try {
             const runData = await api.getRun(runId);
-            const hasReport = isReportWorthyRun(runData);
-            if (hasReport || shadowId) {
-              s.addMessage({
-                id: "", type: "run_complete", content: "", runId,
-                metrics: hasReport ? runData.metrics : undefined,
-                equityCurve: runData.equity_curve?.map(e => ({ time: e.time, equity: e.equity })),
-                shadowId,
-                timestamp: Date.now(),
-              });
+            if (isReportWorthyRun(runData)) {
+              runMetrics = runData.metrics;
+              runCurve = runData.equity_curve?.map(e => ({ time: e.time, equity: Number(e.equity) }));
+              showCard = true;
             }
-          } catch { /* ignore */ }
+          } catch {
+            showCard = true; // fetch failed → show link as fallback
+          }
+          if (showCard || shadowId) {
+            s.addMessage({
+              id: "", type: "run_complete", content: "", runId,
+              metrics: showCard ? runMetrics : undefined,
+              equityCurve: showCard ? runCurve : undefined,
+              shadowId,
+              timestamp: Date.now(),
+            });
+          }
         } else if (shadowId) {
           s.addMessage({ id: "", type: "run_complete", content: "", shadowId, timestamp: Date.now() });
         }
@@ -550,7 +596,7 @@ export function Agent() {
         // the RunnerStatus panel re-polls so its per-broker rows show "halted".
         setLiveHalted(halted);
         setLiveStatusRefresh((n) => n + 1);
-        toast.warning("Live trading halted — runner stopped, resting orders cancelled");
+        toast.warning("Connector runtime halted — runner stopped, resting orders cancelled");
       },
 
       "live.resumed": (d) => {
@@ -560,7 +606,7 @@ export function Agent() {
         void d;
         setLiveHalted(null);
         setLiveStatusRefresh((n) => n + 1);
-        toast.success("Live trading resumed");
+        toast.success("Connector runtime resumed");
       },
 
       "live.action": (d) => {
@@ -568,7 +614,7 @@ export function Agent() {
         const action = d as unknown as LiveAction;
         if (!action.kind) return;
         setLiveItems((items) => [...items, { kind: "live_action", timestamp: Date.now(), action }]);
-        if (action.kind === "halt_tripped") setLiveHalted({ reason: action.intent_normalized });
+        if (action.kind === "halt_tripped") setLiveHalted({ broker: action.broker, reason: action.intent_normalized });
         if (action.kind === "halt_cleared") setLiveHalted(null);
         // Mandate-affecting / runner-affecting actions should refresh the runtime panel.
         if (["mandate_committed", "halt_tripped", "halt_cleared"].includes(action.kind)) {
@@ -619,11 +665,14 @@ export function Agent() {
 
   /* Single shared poller for `GET /live/status`. RunnerStatus consumes this snapshot
    * as a prop rather than polling independently, and the global kill switch reads it
-   * to stay available whenever live trading could be active out-of-band. */
+   * to stay available whenever connector runtime activity could be active out-of-band. */
   const refreshLiveStatus = useCallback(async () => {
     try {
       const next = await api.getLiveStatus();
       setLiveStatus(next);
+      setLiveHalted((current) => (
+        current && !haltScopeStillActive(current, next) ? null : current
+      ));
       setLiveStatusUnavailable(false);
     } catch (error) {
       // A 404/501 means the runtime endpoint is not wired on this backend; treat the
@@ -661,11 +710,17 @@ export function Agent() {
 
   useEffect(() => () => doDisconnect(), [doDisconnect]);
 
-  /* Safety timeout: if streaming but no SSE event for 90s, reset to idle */
+  useEffect(() => {
+    api.getLLMSettings().then((s) => {
+      sseTimeoutMsRef.current = s.sse_timeout_seconds * 1000;
+    }).catch(() => {});
+  }, []);
+
+  /* Safety timeout: if streaming but no SSE event for sseTimeoutMsRef.current ms, reset to idle */
   useEffect(() => {
     if (status !== "streaming") return;
     const timer = setInterval(() => {
-      if (lastEventRef.current && Date.now() - lastEventRef.current > 90_000 && act().status === "streaming") {
+      if (lastEventRef.current && Date.now() - lastEventRef.current > sseTimeoutMsRef.current && act().status === "streaming") {
         act().setStatus("idle");
         toast.warning("Execution timed out, automatically stopped");
       }
@@ -772,15 +827,15 @@ export function Agent() {
       // (e.g. a runner started from the CLI / another session). The backend scopes
       // the SSE broadcast by session_id when present; an empty string is a valid
       // global trip.
-      await api.haltLive(sessionId ?? "");
+      await api.haltLive(sessionId ?? undefined);
       // Preemptive halt: the server trips the kill switch (cancel resting orders +
       // optional flatten per SPEC §7.5 #6) and broadcasts live.halted. Reflect
       // optimistically and re-poll the runtime panel so the runner shows stopped.
-      setLiveHalted((cur) => cur ?? { by: "frontend", tripped_at: new Date().toISOString() });
+      setLiveHalted((cur) => cur ?? { broker: null, by: "frontend", tripped_at: new Date().toISOString() });
       setLiveStatusRefresh((n) => n + 1);
-      toast.success("Live trading halted");
+      toast.success("Connector runtime halted");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to halt live trading.");
+      toast.error(error instanceof Error ? error.message : "Failed to halt connector runtime.");
     } finally {
       setHalting(false);
     }
@@ -950,23 +1005,23 @@ export function Agent() {
     return rows.sort((a, b) => a.sort - b.sort);
   }, [groups, liveItems]);
 
-  /* Whether live trading could be active *anywhere* — the global kill switch must be
+  /* Whether connector runtime activity could be active *anywhere* — the global kill switch must be
    * available whenever it could (audit M2 / SPEC Consent §4). Driven off both
    * in-session SSE artifacts AND the shared `/live/status` snapshot, so a runner
    * started from the CLI or another browser session still surfaces the halt button
    * in a freshly-loaded web session. */
   const liveStatusActive =
     liveStatus != null &&
-    (liveStatus.halted ||
-      liveStatus.brokers.some((b) => b.authorized || b.runner?.alive || b.mandate != null));
+    (liveStatus.global_halted ||
+      liveStatus.brokers.some((b) => b.auth.oauth_token_present || b.runner?.alive || b.mandate != null));
   const liveActive =
     liveItems.length > 0 ||
     Object.keys(committedMandates).length > 0 ||
     liveHalted != null ||
     liveStatusActive;
-  /* The kill switch reflects a halt from either an in-session SSE event or the polled
-   * status, so the halted/resumed state stays consistent across surfaces. */
-  const liveIsHalted = liveHalted != null || (liveStatus?.halted ?? false);
+  /* The global kill switch reflects only a global halt from either an in-session SSE
+   * event or the polled status; broker-scoped halts stay on their broker row. */
+  const liveIsHalted = isGlobalLiveHalt(liveHalted) || (liveStatus?.global_halted ?? false);
 
   return (
     <div className="flex flex-col flex-1 min-w-0 overflow-hidden h-full">
@@ -1285,7 +1340,7 @@ export function Agent() {
               {liveIsHalted ? (
                 <span className="inline-flex items-center gap-1.5 rounded-lg bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive">
                   <OctagonX className="h-3 w-3" />
-                  Live trading halted
+                  Connector runtime halted
                 </span>
               ) : (
                 <button
@@ -1293,10 +1348,10 @@ export function Agent() {
                   onClick={handleHaltLive}
                   disabled={halting}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/5 px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-40"
-                  title="Instantly halt all live trading for this session"
+                  title="Instantly halt connector runtime activity"
                 >
                   {halting ? <Loader2 className="h-3 w-3 animate-spin" /> : <OctagonX className="h-3 w-3" />}
-                  Halt live trading
+                  Halt connector runtime
                 </button>
               )}
             </div>
@@ -1350,6 +1405,29 @@ export function Agent() {
                     <Users className="h-4 w-4" />
                     Agent Swarm
                   </button>
+                  <div className="border-t my-1" />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowUploadMenu(false);
+                      void runPrompt(CONNECTOR_CHECK_PROMPT);
+                    }}
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
+                  >
+                    <Landmark className="h-4 w-4" />
+                    Check Trading Connector
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowUploadMenu(false);
+                      void runPrompt(CONNECTOR_PORTFOLIO_PROMPT);
+                    }}
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
+                  >
+                    <Landmark className="h-4 w-4" />
+                    Analyze Connector Portfolio
+                  </button>
                 </div>
               )}
             </div>
@@ -1365,6 +1443,13 @@ export function Agent() {
               value={input}
               rows={1}
               onChange={(e) => setInput(e.target.value)}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+                lastCompositionEndRef.current = Date.now();
+              }}
               onInput={(e) => {
                 const el = e.target as HTMLTextAreaElement;
                 el.style.height = "auto";
@@ -1372,6 +1457,15 @@ export function Agent() {
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
+                  const nativeEvent = e.nativeEvent as KeyboardEvent & { isComposing?: boolean };
+                  const justFinishedComposing = Date.now() - lastCompositionEndRef.current < 80;
+                  if (isComposingRef.current || nativeEvent.isComposing || nativeEvent.keyCode === 229) {
+                    return;
+                  }
+                  if (justFinishedComposing) {
+                    e.preventDefault();
+                    return;
+                  }
                   e.preventDefault();
                   runPrompt(input.trim());
                 }

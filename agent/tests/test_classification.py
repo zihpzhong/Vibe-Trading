@@ -5,7 +5,8 @@ from __future__ import annotations
 from mcp.types import ToolAnnotations
 
 from src.live.classification import ToolClass, classify_tool
-from src.live.robinhood_classification import ROBINHOOD_TOOL_CLASS
+from src.trading.connectors.ibkr.classification import IBKR_TOOL_CLASS
+from src.trading.connectors.robinhood.classification import ROBINHOOD_TOOL_CLASS
 
 
 def test_tier1_explicit_read_only_hint_true_is_read() -> None:
@@ -62,3 +63,9 @@ def test_map_read_pin_not_overridden_by_absent_annotation() -> None:
     """A curated READ wins even when annotations are present but silent."""
     ann = ToolAnnotations(title="quotes", readOnlyHint=None)
     assert classify_tool("get_quotes", ann, ROBINHOOD_TOOL_CLASS) is ToolClass.READ
+
+
+def test_ibkr_sparse_map_pins_known_order_names_write() -> None:
+    """IBKR read names are annotation-discovered, but order names stay WRITE."""
+    assert classify_tool("place_order", None, IBKR_TOOL_CLASS) is ToolClass.WRITE
+    assert classify_tool("cancelOrder", ToolAnnotations(readOnlyHint=True), IBKR_TOOL_CLASS) is ToolClass.WRITE

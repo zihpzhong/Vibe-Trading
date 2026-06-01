@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Vibe-Trading MCP Server — expose 22 finance research tools to any MCP client.
+"""Vibe-Trading MCP Server — expose finance research tools to any MCP client.
 
 Works with OpenClaw, Claude Desktop, Cursor, and any MCP-compatible client.
-Zero API key required for HK/US/crypto markets (yfinance, OKX, AKShare are free).
+Zero API key required for HK/US/crypto research markets (yfinance, OKX,
+AKShare are free). Trading connector tools are profile-scoped and require the
+selected connector's own local app or OAuth setup.
 
 Usage:
     python mcp_server.py                    # stdio transport (default)
@@ -25,6 +27,8 @@ Claude Desktop config:
 """
 
 from __future__ import annotations
+
+# ruff: noqa: E402
 
 import json
 import logging
@@ -619,6 +623,240 @@ def read_file(path: str) -> str:
     """
     registry = _get_registry()
     return registry.execute("read_file", {"path": path})
+
+
+# ---------------------------------------------------------------------------
+# Trading connector tools
+# ---------------------------------------------------------------------------
+
+
+def _trading_common_args(
+    *,
+    connection: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+) -> dict[str, Any]:
+    """Build shared optional trading connector arguments."""
+    payload: dict[str, Any] = {}
+    if connection:
+        payload["connection"] = connection
+    if host:
+        payload["host"] = host
+    if port is not None:
+        payload["port"] = port
+    if client_id is not None:
+        payload["client_id"] = client_id
+    if account:
+        payload["account"] = account
+    return payload
+
+
+@mcp.tool
+def trading_connections() -> str:
+    """List selectable trading connector profiles.
+
+    The connector is the first-level choice. Paper/live is an attribute of each
+    profile under that connector.
+    """
+    registry = _get_registry()
+    return registry.execute("trading_connections", {})
+
+
+@mcp.tool
+def trading_select_connection(connection: str) -> str:
+    """Select the default trading connector profile for later trading_* calls.
+
+    Args:
+        connection: Profile id, e.g. ``ibkr-paper-local`` or ``robinhood-live-mcp``.
+    """
+    registry = _get_registry()
+    return registry.execute("trading_select_connection", {"connection": connection})
+
+
+@mcp.tool
+def trading_check(
+    connection: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+) -> str:
+    """Check whether a trading connector profile is configured and reachable.
+
+    This never places orders. For local profiles, it checks the user's local
+    app/socket. For remote MCP profiles, it reports config and OAuth-token
+    presence without returning secrets.
+
+    Args:
+        connection: Optional profile id. Defaults to the selected profile.
+        host: Optional local host override.
+        port: Optional local socket port override.
+        client_id: Optional local client id override.
+        account: Optional account code filter.
+    """
+    registry = _get_registry()
+    return registry.execute(
+        "trading_check",
+        _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account),
+    )
+
+
+@mcp.tool
+def trading_account(
+    connection: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+) -> str:
+    """Read account data from the selected trading connector profile.
+
+    Args:
+        connection: Optional profile id. Defaults to the selected profile.
+        host: Optional local host override.
+        port: Optional local socket port override.
+        client_id: Optional local client id override.
+        account: Optional account code filter.
+    """
+    registry = _get_registry()
+    return registry.execute(
+        "trading_account",
+        _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account),
+    )
+
+
+@mcp.tool
+def trading_positions(
+    connection: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+) -> str:
+    """Read positions from the selected trading connector profile.
+
+    Args:
+        connection: Optional profile id. Defaults to the selected profile.
+        host: Optional local host override.
+        port: Optional local socket port override.
+        client_id: Optional local client id override.
+        account: Optional account code filter.
+    """
+    registry = _get_registry()
+    return registry.execute(
+        "trading_positions",
+        _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account),
+    )
+
+
+@mcp.tool
+def trading_orders(
+    connection: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+    include_executions: bool = False,
+) -> str:
+    """Read open orders from the selected trading connector profile.
+
+    Read-only: this tool does not place, cancel, modify, or replace orders.
+
+    Args:
+        connection: Optional profile id. Defaults to the selected profile.
+        host: Optional local host override.
+        port: Optional local socket port override.
+        client_id: Optional local client id override.
+        account: Optional account code filter.
+        include_executions: Include recent executions when available.
+    """
+    params = _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account)
+    params["include_executions"] = include_executions
+    registry = _get_registry()
+    return registry.execute("trading_orders", params)
+
+
+@mcp.tool
+def trading_quote(
+    symbol: str,
+    connection: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+    exchange: str = "SMART",
+    currency: str = "USD",
+    sec_type: str = "STK",
+) -> str:
+    """Read a quote snapshot from the selected trading connector profile.
+
+    Args:
+        symbol: Symbol such as AAPL.
+        connection: Optional profile id. Defaults to the selected profile.
+        host: Optional local host override.
+        port: Optional local socket port override.
+        client_id: Optional local client id override.
+        account: Optional account code filter.
+        exchange: Exchange routing, default SMART.
+        currency: Contract currency, default USD.
+        sec_type: Security type, default STK.
+    """
+    params = _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account)
+    params.update({"symbol": symbol, "exchange": exchange, "currency": currency, "sec_type": sec_type})
+    registry = _get_registry()
+    return registry.execute("trading_quote", params)
+
+
+@mcp.tool
+def trading_history(
+    symbol: str,
+    connection: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    client_id: int | None = None,
+    account: str | None = None,
+    exchange: str = "SMART",
+    currency: str = "USD",
+    sec_type: str = "STK",
+    duration: str = "30 D",
+    bar_size: str = "1 day",
+    what_to_show: str = "TRADES",
+    use_rth: bool = True,
+) -> str:
+    """Read historical bars from the selected trading connector profile.
+
+    Args:
+        symbol: Symbol such as AAPL.
+        connection: Optional profile id. Defaults to the selected profile.
+        host: Optional local host override.
+        port: Optional local socket port override.
+        client_id: Optional local client id override.
+        account: Optional account code filter.
+        exchange: Exchange routing, default SMART.
+        currency: Contract currency, default USD.
+        sec_type: Security type, default STK.
+        duration: IBKR duration string, default 30 D.
+        bar_size: IBKR bar size, default 1 day.
+        what_to_show: Data type, default TRADES.
+        use_rth: Use regular trading hours.
+    """
+    params = _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account)
+    params.update(
+        {
+            "symbol": symbol,
+            "exchange": exchange,
+            "currency": currency,
+            "sec_type": sec_type,
+            "duration": duration,
+            "bar_size": bar_size,
+            "what_to_show": what_to_show,
+            "use_rth": use_rth,
+        }
+    )
+    registry = _get_registry()
+    return registry.execute("trading_history", params)
 
 
 # ---------------------------------------------------------------------------

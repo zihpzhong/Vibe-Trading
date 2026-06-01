@@ -66,9 +66,8 @@ _COUNTER_FILENAME = "trade_counter.json"
 #: to emit a ``live.action`` event without touching the agent loop.
 LIVE_ACTION_RESULT_KEY = "live_action"
 
-#: Canonical Robinhood READ tools the gate uses to snapshot positions/balance
-#: and (for quantity orders) a live quote. Pinned to the frozen catalog: READ =
-#: {get_account, get_positions, get_quotes, list_orders}.
+#: Fallback READ tools the gate uses to snapshot positions/balance and live
+#: quotes. Connector mappings in ``src.trading`` override these when available.
 _POSITIONS_TOOLS = ("get_positions",)
 _BALANCE_TOOLS = ("get_account",)
 _QUOTE_TOOLS = ("get_quotes",)
@@ -165,8 +164,8 @@ class LiveOrderGuardTool(MCPRemoteTool):
                 mandate=mandate,
             )
 
-        positions = self._read_first(_POSITIONS_TOOLS)
-        balance = self._read_first(_BALANCE_TOOLS)
+        positions = self._read_first(self._read_tools("positions", _POSITIONS_TOOLS))
+        balance = self._read_first(self._read_tools("account", _BALANCE_TOOLS))
         daily_count = self._read_daily_count()
 
         breach = check_mandate(
@@ -274,7 +273,7 @@ class LiveOrderGuardTool(MCPRemoteTool):
         Returns:
             A positive USD price, or ``None``.
         """
-        for remote in _QUOTE_TOOLS:
+        for remote in self._read_tools("quote", _QUOTE_TOOLS):
             try:
                 result = self._adapter.call_tool(
                     remote, {"symbol": symbol}, local_name=remote
@@ -473,6 +472,16 @@ class LiveOrderGuardTool(MCPRemoteTool):
                 continue
             return result
         return None
+
+    def _read_tools(self, operation: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
+        """Return connector-specific read tools, falling back to legacy names."""
+        try:
+            from src.trading.service import runner_tool_name
+
+            remote = runner_tool_name(self.broker, operation)
+        except Exception:  # pragma: no cover - guard must fail closed later
+            remote = None
+        return (remote,) if remote else fallback
 
     # -- daily counter ------------------------------------------------------
 

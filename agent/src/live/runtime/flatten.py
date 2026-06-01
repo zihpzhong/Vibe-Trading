@@ -181,12 +181,26 @@ def _cancel_resting_orders(
             report["errors"].append(
                 {"phase": "cancel", "order_id": order_id, "error": str(exc)}
             )
-            _audit(broker, _CANCEL_TOOL, f"cancel order {order_id}", request,
-                   None, "error", str(exc))
+            _audit(
+                broker,
+                _sweep_tool(broker, "cancel_order", _CANCEL_TOOL),
+                f"cancel order {order_id}",
+                request,
+                None,
+                "error",
+                str(exc),
+            )
             continue
         report["cancelled_order_ids"].append(order_id)
-        _audit(broker, _CANCEL_TOOL, f"cancel order {order_id}", request,
-               response, "accepted", None)
+        _audit(
+            broker,
+            _sweep_tool(broker, "cancel_order", _CANCEL_TOOL),
+            f"cancel order {order_id}",
+            request,
+            response,
+            "accepted",
+            None,
+        )
 
 
 def _flatten_open_positions(
@@ -234,12 +248,38 @@ def _flatten_open_positions(
             report["errors"].append(
                 {"phase": "flatten", "symbol": symbol, "error": str(exc)}
             )
-            _audit(broker, _FLATTEN_TOOL, intent, request, None, "error", str(exc))
+            _audit(
+                broker,
+                _sweep_tool(broker, "submit_order", _FLATTEN_TOOL),
+                intent,
+                request,
+                None,
+                "error",
+                str(exc),
+            )
             continue
         report["flatten_orders_submitted"].append(
             {"symbol": symbol, "qty": close_qty, "side": side, "response": response}
         )
-        _audit(broker, _FLATTEN_TOOL, intent, request, response, "accepted", None)
+        _audit(
+            broker,
+            _sweep_tool(broker, "submit_order", _FLATTEN_TOOL),
+            intent,
+            request,
+            response,
+            "accepted",
+            None,
+        )
+
+
+def _sweep_tool(broker: str, operation: str, fallback: str) -> str:
+    """Return the connector-specific sweep tool name for audit records."""
+    try:
+        from src.trading.service import runner_tool_name
+
+        return runner_tool_name(broker, operation) or fallback
+    except Exception:  # pragma: no cover - audit should not fail the sweep
+        return fallback
 
 
 def _audit(

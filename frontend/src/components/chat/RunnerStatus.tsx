@@ -1,4 +1,4 @@
-import { memo, useCallback, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import {
   Activity,
   Power,
@@ -17,6 +17,7 @@ import {
   type LiveStatus,
   type LiveBrokerStatus,
   type LiveMandateLimits,
+  type LiveAuthorizeResponse,
 } from "@/lib/api";
 
 interface Props {
@@ -36,9 +37,11 @@ function formatUsd(value: number | undefined): string {
   return `$${value.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
 }
 
-function formatRelative(iso: string | null | undefined): string {
-  if (!iso) return "never";
-  const then = new Date(iso).getTime();
+function formatRelative(value: string | number | null | undefined): string {
+  if (value == null || value === "") return "never";
+  const then = typeof value === "number"
+    ? (value < 1_000_000_000_000 ? value * 1000 : value)
+    : new Date(value).getTime();
   if (!Number.isFinite(then)) return "unknown";
   const deltaSec = Math.round((Date.now() - then) / 1000);
   if (deltaSec < 0) return "just now";
@@ -66,15 +69,14 @@ function formatCountdown(iso: string | undefined): { label: string; expired: boo
 function summarizeLimits(limits: LiveMandateLimits | undefined): string {
   if (!limits) return "";
   const parts: string[] = [];
-  if (limits.max_order_usd != null) parts.push(`≤${formatUsd(limits.max_order_usd)}/order`);
-  if (limits.daily_trade_cap != null) parts.push(`${limits.daily_trade_cap}/day`);
-  if (limits.leverage != null) {
-    const lev = typeof limits.leverage === "number"
-      ? (limits.leverage <= 1 ? "no leverage" : `${limits.leverage}×`)
-      : (limits.leverage.toLowerCase() === "none" ? "no leverage" : limits.leverage);
-    parts.push(lev);
-  }
+  if (limits.max_order_notional_usd != null) parts.push(`≤${formatUsd(limits.max_order_notional_usd)}/order`);
+  if (limits.max_trades_per_day != null) parts.push(`${limits.max_trades_per_day}/day`);
+  if (limits.max_leverage != null) parts.push(limits.max_leverage <= 1 ? "no leverage" : `${limits.max_leverage}×`);
   return parts.join(" · ");
+}
+
+function fallbackAuthorizeInstruction(): string {
+  return "Run `vibe-trading connector list`, choose the broker profile, then run `vibe-trading connector authorize <profile>` from the desktop session that will hold the broker connection.";
 }
 
 function BrokerRow({
@@ -87,20 +89,44 @@ function BrokerRow({
   onRefresh: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [authorizeHint, setAuthorizeHint] = useState<LiveAuthorizeResponse | null>(null);
+  const [authorizeFailed, setAuthorizeFailed] = useState(false);
+  const brokerKey = broker.auth.broker;
+  const authorized = broker.auth.oauth_token_present;
   const runnerAlive = broker.runner?.alive ?? false;
   const mandate = broker.mandate ?? null;
   const countdown = formatCountdown(mandate?.expires_at);
+  const authorizeInstruction = authorizeHint?.instruction
+    ?? (authorizeFailed ? fallbackAuthorizeInstruction() : "Loading connector authorization instructions...");
+  const authorizeNote = "The connector channel stays read-only until OAuth succeeds and a mandate is committed.";
+
+  useEffect(() => {
+    let cancelled = false;
+    setAuthorizeHint(null);
+    setAuthorizeFailed(false);
+    if (authorized || !brokerKey) return () => { cancelled = true; };
+
+    api.authorizeLive(brokerKey)
+      .then((response) => {
+        if (!cancelled) setAuthorizeHint(response);
+      })
+      .catch(() => {
+        if (!cancelled) setAuthorizeFailed(true);
+      });
+
+    return () => { cancelled = true; };
+  }, [authorized, brokerKey]);
 
   const toggleRunner = useCallback(async () => {
     if (busy) return;
     setBusy(true);
     try {
       if (runnerAlive) {
-        await api.stopLiveRunner(broker.broker);
-        toast.success(`Runner stopped for ${broker.broker}`);
+        await api.stopLiveRunner(brokerKey);
+        toast.success(`Runner stopped for ${brokerKey}`);
       } else {
-        await api.startLiveRunner(broker.broker);
-        toast.success(`Runner started for ${broker.broker}`);
+        await api.startLiveRunner(brokerKey);
+        toast.success(`Runner started for ${brokerKey}`);
       }
       onRefresh();
     } catch (error) {
@@ -108,14 +134,14 @@ function BrokerRow({
     } finally {
       setBusy(false);
     }
-  }, [broker.broker, busy, runnerAlive, onRefresh]);
+  }, [brokerKey, busy, runnerAlive, onRefresh]);
 
   return (
     <div className="grid gap-2 rounded-lg border bg-muted/20 p-2.5">
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
-          <span className="truncate text-xs font-semibold capitalize text-foreground">{broker.broker}</span>
-          {broker.authorized ? (
+          <span className="truncate text-xs font-semibold capitalize text-foreground">{brokerKey}</span>
+          {authorized ? (
             <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
               <ShieldCheck className="h-2.5 w-2.5" />
               Authorized
@@ -129,22 +155,23 @@ function BrokerRow({
         </div>
       </div>
 
-      {/* Connect-broker on-ramp for unauthorized brokers (C2). The OAuth bootstrap
+      {/* Connect-profile on-ramp for unauthorized brokers (C2). The OAuth bootstrap
           is a desktop-only CLI step (SPEC §4 headless behavior), so the web surface
           surfaces the discoverable instruction rather than driving the browser flow. */}
-      {!broker.authorized ? (
+      {!authorized ? (
         <div className="grid gap-1.5 rounded-md border border-dashed border-primary/30 bg-primary/5 p-2">
           <div className="flex items-center gap-1.5 text-[11px] font-medium text-primary">
             <PlugZap className="h-3 w-3 shrink-0" />
-            Connect this broker to enable live trading
+            Connect this profile to enable connector runtime
           </div>
           <p className="text-[10px] leading-relaxed text-muted-foreground">
-            Authorize on a desktop session:{" "}
-            <code className="rounded bg-background px-1 py-0.5 font-mono text-[10px] text-foreground">
-              vibe-trading live authorize {broker.broker}
-            </code>
-            . The channel stays read-only until OAuth succeeds and a mandate is committed.
+            {authorizeInstruction}
           </p>
+          {authorizeNote && (
+            <p className="text-[10px] leading-relaxed text-muted-foreground">
+              {authorizeNote}
+            </p>
+          )}
         </div>
       ) : (
         <>
@@ -199,7 +226,7 @@ function BrokerRow({
             </div>
           ) : (
             <div className="rounded-md border border-dashed bg-background/40 p-2 text-[10px] text-muted-foreground">
-              No active mandate. Ask the agent to propose one, then commit it to begin autonomous trading.
+              No active mandate. Ask the agent to propose one, then commit it before starting the connector runtime.
             </div>
           )}
 
@@ -211,7 +238,7 @@ function BrokerRow({
               </span>
             ) : (
               <span className="text-[10px] text-muted-foreground">
-                {runnerAlive ? "Trading autonomously inside mandate" : "Idle"}
+                {runnerAlive ? "Runtime active inside mandate" : "Idle"}
               </span>
             )}
             <button
@@ -241,10 +268,10 @@ function BrokerRow({
  *
  * Renders the shared `GET /live/status` snapshot (polled once by Agent.tsx and passed
  * in as `status`, so the kill switch and this panel share a single poller). Per authorized
- * broker: runner running state, last heartbeat tick, the active mandate's limits, and an
+ * profile: runner running state, last heartbeat tick, the active mandate's limits, and an
  * expiry countdown. `onRefresh` asks the parent to re-poll after a runner start/stop. Unauthorized
- * brokers get a "Connect broker" on-ramp so a web user can discover how to enable live
- * trading. Runner start/stop are privileged surface fetches (`api.startLiveRunner` /
+ * profiles get a connector on-ramp so a web user can discover how to enable connector
+ * runtime execution. Runner start/stop are privileged surface fetches (`api.startLiveRunner` /
  * `api.stopLiveRunner`), never chat messages. Collapses to a compact toggle.
  */
 export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, halted, onRefresh }: Props) {
@@ -253,9 +280,9 @@ export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, ha
   if (unavailable) return null;
   if (!status || status.brokers.length === 0) return null;
 
-  const isHalted = halted ?? status.halted;
+  const isHalted = halted ?? status.global_halted;
   const anyRunning = status.brokers.some((b) => b.runner?.alive);
-  const authorizedCount = status.brokers.filter((b) => b.authorized).length;
+  const authorizedCount = status.brokers.filter((b) => b.auth.oauth_token_present).length;
 
   return (
     <div className="grid gap-2">
@@ -263,13 +290,13 @@ export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, ha
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="inline-flex max-w-full items-center gap-1.5 justify-self-start rounded-lg bg-primary/10 px-2.5 py-1 text-left text-xs font-medium text-primary transition-colors hover:bg-primary/15"
-        aria-label="Live runtime status"
+        aria-label="Connector runtime status"
         aria-expanded={open}
       >
         <Activity className="h-3 w-3 shrink-0" />
-        <span className="shrink-0">Live runtime</span>
+        <span className="shrink-0">Connector runtime</span>
         <span className="truncate text-muted-foreground">
-          {authorizedCount > 0 ? `${authorizedCount} connected` : "no broker connected"}
+          {authorizedCount > 0 ? `${authorizedCount} connected` : "no connector connected"}
         </span>
         {anyRunning && !isHalted && (
           <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
@@ -289,7 +316,7 @@ export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, ha
       {open && (
         <div className="grid gap-2 rounded-xl border border-primary/20 bg-background/95 p-3 shadow-sm">
           {status.brokers.map((broker) => (
-            <BrokerRow key={broker.broker} broker={broker} halted={isHalted} onRefresh={onRefresh} />
+            <BrokerRow key={broker.auth.broker} broker={broker} halted={isHalted || broker.halted} onRefresh={onRefresh} />
           ))}
         </div>
       )}

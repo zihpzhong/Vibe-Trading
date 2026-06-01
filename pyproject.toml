@@ -91,6 +91,9 @@ include = ["src*", "backtest*", "cli*"]
 "src.factors" = ["zoo/**/*.yaml", "zoo/**/*.md", "zoo/**/NOTICE"]
 
 [project.optional-dependencies]
+ibkr = [
+    "ib_async>=2.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

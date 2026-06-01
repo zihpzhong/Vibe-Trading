@@ -34,17 +34,17 @@ from cli.theme import Theme, get_console
 
 
 def _register_live_slash_commands() -> None:
-    """Surface the live-trading slash commands in the shared registry.
+    """Surface connector live-trading slash commands in the shared registry.
 
-    Discoverability fix (SPEC.md Consent §4 + §9 audit): ``/live``, ``/halt`` and
-    ``/resume`` are privileged kill-switch / runner surface actions intercepted
+    Discoverability fix (SPEC.md Consent §4 + §9 audit): ``/connector``,
+    ``/halt`` and ``/resume`` are privileged kill-switch / runner surface actions intercepted
     in the REPL input path (never dispatched to the model), so they were absent
     from the slash registry — meaning ``/help``, the typeahead completer, and the
     fuzzy matcher never listed them. We append them here, at this module's import
     time, which runs on every interactive startup *before* the lazily-imported
     ``cli.commands.help`` / ``cli.completer`` first read the registry. Both of
     those read ``slash_router.SLASH_COMMANDS`` (help) / call ``match_commands``
-    (completer) which resolve the live module attribute, so the single
+    (completer) which resolve the connector module attribute, so the single
     reassignment here surfaces the commands in all three places.
 
     The registry is a tuple of frozen dataclasses, so we build a NEW tuple rather
@@ -56,7 +56,7 @@ def _register_live_slash_commands() -> None:
     existing = {cmd.name for cmd in slash_router.SLASH_COMMANDS}
     additions = (
         slash_router.Command(
-            "live", "Live trading channel (status / run / halt)", "cli.main"
+            "connector", "Trading connector profiles (status / start / halt)", "cli.main"
         ),
         slash_router.Command(
             "halt", "Kill switch — halt ALL live trading now", "cli.main"
@@ -68,7 +68,7 @@ def _register_live_slash_commands() -> None:
     new = tuple(cmd for cmd in additions if cmd.name not in existing)
     if not new:
         return
-    # Insert the live group just before ``quit`` (the conventional last row) so
+    # Insert the connector group just before ``quit`` (the conventional last row) so
     # the kill switch sits with the other safety-relevant commands.
     commands = list(slash_router.SLASH_COMMANDS)
     quit_idx = next(
@@ -272,12 +272,12 @@ def _show_banner() -> None:
     console = get_console()
     print_banner(console, **stats)
     # Discoverability one-liner (SPEC.md §9 audit): point users at the
-    # live-trading channel + its CLI surface. Live is opt-in and read-only by
+    # connector channel + its CLI surface. Live profiles are opt-in and read-only by
     # default, so this is a pointer, not an enablement.
     console.print(
         "  [dim]Live trading (opt-in, read-only by default): "
-        "[/dim][bold]/live[/bold][dim] in chat · "
-        "[/dim][bold]vibe-trading live --help[/bold][dim] · "
+        "[/dim][bold]/connector[/bold][dim] in chat · "
+        "[/dim][bold]vibe-trading connector --help[/bold][dim] · "
         "[/dim][bold]/halt[/bold][dim] = kill switch.[/dim]"
     )
     console.print()
@@ -811,7 +811,7 @@ def _trip_halt_from_repl(console: Any, *, reason: str) -> None:
         return
     console.print(
         "[bold red]Live trading halted[/bold red] — all live order tools are now "
-        "disabled until you run [bold]/resume[/bold] or [bold]vibe-trading live resume[/bold]."
+        "disabled until you run [bold]/resume[/bold] or [bold]vibe-trading connector resume[/bold]."
     )
     console.print(f"[dim]HALT sentinel: {path}[/dim]")
 
@@ -821,7 +821,7 @@ def _clear_halt_from_repl(console: Any) -> None:
 
     Clearing the halt is a privileged surface action — an explicit re-enable,
     never an agent tool (SPEC.md Consent §4). It is intercepted in the input
-    path so the model never performs it. Mirrors ``vibe-trading live resume``
+    path so the model never performs it. Mirrors ``vibe-trading connector resume``
     with no broker (the global scope).
 
     Args:
@@ -842,35 +842,35 @@ def _clear_halt_from_repl(console: Any) -> None:
         console.print("[dim]No active global halt to clear.[/dim]")
 
 
-def _run_live_command_from_repl(console: Any, args: list[str]) -> None:
-    """Run a ``/live ...`` subcommand from the REPL via the legacy dispatcher.
+def _run_connector_command_from_repl(console: Any, args: list[str]) -> None:
+    """Run a ``/connector ...`` subcommand from the REPL via the dispatcher.
 
-    ``/live`` is a thin in-REPL bridge to the ``vibe-trading live`` subcommand
-    group (SPEC.md §9 Decision 1): ``/live status``, ``/live run``,
-    ``/live start``, ``/live stop``, ``/live mandate``, etc. It parses the
+    ``/connector`` is a thin in-REPL bridge to the ``vibe-trading connector``
+    subcommand group (SPEC.md §9 Decision 1): ``/connector status``,
+    ``/connector start``, ``/connector stop``, ``/connector halt``, etc. It parses the
     arguments through the same argparse surface as the non-interactive CLI and
     dispatches to the same privileged handlers — none of which is an agent tool.
-    A bare ``/live`` defaults to ``status`` so the most common read is one
+    A bare ``/connector`` defaults to ``status`` so the most common read is one
     keystroke away.
 
     Args:
         console: Rich console for error messages.
-        args: Tokens following ``/live`` (e.g. ``["status", "robinhood"]``).
+        args: Tokens following ``/connector`` (e.g. ``["status", "robinhood-live-mcp"]``).
     """
-    from cli._legacy import _build_parser, _dispatch_live
+    from cli._legacy import _build_parser, _dispatch_connector
 
-    argv = ["live", *(args or ["status"])]
+    argv = ["connector", *(args or ["status"])]
     parser = _build_parser()
     try:
         parsed = parser.parse_args(argv)
     except SystemExit:
         # argparse already printed usage to stderr; keep the REPL alive.
-        console.print("[dim]Usage: /live [status|run|start|stop|mandate|halt|resume|revoke][/dim]")
+        console.print("[dim]Usage: /connector [list|status|start|stop|halt|resume|revoke][/dim]")
         return
     try:
-        _dispatch_live(parsed)
-    except Exception as exc:  # noqa: BLE001 — never let a live command kill the loop
-        console.print(f"[bold red]/live failed:[/bold red] {exc}")
+        _dispatch_connector(parsed)
+    except Exception as exc:  # noqa: BLE001 — never let a connector command kill the loop
+        console.print(f"[bold red]/connector failed:[/bold red] {exc}")
 
 
 def _is_numeric_pick(text: str) -> Optional[int]:
@@ -1130,7 +1130,7 @@ def _interactive_loop(max_iter: int) -> int:
 
         # Slash command path.
         if text.startswith("/"):
-            # /halt /stop /resume /live are privileged live-trading surface
+            # /halt /stop /resume /connector are privileged live-trading surface
             # actions handled in the input path, never dispatched to the model
             # (SPEC.md Consent §4 / §9 Decision 1).
             slash_tokens = text.lstrip("/").split()
@@ -1142,8 +1142,8 @@ def _interactive_loop(max_iter: int) -> int:
             if slash_name == "resume":
                 _clear_halt_from_repl(console)
                 continue
-            if slash_name == "live":
-                _run_live_command_from_repl(console, slash_tokens[1:])
+            if slash_name == "connector":
+                _run_connector_command_from_repl(console, slash_tokens[1:])
                 continue
             rc = _dispatch_slash(text, ctx)
             if rc == 2:

@@ -177,7 +177,7 @@ function ProfileTile({
 }
 
 /**
- * Renders a live-trading mandate proposal (SPEC Consent §1/§2).
+ * Renders a connector-runtime mandate proposal (SPEC Consent §1/§2).
  *
  * Each profile tile shows concrete numbers (universe, max order, daily cap, leverage,
  * instruments). Committing calls `api.commitMandate` — a privileged surface action,
@@ -191,9 +191,15 @@ export const MandateProposalCard = memo(function MandateProposalCard({ proposal,
   const handleCommit = useCallback(
     async (ordinal: number) => {
       if (busyOrdinal != null) return;
+      const broker = proposal.account?.broker?.trim().toLowerCase();
+      if (!broker) {
+        toast.error("Cannot commit mandate: connector broker is missing. Ask the agent to regenerate the proposal.");
+        return;
+      }
       setBusyOrdinal(ordinal);
       try {
         await api.commitMandate({
+          broker,
           proposal_id: proposal.proposal_id,
           selected_ordinal: ordinal,
           adjustments: null,
@@ -207,7 +213,7 @@ export const MandateProposalCard = memo(function MandateProposalCard({ proposal,
         toast.error(error instanceof Error ? error.message : "Failed to commit mandate.");
       }
     },
-    [busyOrdinal, proposal.proposal_id, proposal.session_id],
+    [busyOrdinal, proposal.account?.broker, proposal.proposal_id, proposal.session_id],
   );
 
   // Collapsed state: a compact active-mandate badge (same visual family as the goal badge).
@@ -254,7 +260,7 @@ export const MandateProposalCard = memo(function MandateProposalCard({ proposal,
           )}
           <div className="min-w-0">
             <p className="text-sm font-semibold text-foreground">
-              {isReauth ? "Re-authorize live mandate" : "Live trading mandate"}
+              {isReauth ? "Re-authorize connector mandate" : "Connector runtime mandate"}
             </p>
             {proposal.intent_normalized && (
               <p className="text-xs text-muted-foreground">{proposal.intent_normalized}</p>
