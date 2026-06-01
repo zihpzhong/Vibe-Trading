@@ -208,5 +208,10 @@
 
     "//vol_ratio_high_score_threshold": "高分信号所需最低成交量比(当前量/均值)。趋势市可调低至1.2",
     "vol_ratio_high_score_threshold": 1.5
+  },
+
+  "agt_live": {
+    "//_说明": "AGT 自主交易 tick prompt 模板。AGT_LIVE_PROMPT 环境变量优先级更高",
+    "prompt_template": ""
   }
 }
