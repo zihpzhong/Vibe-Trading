@@ -531,7 +531,7 @@ def format_sizing_prompt_block(plan: EntrySizePlan) -> str:
         f"Flr=${plan.notional_min_usdt:.1f} "
         f"Ceil=${plan.notional_max_usdt:.1f} "
         f"Lev={plan.recommended_leverage:.0f}X | "
-        f"Edge={edge_tag}→no new longs; notional<Flr→rejected"
+        f"Edge={edge_tag}→{'ok to enter' if k.edge_positive else 'no new longs'}; notional<Flr→rejected"
     )
 
 

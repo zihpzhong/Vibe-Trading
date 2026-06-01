@@ -94,9 +94,14 @@ def _bitget_error_text(exc: Exception) -> str:
 
 
 def _is_one_way_mode_error(exc: Exception) -> bool:
-    """Bitget 40774: order params disagree with account hold mode."""
+    """Bitget 40774/40773: order params disagree with account hold mode.
+
+    40773 = "Closed positions can only occur in two-way positions"
+    — 账户实际是 one-way mode 但订单使用了 hedged=True(posSide) / Account is one-way
+    40774 = "unilateral position" — one-way mode 与订单参数冲突 / Order params disagree
+    """
     text = _bitget_error_text(exc).lower()
-    return "40774" in text or "unilateral position" in text
+    return "40774" in text or "40773" in text or "unilateral position" in text
 
 
 # ---------------------------------------------------------------------------
