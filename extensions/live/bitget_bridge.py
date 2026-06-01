@@ -111,6 +111,9 @@ def patch_upstream() -> None:
     from src.live import registry as _registry
     from src.live.extractors import BROKER_EXTRACTORS as _extractors
 
+    # 1. Patch broker_supports_live_runner (upstream v2 profiles check).
+    _patch_broker_supports_live_runner()
+
     # 1. Patch is_live_broker (LIVE_BROKER_SERVER_KEYS is an immutable frozenset).
     _original_is_live = _registry.is_live_broker
 
@@ -163,6 +166,21 @@ def patch_upstream() -> None:
     _patch_reconcile_audit_error()
 
     logger.info("bitget live broker registered (upstream patched at runtime)")
+
+
+def _patch_broker_supports_live_runner() -> None:
+    """Patch upstream broker_supports_live_runner to include bitget."""
+    from src.trading import service as _trading_svc
+
+    _orig_supports = _trading_svc.broker_supports_live_runner
+
+    def _patched_supports(broker: str) -> bool:
+        if broker.strip().lower() in _EXTRA_LIVE_KEYS:
+            return True
+        return _orig_supports(broker)
+
+    _trading_svc.broker_supports_live_runner = _patched_supports
+    logger.info("broker_supports_live_runner patched for bitget")
 
 
 def _patch_mandate_crypto_universe() -> None:
