@@ -211,7 +211,7 @@
   },
 
   "agt_live": {
-    "//_说明": "AGT 自主交易 tick prompt 模板。\\n 为换行。AGT_LIVE_PROMPT 环境变量优先级更高。为空=使用代码默认",
-    "prompt_template": "\n\n=== TICK CONSTRAINTS ===\n- Market data: Bitget MCP tools (mcp_bitget_get_account, mcp_bitget_get_positions, mcp_bitget_get_quotes, mcp_bitget_list_orders) or live_trading (get_positions, get_account, run_gate)\n- Not available this tick: read_url, web_search, run_swarm, bash, backtest\n\n=== ACTION GUIDANCE ===\n- SIGNAL=GREEN with Tgt≥Flr: gate allows entry. Use get_quotes to check price, run_gate to validate, then place order\n- Tgt=Flr is normal, not a deadlock — orders at Tgt level pass the gate\n- SIGNAL=RED: do not enter\n- If unsure: HOLD and explain why"
+    "//_说明": "AGT prompt 已迁移到 extensions/live/agt_prompt.txt。优先使用环境变量 AGT_LIVE_PROMPT",
+    "prompt_template": ""
   }
 }

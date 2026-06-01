@@ -4,12 +4,11 @@ Live-runner sessions (``live-runner:{broker}``) use a reduced tool surface so
 autonomous ticks do not invoke ``read_url``, ``run_swarm``, or other research
 tools that blow tick latency and third-party rate limits.
 
-Prompt 优先级: AGT_LIVE_PROMPT 环境变量 > config.json:agt_live.prompt_template > 代码默认值
+Prompt 优先级: AGT_LIVE_PROMPT 环境变量 > agt_prompt.txt 文件 > 代码默认值
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -59,39 +58,38 @@ _DEFAULT_PROMPT_ADDENDUM = (
 )
 
 
-#: 配置文件路径 / Config file path
-_CONFIG_JSON_PATH: Path = Path(__file__).resolve().parent.parent / "config" / "config.json"
+#: Prompt 模板文件路径 / Path to prompt template file
+_PROMPT_FILE_PATH: Path = Path(__file__).resolve().parent / "agt_prompt.txt"
 
 
-def _load_prompt_addendum_from_config() -> str:
-    """从 config.json 的 agt_live.prompt_template 字段加载 prompt。
+def _load_prompt_from_file() -> str:
+    """从 agt_prompt.txt 文件加载 prompt。
 
-    Load prompt template from config.json ``agt_live.prompt_template``.
-    Returns empty string if config is missing or field is empty.
+    Load prompt template from ``agt_prompt.txt``.
+    Returns empty string if file is missing or unreadable.
     """
     try:
-        cfg = json.loads(_CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        template = (cfg or {}).get("agt_live", {}).get("prompt_template", "")
-        if isinstance(template, str) and (stripped := template.strip()):
+        text = _PROMPT_FILE_PATH.read_text(encoding="utf-8")
+        if stripped := text.strip():
             return stripped
     except (OSError, ValueError) as exc:
-        logger.warning("agt live-runner config.json read failed: %s", exc)
+        logger.warning("agt live-runner agt_prompt.txt read failed: %s", exc)
     return ""
 
 
 def _load_prompt_addendum() -> str:
-    """加载 prompt，优先级: 环境变量 > config.json > 代码默认。
+    """加载 prompt，优先级: 环境变量 > agt_prompt.txt 文件 > 代码默认。
 
-    Load prompt addendum with precedence: env var > config.json > code default.
+    Load prompt addendum with precedence: env var > file > code default.
     """
     raw = os.environ.get("AGT_LIVE_PROMPT", "").strip()
     if raw:
         logger.info("agt live-runner prompt loaded from AGT_LIVE_PROMPT env var (%d chars)", len(raw))
         return raw
-    from_cfg = _load_prompt_addendum_from_config()
-    if from_cfg:
-        logger.info("agt live-runner prompt loaded from config.json (%d chars)", len(from_cfg))
-        return from_cfg
+    from_file = _load_prompt_from_file()
+    if from_file:
+        logger.info("agt live-runner prompt loaded from agt_prompt.txt (%d chars)", len(from_file))
+        return from_file
     logger.info("agt live-runner prompt using hardcoded default (%d chars)", len(_DEFAULT_PROMPT_ADDENDUM))
     return _DEFAULT_PROMPT_ADDENDUM
 
