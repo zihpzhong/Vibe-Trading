@@ -3,11 +3,14 @@
 Live-runner sessions (``live-runner:{broker}``) use a reduced tool surface so
 autonomous ticks do not invoke ``read_url``, ``run_swarm``, or other research
 tools that blow tick latency and third-party rate limits.
+
+Prompt 可通过环境变量 ``AGT_LIVE_PROMPT`` 覆盖 / Override via env var.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,7 +41,7 @@ AGT_LIVE_BLOCKED_TOOLS: frozenset[str] = frozenset({
     "backtest",
 })
 
-AGT_LIVE_PROMPT_ADDENDUM = (
+_DEFAULT_PROMPT_ADDENDUM = (
     "\n\n=== AGT LIVE TICK CONSTRAINTS (mandatory) ===\n"
     "- Market data: use ONLY Bitget MCP tools (mcp_bitget_get_account, "
     "mcp_bitget_get_positions, mcp_bitget_get_quotes, mcp_bitget_list_orders) "
@@ -52,6 +55,21 @@ AGT_LIVE_PROMPT_ADDENDUM = (
     "check prices, run_gate to validate, and place an order if gate passes. "
     "Tgt=Flr is NOT a deadlock — orders at Tgt level pass the gate.\n"
 )
+
+
+def _load_prompt_addendum() -> str:
+    """从环境变量 AGT_LIVE_PROMPT 加载 prompt，未设置时使用默认值。
+
+    Load prompt addendum from env var ``AGT_LIVE_PROMPT`` or fall back to default.
+    """
+    raw = os.environ.get("AGT_LIVE_PROMPT", "").strip()
+    if raw:
+        logger.info("agt live-runner prompt loaded from AGT_LIVE_PROMPT env var (%d chars)", len(raw))
+        return raw
+    return _DEFAULT_PROMPT_ADDENDUM
+
+
+AGT_LIVE_PROMPT_ADDENDUM = _load_prompt_addendum()
 
 
 def is_live_runner_session_title(title: str | None) -> bool:
