@@ -691,6 +691,7 @@ def _patch_api_server_surfaces() -> None:
                 market_watch_ms=watch_ms,
             )
             runner_holder["runner"] = runner
+            _schedule_bitget_watchdog(broker, runner_holder)
             logger.info(
                 "bitget LiveRunner market_watch_ms=%d (%.1f min/tick)",
                 watch_ms,
@@ -699,6 +700,49 @@ def _patch_api_server_surfaces() -> None:
             return runner
 
         mod._runner_factory = _bitget_runner_factory
+
+
+#: module-level registry of running watchdogs so they aren't garbage-collected.
+_BITGET_WATCHDOGS: dict[str, object] = {}
+
+
+def _schedule_bitget_watchdog(broker: str, runner_holder: dict) -> None:
+    """Schedule a background watchdog that auto-restarts the runner if it dies.
+
+    上游 LiveRunner 的 run_loop() 是同步函数，启动 scheduler 后立即返回。FastAPI
+    event loop 上 task 立即 done，runner 引用可能被 GC 掉。Watchdog 定期
+    检查 is_runner_alive()，心跳过期时自动重新 start runner。
+    """
+    import asyncio
+
+    from src.live.runtime import liveness
+
+    runner = runner_holder.get("runner")
+    runner_id = getattr(runner, "runner_id", None) or broker
+
+    async def _watchdog_loop() -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                if not liveness.is_runner_alive(runner_id):
+                    logger.warning(
+                        "bitget watchdog: runner %s heartbeat stale — restarting",
+                        runner_id,
+                    )
+                    if getattr(runner, "_scheduler", None) is not None:
+                        runner._scheduler.start()
+            except Exception as exc:
+                logger.warning("bitget watchdog error: %s", exc)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    if broker in _BITGET_WATCHDOGS:
+        return
+    _BITGET_WATCHDOGS[broker] = loop.create_task(_watchdog_loop(), name=f"bitget-watchdog-{broker}")
+    logger.info("bitget runner watchdog scheduled for %s", broker)
 
 
 def _unwrap(read_fn):  # type: ignore[no-untyped-def]
