@@ -101,7 +101,7 @@ def _is_one_way_mode_error(exc: Exception) -> bool:
     40774 = "unilateral position" — one-way mode 与订单参数冲突 / Order params disagree
     """
     text = _bitget_error_text(exc).lower()
-    return "40774" in text or "40773" in text or "unilateral position" in text
+    return "40773" in text or "unilateral position" in text
 
 
 # ---------------------------------------------------------------------------

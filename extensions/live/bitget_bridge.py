@@ -97,8 +97,9 @@ def patch_upstream() -> None:
 
     Patches:
 
-    1. ``registry.is_live_broker`` — ``"bitget"`` → live broker.
-    2. ``registry._BROKER_CURATED_MAPS`` — classification map.
+    1. ``trading.service.broker_supports_live_runner`` — upstream v2 profiles check.
+    2. ``registry.is_live_broker`` — ``"bitget"`` → live broker.
+    3. ``registry._BROKER_CURATED_MAPS`` — classification map.
     4. ``extractors.BROKER_EXTRACTORS`` — order intent extractor.
     5. ``schema.is_live_broker_entry`` — config-load wildcard rejection.
     6. ``api_server._known_live_brokers`` / ``_oauth_token_present`` — when loaded.
@@ -114,7 +115,7 @@ def patch_upstream() -> None:
     # 1. Patch broker_supports_live_runner (upstream v2 profiles check).
     _patch_broker_supports_live_runner()
 
-    # 1. Patch is_live_broker (LIVE_BROKER_SERVER_KEYS is an immutable frozenset).
+    # 2. Patch is_live_broker (LIVE_BROKER_SERVER_KEYS is an immutable frozenset).
     _original_is_live = _registry.is_live_broker
 
     def _patched_is_live(server_name: str, url: str = "") -> bool:
@@ -153,7 +154,8 @@ def patch_upstream() -> None:
     _patch_agt_live_tool_filter()
 
     # 9. API / status surfaces (import api_server when already running as serve).
-    _patch_api_server_surfaces()
+    if "api_server" in sys.modules:
+        _patch_api_server_surfaces()
     if "api_server" not in sys.modules:
         try:
             import api_server  # noqa: F401

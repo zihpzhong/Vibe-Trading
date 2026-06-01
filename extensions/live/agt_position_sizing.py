@@ -519,17 +519,11 @@ def _sizing_gate(plan: EntrySizePlan) -> str:
     RED → do not enter (edge negative or conviction too low).
     """
     k = plan.kelly
-    can_enter = (
-        k.edge_positive
-        and plan.conviction_multiplier > 0
-        and plan.notional_target_usdt >= plan.notional_min_usdt
-        and plan.notional_min_usdt > 0
-    )
-    if can_enter:
+    if not k.edge_positive or plan.conviction_multiplier <= 0:
+        return "RED edge=NEG or conviction=0—do not enter"
+    if plan.notional_target_usdt >= plan.notional_min_usdt and plan.notional_min_usdt > 0:
         return f"GREEN Tgt={plan.notional_target_usdt:.1f}≥Flr={plan.notional_min_usdt:.1f} OK—gate PASS, consider entry"
-    if k.edge_positive and plan.notional_target_usdt < plan.notional_min_usdt:
-        return f"YELLOW Tgt={plan.notional_target_usdt:.1f}<Flr={plan.notional_min_usdt:.1f}—tight, evaluate"
-    return "RED edge=NEG or conviction=0—do not enter"
+    return f"YELLOW Tgt={plan.notional_target_usdt:.1f}<Flr={plan.notional_min_usdt:.1f}—tight, evaluate"
 
 
 def format_sizing_prompt_block(plan: EntrySizePlan) -> str:
