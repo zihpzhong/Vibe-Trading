@@ -28,6 +28,7 @@ class LiveTradingTool(BaseTool):
     """实盘交易执行门禁、ATR 止损、自动调度、持仓管理与 TP/SL 守护."""
 
     name = "live_trading"
+    repeatable = True  # 允许同 tick 内调用不同 action（如 run_gate → run_once）
     description = (
         "Live trading execution gate, ATR stop calculation, automated trading scheduler, "
         "position management, and TP/SL monitoring. Supports 8 actions: run_gate (7 checks: "
