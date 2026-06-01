@@ -32,8 +32,15 @@ _EXTRA_LIVE_KEYS: frozenset[str] = frozenset({"bitget"})
 
 # Sizing snapshot cache — refreshed every N ticks to reduce MCP subprocess + LLM tokens.
 # 缓存 balance/positions 快照，每第 N tick 刷新一次 / refresh every N runner ticks
-_SIZING_CACHE: dict[str, Any] = {"tick_count": 0, "snapshot": None, "adapter": None}
+_SIZING_CACHE: dict[str, Any] = {
+    "tick_count": 0,
+    "snapshot": None,
+    "adapter": None,
+    "mandate_fingerprint": None,  # 监测 mandate 变更后强制刷新 / force refresh on mandate change
+}
 _SIZING_REFRESH_INTERVAL = 5
+#: 连续 refresh 失败超过此阈值时打印高优告警 / Log prominent warning after this many consecutive failures
+_SIZING_STALE_WARN_THRESHOLD = 3
 
 # AGT Runner tick 间隔默认 60s；可用 LIVE_RUNNER_MARKET_WATCH_MS 覆盖 / override via env
 _DEFAULT_RUNNER_MARKET_WATCH_MS = 60_000
@@ -154,6 +161,9 @@ def patch_upstream() -> None:
         except ImportError:
             pass
 
+    # Patch reconcile audit to include delta details.
+    _patch_reconcile_audit_error()
+
     logger.info("bitget live broker registered (upstream patched at runtime)")
 
 
@@ -250,7 +260,7 @@ def _patch_order_guard_read_first() -> None:
     logger.info("bitget order_guard._read_first patched to unwrap MCP envelopes")
 
 
-def _bitget_mcp_config(*, tool_timeout: int = 20) -> Any:
+def _bitget_mcp_config(*, tool_timeout: int = 30) -> Any:
     """Build a standard Bitget MCP server config (shared by sizing + runner)."""
     from src.config.schema import MCPServerConfig
 
@@ -293,7 +303,17 @@ def _maybe_refresh_sizing() -> tuple[Any | None, Any | None]:
             positions = _unwrap(lambda: adapter.call_tool("get_positions", {}))()
             _SIZING_CACHE["snapshot"] = (balance, positions)
         except Exception as exc:
-            logger.debug("sizing snapshot refresh failed: %s", exc)
+            _SIZING_CACHE["stale_count"] = _SIZING_CACHE.get("stale_count", 0) + 1
+            stale = _SIZING_CACHE["stale_count"]
+            if stale >= _SIZING_STALE_WARN_THRESHOLD:
+                logger.warning(
+                    "SIZING SNAPSHOT STALE (%d consecutive failures) — data may be inaccurate; "
+                    "check Bitget MCP subprocess: %s",
+                    stale,
+                    exc,
+                )
+            else:
+                logger.warning("sizing snapshot refresh failed: %s", exc)
             _invalidate_sizing_adapter()
             # 失败时保留旧快照 / keep stale snapshot on failure
     _SIZING_CACHE["tick_count"] = tick + 1
@@ -322,6 +342,15 @@ def _patch_runner_prompt() -> None:
         if broker.strip().lower() != "bitget":
             return base
         caps = mandate.hard_caps
+        # 监测 mandate 变更，强制刷新 sizing cache / Force refresh on mandate change
+        fp = (
+            f"{caps.max_order_notional_usd}|{caps.max_total_exposure_usd}|"
+            f"{caps.account_funding_usd}|{caps.max_leverage}|{caps.max_trades_per_day}"
+        )
+        if _SIZING_CACHE.get("mandate_fingerprint") is not None and _SIZING_CACHE["mandate_fingerprint"] != fp:
+            logger.warning("mandate changed — forcing sizing cache refresh")
+            _SIZING_CACHE["snapshot"] = None
+        _SIZING_CACHE["mandate_fingerprint"] = fp
         balance, positions = _maybe_refresh_sizing()
         plan = plan_from_account_snapshot(
             balance if isinstance(balance, dict) else None,
@@ -483,6 +512,71 @@ def _patch_order_guard_sizing() -> None:
 
     _og.LiveOrderGuardTool.execute = _execute_with_sizing_inner  # type: ignore[assignment]
     logger.info("bitget order_guard patched with AGT min-notional sizing floor")
+
+
+def _patch_reconcile_audit_error() -> None:
+    """Patch ``LiveRunner._run_reconcile`` to include halting delta details in audit error field.
+
+    当 reconcile 识别到 unsafe/ambiguous 状态时，将具体的 delta 详情（哪个交易对、
+    什么类型的冲突）写入 audit record 的 error 字段，便于线上排查。
+    """
+    from src.live.runtime import runner as _run_mod
+    from src.live.runtime.runner import TickResult, TICK_RECONCILE_ERROR, TICK_RECONCILE_UNSAFE
+    from src.live.runtime.reconcile import _HALTING_KINDS
+
+    if getattr(_run_mod.LiveRunner, "_reconcile_audit_patched", False):
+        return
+
+    _orig_run_reconcile = _run_mod.LiveRunner._run_reconcile
+
+    def _run_reconcile_with_audit_error(self) -> dict | None:
+        """Wrapped reconcile with delta details in audit error field."""
+        try:
+            report = self._reconcile_fn(
+                self.broker,
+                self._read_positions,
+                self._read_balance,
+                self._read_open_orders,
+            )
+        except Exception as exc:
+            logger.warning("live reconcile failed for %s: %s", self.broker, exc)
+            audit_id = self._audit(
+                kind="breach",
+                outcome="blocked",
+                intent="reconcile failed — tick aborted (fail-closed)",
+                error=str(exc),
+            )
+            return TickResult(
+                outcome=TICK_RECONCILE_ERROR,
+                broker=self.broker,
+                reason="reconcile raised; tick aborted",
+                audit_id=audit_id,
+            ).to_dict()
+
+        if self._report_unsafe(report):
+            halt_deltas = [d for d in report.deltas if d.kind in _HALTING_KINDS]
+            error_detail = "; ".join(
+                f"{d.kind}: {d.subject}[{d.identity}] — {d.detail}"
+                for d in halt_deltas
+            ) if halt_deltas else "unsafe reconcile (no halting deltas)"
+            logger.warning("reconcile unsafe for %s: %s", self.broker, error_detail)
+            audit_id = self._audit(
+                kind="breach",
+                outcome="blocked",
+                intent="reconcile flagged unsafe/ambiguous — no auto-resend",
+                error=error_detail,
+            )
+            return TickResult(
+                outcome=TICK_RECONCILE_UNSAFE,
+                broker=self.broker,
+                reason="reconcile flagged unsafe/ambiguous broker state",
+                audit_id=audit_id,
+            ).to_dict()
+        return None
+
+    _run_mod.LiveRunner._run_reconcile = _run_reconcile_with_audit_error  # type: ignore[assignment]
+    _run_mod.LiveRunner._reconcile_audit_patched = True
+    logger.info("reconcile audit error detail patched for all brokers")
 
 
 def _patch_api_server_surfaces() -> None:

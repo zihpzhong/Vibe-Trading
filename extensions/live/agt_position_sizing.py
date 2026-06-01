@@ -521,17 +521,17 @@ def format_sizing_prompt_block(plan: EntrySizePlan) -> str:
         "\n\n[SIZING] "
         f"Eq={plan.equity_usdt:.0f} Avail={plan.available_usdt:.0f} "
         f"Expo={plan.exposure_notional_usdt:.0f} "
-        f"Head={plan.exposure_headroom_usdt:.0f} Open={plan.open_positions} | "
+        f"Head={plan.exposure_headroom_usdt:.1f} Open={plan.open_positions} | "
         f"f*={k.kelly_full:.1%} WR={k.win_rate:.0%} "
         f"Payoff={k.payoff_ratio:.2f}(n={st.sample_size} {st.source}) | "
         f"Mgn={k.margin_pct:.1%} Flr={k.floor_margin_pct:.1%} | "
         f"Edge={edge_tag} Conv={plan.conviction_score:.0f}/10 "
         f"(×{plan.conviction_multiplier:.2f}) | "
-        f"Tgt=${plan.notional_target_usdt:.0f} "
-        f"Flr=${plan.notional_min_usdt:.0f} "
-        f"Ceil=${plan.notional_max_usdt:.0f} "
+        f"Tgt=${plan.notional_target_usdt:.1f} "
+        f"Flr=${plan.notional_min_usdt:.1f} "
+        f"Ceil=${plan.notional_max_usdt:.1f} "
         f"Lev={plan.recommended_leverage:.0f}X | "
-        "Edge=NEG→no new longs; notional<Flr→rejected"
+        f"Edge={edge_tag}→no new longs; notional<Flr→rejected"
     )
 
 
