@@ -99,7 +99,6 @@ def patch_upstream() -> None:
 
     1. ``registry.is_live_broker`` — ``"bitget"`` → live broker.
     2. ``registry._BROKER_CURATED_MAPS`` — classification map.
-    3. ``registry._HOST_SUFFIX_TO_BROKER`` — host suffix (reserved).
     4. ``extractors.BROKER_EXTRACTORS`` — order intent extractor.
     5. ``schema.is_live_broker_entry`` — config-load wildcard rejection.
     6. ``api_server._known_live_brokers`` / ``_oauth_token_present`` — when loaded.
@@ -128,7 +127,6 @@ def patch_upstream() -> None:
     _registry._BROKER_CURATED_MAPS["bitget"] = BITGET_TOOL_CLASS
 
     # 3. URL host suffix (future HTTP transport).
-    _registry._HOST_SUFFIX_TO_BROKER["bitget.com"] = "bitget"
 
     # 4. Order-intent extractor.
     from extensions.live.bitget_extractor import extract_order_intent
