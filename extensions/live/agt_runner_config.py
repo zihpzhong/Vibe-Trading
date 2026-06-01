@@ -48,6 +48,9 @@ AGT_LIVE_PROMPT_ADDENDUM = (
     "- Do NOT load okx-market or other exchange REST skills for price data.\n"
     "- If mandate caps block new orders, HOLD quickly — do not spawn research "
     "sub-agents or bulk URL fetches.\n"
+    "- Signal: When SIZING shows SIGNAL=GREEN, you SHOULD use get_quotes to "
+    "check prices, run_gate to validate, and place an order if gate passes. "
+    "Tgt=Flr is NOT a deadlock — orders at Tgt level pass the gate.\n"
 )
 
 

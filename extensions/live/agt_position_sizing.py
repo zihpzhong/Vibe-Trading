@@ -511,6 +511,27 @@ def validate_entry_notional(
     return None
 
 
+def _sizing_gate(plan: EntrySizePlan) -> str:
+    """Return a one-word gate signal + short explainer for the agent.
+
+    GREEN → agent should consider entering (edge positive, target ≥ floor).
+    YELLOW → tight allocation but still possible.
+    RED → do not enter (edge negative or conviction too low).
+    """
+    k = plan.kelly
+    can_enter = (
+        k.edge_positive
+        and plan.conviction_multiplier > 0
+        and plan.notional_target_usdt >= plan.notional_min_usdt
+        and plan.notional_min_usdt > 0
+    )
+    if can_enter:
+        return f"GREEN Tgt={plan.notional_target_usdt:.1f}≥Flr={plan.notional_min_usdt:.1f} OK—gate PASS, consider entry"
+    if k.edge_positive and plan.notional_target_usdt < plan.notional_min_usdt:
+        return f"YELLOW Tgt={plan.notional_target_usdt:.1f}<Flr={plan.notional_min_usdt:.1f}—tight, evaluate"
+    return "RED edge=NEG or conviction=0—do not enter"
+
+
 def format_sizing_prompt_block(plan: EntrySizePlan) -> str:
     """Compact Kelly sizing block — all numbers, minimal labels (~100 tokens)."""
     k = plan.kelly
@@ -532,6 +553,7 @@ def format_sizing_prompt_block(plan: EntrySizePlan) -> str:
         f"Ceil=${plan.notional_max_usdt:.1f} "
         f"Lev={plan.recommended_leverage:.0f}X | "
         f"Edge={edge_tag}→{'ok to enter' if k.edge_positive else 'no new longs'}; notional<Flr→rejected"
+        f"\nSIGNAL={_sizing_gate(plan)}"
     )
 
 
