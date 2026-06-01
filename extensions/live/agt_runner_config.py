@@ -59,9 +59,8 @@ _DEFAULT_PROMPT_ADDENDUM = (
 )
 
 
-def _config_json_path() -> Path:
-    """Return path to extensions/config/config.json."""
-    return Path(__file__).resolve().parent.parent / "config" / "config.json"
+#: 配置文件路径 / Config file path
+_CONFIG_JSON_PATH: Path = Path(__file__).resolve().parent.parent / "config" / "config.json"
 
 
 def _load_prompt_addendum_from_config() -> str:
@@ -70,14 +69,11 @@ def _load_prompt_addendum_from_config() -> str:
     Load prompt template from config.json ``agt_live.prompt_template``.
     Returns empty string if config is missing or field is empty.
     """
-    path = _config_json_path()
-    if not path.is_file():
-        return ""
     try:
-        cfg = json.loads(path.read_text(encoding="utf-8"))
+        cfg = json.loads(_CONFIG_JSON_PATH.read_text(encoding="utf-8"))
         template = (cfg or {}).get("agt_live", {}).get("prompt_template", "")
-        if isinstance(template, str) and template.strip():
-            return template.strip()
+        if isinstance(template, str) and (stripped := template.strip()):
+            return stripped
     except (OSError, ValueError) as exc:
         logger.warning("agt live-runner config.json read failed: %s", exc)
     return ""
