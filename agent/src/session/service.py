@@ -124,6 +124,17 @@ class SessionService:
         asyncio.create_task(self._run_attempt(session, attempt, include_shell_tools=include_shell_tools))
         return {"message_id": message.message_id, "attempt_id": attempt.attempt_id}
 
+    def append_message(self, session_id: str, role: str, content: str) -> None:
+        """Append a message to session history (used by AgentLoop for goal continuation persistence).
+
+        Args:
+            session_id: Session ID.
+            role: Message role (e.g., "user", "assistant").
+            content: Message content.
+        """
+        message = Message(session_id=session_id, role=role, content=content)
+        self.store.append_message(message)
+
     def get_messages(self, session_id: str, limit: int = 100) -> list[Message]:
         """Return the message history."""
         return self.store.get_messages(session_id, limit)
@@ -257,6 +268,8 @@ class SessionService:
             max_iterations=50,
             persistent_memory=pm,
         )
+        # 注入 session_service 以支持 goal 续写消息持久化
+        agent.set_session_service(self)
         self._active_loops[session_id] = agent
 
         # Build the message history context.

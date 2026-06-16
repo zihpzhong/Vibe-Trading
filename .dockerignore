@@ -29,6 +29,9 @@ agent/.tasks/
 # Env files (mounted via docker-compose env_file)
 .env
 agent/.env
+agent/.env.agt
+agent/.env.aut
+extensions/config/.env.local
 
 # Frontend build (built inside Docker, don't copy local)
 frontend/dist/

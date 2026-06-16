@@ -2,6 +2,9 @@
 # Stage 1: Build frontend
 # ============================================================================
 FROM node:20-slim AS frontend-build
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
@@ -13,6 +16,9 @@ RUN npm run build
 # Stage 2: Python runtime
 # ============================================================================
 FROM python:3.11-slim AS runtime
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 LABEL org.opencontainers.image.title="Vibe-Trading" \
     org.opencontainers.image.description="Natural-language finance research AI agent with backtesting" \
@@ -34,6 +40,7 @@ RUN pip install --no-cache-dir -r agent/requirements.txt
 # Copy project
 COPY pyproject.toml LICENSE README.md ./
 COPY agent/ agent/
+COPY extensions/ extensions/
 
 # Copy built frontend
 COPY --from=frontend-build /app/frontend/dist frontend/dist

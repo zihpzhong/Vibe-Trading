@@ -10,7 +10,9 @@ agent/.env
 .claude/*
 !.claude/hooks.json
 CLAUDE.md
+.DS_Store
 .vscode/
+.idea/
 learn-claude-code-main/
 agent/sessions/
 agent/runs/
@@ -31,6 +33,7 @@ wiki/.cache/
 .vibe-record/
 .cache/
 .remotion/
+.omc/
 
 # DuckDB data cache
 data/*.duckdb
@@ -39,8 +42,13 @@ data/.duckdb_tmp/
 data/parquet/
 data/backup/
 
-# Internal docs (plans, specs)
-docs/
+# Internal docs (plans, specs) — docs/* 保留目录以便 ! 例外生效 / keep dir for negation rules
+docs/*
+!docs/auto-trading-plan.md
+!docs/extension-guide.md
+!docs/project-overview.md
+!docs/crypto-live-optimization-plan.md
+!docs/bitget-mcp-live-broker-plan.md
 !wiki/docs/
 !wiki/docs/**
 docs/screenshots/agent-run.png
@@ -57,7 +65,7 @@ dist/
 build/
 
 # Local demo videos (too large for git; link to external host instead)
-assets/*.mp4
+assets/
 
 # Local demo / promo production workspace
 demo/
@@ -79,3 +87,18 @@ AGENTS.md
 # Alpha Zoo wiki artifacts (generated, not source)
 wiki/alpha-library/manifest.json
 wiki/alpha-library/content/
+
+# Custom extensions - local config (never commit real secrets)
+extensions/config/.env.local
+extensions/.cache_astock/
+extensions/.cache_crypto/
+extensions/ext_cli/.cache_crypto/
+trading.db
+claudedocs/
+.deepseek/
+.cursor/
+.codegraph/uv.lock
+
+# Bitget account-specific env files
+agent/.env.agt
+agent/.env.aut

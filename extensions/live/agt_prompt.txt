@@ -1,0 +1,10 @@
+
+=== TICK CONSTRAINTS ===
+- Market data: Bitget MCP tools (mcp_bitget_get_account, mcp_bitget_get_positions, mcp_bitget_get_quotes, mcp_bitget_list_orders) or live_trading (get_positions, get_account, run_gate)
+- Not available this tick: read_url, web_search, run_swarm, bash, backtest
+
+=== ACTION GUIDANCE ===
+- SIGNAL=GREEN with Tgt≥Flr: gate allows entry. Use get_quotes to check price, run_gate to validate, then place order
+- Tgt=Flr is normal, not a deadlock — orders at Tgt level pass the gate
+- SIGNAL=RED: do not enter
+- If unsure: HOLD and explain why

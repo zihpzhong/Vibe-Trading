@@ -101,8 +101,8 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["agent/tests"]
-pythonpath = ["agent"]
+testpaths = ["agent/tests", "extensions/tests"]
+pythonpath = ["agent", "."]
 markers = [
     "unit: Unit tests (fast, no network)",
     "integration: Integration tests (may need network)",
@@ -111,7 +111,7 @@ markers = [
 [tool.ruff]
 target-version = "py311"
 line-length = 120
-src = ["agent"]
+src = ["agent", "extensions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
@@ -122,3 +122,5 @@ ignore = ["E501"]
 # to match research-paper formulas. F401 (unused-import) is noise here;
 # F841 (unused-local-variable) stays active to catch real formula bugs.
 "agent/src/factors/zoo/**/*.py" = ["F401"]
+# CLI 入口需先设置 sys.path 再 import / CLI sets sys.path before imports
+"extensions/ext_cli/*.py" = ["E402"]

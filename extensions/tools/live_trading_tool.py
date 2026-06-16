@@ -1,0 +1,354 @@
+"""Live Trading tool for the ReAct Agent.
+
+Wraps Execution Gate, ATR stop, exchange data, trading scheduler,
+position tracker, and TPSL monitor into BaseTool for automatic
+registration via ext_bridge.py.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+from typing import Any, Optional
+
+from src.agent.tools import BaseTool
+
+from extensions.trading.crypto.config import LiveTradingConfig
+from extensions.trading.crypto.models import LiveSignal, SignalDirection
+from extensions.trading.crypto.live.execution_gate import ExecGateEngine
+from extensions.trading.crypto.live.atr_stop import calculate_atr_stop
+from extensions.trading.crypto.live.exchange import create_exchange
+from extensions.trading.crypto.live.scheduler import TradingScheduler
+from extensions.trading.crypto.live.position_tracker import PositionTracker
+from extensions.trading.crypto.live.tpsl_monitor import TPSLMonitor
+
+
+class LiveTradingTool(BaseTool):
+    """实盘交易执行门禁、ATR 止损、自动调度、持仓管理与 TP/SL 守护."""
+
+    name = "live_trading"
+    repeatable = True  # 允许同 tick 内调用不同 action（如 run_gate → run_once）
+    description = (
+        "Live trading execution gate, ATR stop calculation, automated trading scheduler, "
+        "position management, and TP/SL monitoring. Supports 8 actions: run_gate (7 checks: "
+        "PASS/WATCH_ONLY/REJECT), calculate_stop (ATR stop price), run_once (full scheduler "
+        "cycle: BTC check, scan, tiered decisions), get_positions (list active positions), "
+        "close_position (close a position), get_account (account info), start_monitor (TP/SL "
+        "monitor background thread), stop_monitor (stop TP/SL monitor)."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "run_gate",
+                    "calculate_stop",
+                    "run_once",
+                    "get_positions",
+                    "close_position",
+                    "get_account",
+                    "start_monitor",
+                    "stop_monitor",
+                ],
+                "description": (
+                    "Action to perform: "
+                    "run_gate (execute all 7 gate checks -> PASS/WATCH_ONLY/REJECT), "
+                    "calculate_stop (ATR-based stop price), "
+                    "run_once (execute automated scheduler cycle: BTC conduction -> Phase 1 scan -> tiered decisions), "
+                    "get_positions (list all active positions), "
+                    "close_position (close a position by symbol), "
+                    "get_account (get account balance, active count, exposure), "
+                    "start_monitor (start background TP/SL monitoring thread), "
+                    "stop_monitor (stop background TP/SL monitoring thread)"
+                ),
+            },
+            "symbol": {
+                "type": "string",
+                "description": "Trading symbol, e.g. BTCUSDT",
+            },
+            "direction": {
+                "type": "string",
+                "enum": ["LONG", "SHORT"],
+                "description": "Trade direction",
+            },
+            "score": {
+                "type": "integer",
+                "description": "Signal score from Phase 1 (0-10)",
+            },
+            "entry_price": {
+                "type": "number",
+                "description": "Entry price (required for calculate_stop, optional for run_gate)",
+            },
+            "stop_loss": {
+                "type": "number",
+                "description": "Optional pre-defined stop loss",
+            },
+            "target_price": {
+                "type": "number",
+                "description": "Optional first target price for R:R calculation",
+            },
+            "funding_rate": {
+                "type": "number",
+                "description": "Current funding rate (decimal)",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["default", "conservative"],
+                "description": "Risk mode for ATR multiplier",
+            },
+            "order_qty": {
+                "type": "number",
+                "description": "Expected order quantity in base asset (for orderbook impact check). 0 = skip.",
+            },
+            "account_balance": {
+                "type": "number",
+                "description": "Account USDT balance (for position cap check). 0 = skip.",
+            },
+            "order_margin": {
+                "type": "number",
+                "description": "Margin allocated to the position in USDT (for position cap check). 0 = fallback to notional.",
+            },
+        "mock": {
+                "type": "boolean",
+                "description": "Use mock exchange (default: true). Set to false for real trading.",
+            },
+            "exchange_name": {
+                "type": "string",
+                "enum": ["binance", "bitget"],
+                "description": "Exchange to use (default: binance). Only used when mock=False.",
+            },
+        },
+        "required": ["action"],
+    }
+    is_readonly = False
+
+    def __init__(self, mock: bool = True, pair_whitelist: Optional[list[str]] = None, exchange_name: Optional[str] = None) -> None:
+        self._mock = mock
+        self._exchange_name = exchange_name or os.environ.get("CRYPTO_EXCHANGE", "binance")
+        self._whitelist: Optional[list[str]] = pair_whitelist
+        self._exchange: Optional[Any] = None
+        self._positions: Optional[PositionTracker] = None
+        self._monitor: Optional[TPSLMonitor] = None
+
+    def _get_exchange(self):
+        """Lazy-init exchange instance."""
+        if self._exchange is None:
+            self._exchange = create_exchange(mock=self._mock, exchange_name=self._exchange_name)
+            if self._exchange_name != "binance" and hasattr(self._exchange, "validate_symbols") and self._whitelist:
+                self._whitelist = self._exchange.validate_symbols(self._whitelist)
+        return self._exchange
+
+    @classmethod
+    def check_available(cls) -> bool:
+        return True
+
+    def execute(self, **kwargs: Any) -> str:
+        action = kwargs.get("action", "")
+        symbol = kwargs.get("symbol", "")
+
+        # Allow the schema-level mock flag to select exchange mode before the
+        # lazy exchange instance is created. Refuse unsafe mid-session swaps.
+        if "mock" in kwargs:
+            requested_mock = bool(kwargs["mock"])
+            if self._exchange is not None and requested_mock != self._mock:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Cannot change mock mode after exchange initialization",
+                })
+            self._mock = requested_mock
+
+        # Per-action parameter validation
+        if not action:
+            return json.dumps({"status": "error", "message": "Missing required field: action"})
+        if action in ("run_gate", "calculate_stop") and not symbol:
+            return json.dumps({"status": "error", "message": "Missing required field: symbol"})
+        if action in ("run_gate", "calculate_stop") and not kwargs.get("direction"):
+            return json.dumps({"status": "error", "message": "Missing required field: direction"})
+        if action == "close_position" and not symbol:
+            return json.dumps({"status": "error", "message": "Missing required field: symbol"})
+
+        # --- Whitelist guard: reject non-whitelisted symbols at the gate ---
+        if action in ("run_gate",) and symbol and not self._is_whitelisted(symbol):
+            return json.dumps({
+                "status": "rejected",
+                "summary": f"{symbol} is not in trading whitelist",
+            }, ensure_ascii=False)
+
+        if action == "run_gate":
+            direction = SignalDirection(kwargs["direction"])
+            return self._run_gate(symbol, direction, kwargs)
+        elif action == "calculate_stop":
+            direction = SignalDirection(kwargs["direction"])
+            return self._calc_stop(symbol, direction, kwargs)
+        elif action == "run_once":
+            return self._run_once()
+        elif action == "get_positions":
+            return self._get_positions_action()
+        elif action == "close_position":
+            return self._close_position(symbol)
+        elif action == "get_account":
+            return self._get_account()
+        elif action == "start_monitor":
+            return self._start_monitor()
+        elif action == "stop_monitor":
+            return self._stop_monitor()
+        else:
+            return json.dumps({"status": "error", "message": f"Unknown action: {action}"})
+
+    def _run_gate(self, symbol: str, direction: SignalDirection, kwargs: dict) -> str:
+        score = kwargs.get("score", 5)
+        entry_price = kwargs.get("entry_price")
+        stop_loss = kwargs.get("stop_loss")
+        target_price = kwargs.get("target_price")
+        funding_rate = kwargs.get("funding_rate", 0.0)
+
+        signal = LiveSignal(
+            symbol=symbol,
+            direction=direction,
+            score=score,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            target_prices=[target_price] if target_price else [],
+            conviction="MEDIUM" if score >= 5 else "LOW",
+        )
+
+        # Use real or mock exchange for data
+        exchange = self._get_exchange()
+        ticker = exchange.get_ticker(symbol)
+        orderbook = exchange.get_orderbook(symbol)
+        mode = kwargs.get("mode", "default")
+        config = LiveTradingConfig.conservative() if mode == "conservative" else LiveTradingConfig()
+
+        order_qty = kwargs.get("order_qty", 0.0)
+        account_balance = kwargs.get("account_balance", 0.0)
+        order_margin = kwargs.get("order_margin", 0.0)
+        engine = ExecGateEngine(config)
+        result = engine.run_gate(
+            signal, ticker=ticker, funding_rate=funding_rate,
+            orderbook=orderbook, order_qty=order_qty,
+            account_balance=account_balance, order_margin=order_margin,
+            whitelist=self._whitelist,
+        )
+
+        return json.dumps({
+            "status": result.status.value,
+            "summary": result.summary,
+            "checks": [
+                {"name": c.name, "passed": c.passed, "detail": c.detail}
+                for c in result.checks
+            ],
+            "passed": len(result.passed_checks),
+            "failed": len(result.failed_checks),
+        }, ensure_ascii=False)
+
+    def _calc_stop(self, symbol: str, direction: SignalDirection, kwargs: dict) -> str:
+        entry_price = kwargs.get("entry_price")
+        if not entry_price:
+            return json.dumps({"status": "error", "message": "entry_price required"})
+
+        exchange = self._get_exchange()
+        kline = exchange.get_kline(symbol, "1h", 50)
+        conservative = kwargs.get("mode") == "conservative"
+
+        stop_price, atr_value = calculate_atr_stop(kline, direction, entry_price, conservative=conservative)
+
+        result = {
+            "stop_price": stop_price,
+            "atr_value": atr_value,
+            "distance_pct": round(abs(entry_price - stop_price) / entry_price * 100, 2),
+        }
+        return json.dumps(result, ensure_ascii=False)
+
+    # ------------------------------------------------------------------
+    # Lazy-init helpers
+    # ------------------------------------------------------------------
+
+    def _get_positions(self) -> PositionTracker:
+        """Lazy-init PositionTracker singleton."""
+        if self._positions is None:
+            self._positions = PositionTracker()
+        return self._positions
+
+    # ------------------------------------------------------------------
+    # New actions: automated scheduler
+    # ------------------------------------------------------------------
+
+    def _run_once(self) -> str:
+        """Execute one full scheduler cycle: BTC check, Phase 1 scan, tiered decisions."""
+        exchange = self._get_exchange()
+        positions = self._get_positions()
+        scheduler = TradingScheduler(exchange, positions, trading_enabled=True)
+        report = scheduler.run_once(whitelist=self._whitelist)
+        return json.dumps({
+            "rankings": report.rankings,
+            "phase2_requests": [dataclasses.asdict(r) for r in report.phase2_requests],
+            "watchlist": report.watchlist,
+            "btc_status": report.btc_status,
+            "active_positions": report.active_positions,
+            "scan_time_ms": report.scan_time_ms,
+        }, ensure_ascii=False)
+
+    # ------------------------------------------------------------------
+    # New actions: position management
+    # ------------------------------------------------------------------
+
+    def _get_positions_action(self) -> str:
+        """Return JSON list of active positions."""
+        positions = self._get_positions().get_active_positions()
+        return json.dumps([p.to_dict() for p in positions], ensure_ascii=False)
+
+    def _close_position(self, symbol: str) -> str:
+        """Close a position by symbol."""
+        if not symbol:
+            return json.dumps({"closed": None, "success": False})
+        pos = self._get_positions().close_position(symbol)
+        if pos:
+            return json.dumps({"closed": symbol, "success": True})
+        return json.dumps({"closed": None, "success": False})
+
+    def _get_account(self) -> str:
+        """Return account info: balance, active count, exposure."""
+        positions = self._get_positions()
+        return json.dumps({
+            "account_balance": positions.account_balance,
+            "active_count": positions.active_count,
+            "exposure": positions.get_exposure(),
+        })
+
+    # ------------------------------------------------------------------
+    # Whitslist enforcement
+    # ------------------------------------------------------------------
+
+    def _is_whitelisted(self, symbol: str) -> bool:
+        """Check if a symbol is in the trading whitelist.
+
+        Returns ``True`` when no whitelist is configured (allow all).
+        """
+        if not self._whitelist:
+            return True
+        base = symbol.upper().removesuffix("USDT")
+        return base in {w.upper().removesuffix("USDT") for w in self._whitelist}
+
+    # ------------------------------------------------------------------
+    # New actions: TP/SL monitor lifecycle
+    # ------------------------------------------------------------------
+
+    def _start_monitor(self) -> str:
+        """Start background TP/SL monitoring thread."""
+        if self._monitor is not None and self._monitor.is_alive():
+            return json.dumps({"status": "already_running"})
+        exchange = self._get_exchange()
+        positions = self._get_positions()
+        self._monitor = TPSLMonitor(exchange, positions, poll_interval=5.0)
+        self._monitor.start()
+        return json.dumps({"status": "started"})
+
+    def _stop_monitor(self) -> str:
+        """Stop background TP/SL monitoring thread."""
+        if self._monitor is None:
+            return json.dumps({"status": "not_running"})
+        self._monitor.stop()
+        self._monitor = None
+        return json.dumps({"status": "stopped"})

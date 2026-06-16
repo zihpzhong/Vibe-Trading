@@ -1,0 +1,1219 @@
+"""Position Tracker —持仓生命周期管理与风控.
+
+Manages position state, exposure calculation, cooldown tracking,
+and SQLite persistence. All mutable state is protected by threading.RLock.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import sqlite3
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from threading import RLock
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_PERSIST_DIR = Path.home() / ".vibe-trading"
+# 单次余额同步跌幅 ≥ 此比例视为外部调整（提现/划转/对账），重置 rolling 峰值
+# Treat single-step balance drops ≥ this ratio as external (withdraw/transfer/reconcile)
+ROLLING_EXTERNAL_JUMP_PCT = 0.10
+
+# 合法 symbol 格式：仅含 ASCII 字母/数字/连字符，长度 1-30
+# 用于过滤中文字符等无效 symbol（如历史上的 "币安人生USDT"）
+_VALID_SYMBOL_RE = re.compile(r"^[A-Za-z0-9-]{1,30}$")
+
+
+@dataclass
+class Position:
+    """A single open position."""
+
+    symbol: str
+    direction: str  # "LONG" or "SHORT"
+    entry_price: float
+    quantity: float
+    stop_loss: float
+    take_profit: Optional[float] = None
+    opened_at: str = ""  # ISO 8601
+    dca_count: int = 0  # 已 DCA 加仓次数
+    leverage: int = 1
+    entry_score: int = -1  # 开仓时评分, -1 表示旧数据无评分, 用于分档胜率统计
+    first_entry_cost: float = 0.0  # 首次入场价（永不改变，de-risk 参照系）
+    first_entry_quantity: float = 0.0  # 首次数量（永不改变）
+    de_risk_level: int = 0  # 已触发的最高 de-risk 级别 (0-4)
+    sl_order_id: Optional[str] = None  # 交易所止损单 ID
+    tp_order_id: Optional[str] = None  # 交易所止盈单 ID
+    entry_atr: float = 0.0  # 开仓时 ATR(14) 值，用于 ATR 基础 TP/SL 计算 / ATR at entry for ATR-based TP
+
+    def __post_init__(self) -> None:
+        if not self.opened_at:
+            self.opened_at = datetime.now(timezone.utc).isoformat()
+        # 旧数据兼容：确保 first_entry_cost/quantity 有值
+        if self.first_entry_cost == 0.0:
+            self.first_entry_cost = self.entry_price
+        if self.first_entry_quantity == 0.0:
+            self.first_entry_quantity = self.quantity
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "direction": self.direction,
+            "entry_price": self.entry_price,
+            "quantity": self.quantity,
+            "stop_loss": self.stop_loss,
+            "take_profit": self.take_profit,
+            "opened_at": self.opened_at,
+            "dca_count": self.dca_count,
+            "leverage": self.leverage,
+            "entry_score": self.entry_score,
+            "first_entry_cost": self.first_entry_cost,
+            "first_entry_quantity": self.first_entry_quantity,
+            "de_risk_level": self.de_risk_level,
+            "sl_order_id": self.sl_order_id,
+            "tp_order_id": self.tp_order_id,
+            "entry_atr": self.entry_atr,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Position:
+        return cls(
+            symbol=d["symbol"],
+            direction=d["direction"],
+            entry_price=float(d["entry_price"]),
+            quantity=float(d["quantity"]),
+            stop_loss=float(d.get("stop_loss", 0)),
+            take_profit=float(d["take_profit"]) if d.get("take_profit") is not None else None,
+            opened_at=d.get("opened_at", ""),
+            dca_count=int(d.get("dca_count", 0)),
+            leverage=int(d.get("leverage", 1)),
+            entry_score=int(d.get("entry_score", -1)),
+            first_entry_cost=float(d.get("first_entry_cost", 0.0)),
+            first_entry_quantity=float(d.get("first_entry_quantity", 0.0)),
+            de_risk_level=int(d.get("de_risk_level", 0)),
+            sl_order_id=d.get("sl_order_id") or None,
+            tp_order_id=d.get("tp_order_id") or None,
+            entry_atr=float(d.get("entry_atr", 0.0)),
+        )
+
+
+@dataclass
+class CloseRecord:
+    """A closed position record."""
+
+    symbol: str
+    direction: str
+    entry_price: float
+    exit_price: float
+    quantity: float
+    pnl_usdt: float
+    pnl_pct: float
+    reason: str  # "TP" | "SL" | "MANUAL"
+    opened_at: str = ""
+    closed_at: str = ""
+    dca_count: int = 0
+    leverage: int = 1
+    entry_score: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.closed_at:
+            self.closed_at = datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "direction": self.direction,
+            "entry_price": self.entry_price,
+            "exit_price": self.exit_price,
+            "quantity": self.quantity,
+            "pnl_usdt": self.pnl_usdt,
+            "pnl_pct": self.pnl_pct,
+            "reason": self.reason,
+            "opened_at": self.opened_at,
+            "closed_at": self.closed_at,
+            "dca_count": self.dca_count,
+            "leverage": self.leverage,
+            "entry_score": self.entry_score,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> CloseRecord:
+        return cls(
+            symbol=d["symbol"],
+            direction=d["direction"],
+            entry_price=float(d["entry_price"]),
+            exit_price=float(d["exit_price"]),
+            quantity=float(d["quantity"]),
+            pnl_usdt=float(d["pnl_usdt"]),
+            pnl_pct=float(d["pnl_pct"]),
+            reason=d["reason"],
+            opened_at=d.get("opened_at", ""),
+            closed_at=d.get("closed_at", ""),
+            dca_count=int(d.get("dca_count", 0)),
+            leverage=int(d.get("leverage", 1)),
+            entry_score=int(d.get("entry_score", -1)),
+        )
+
+    def to_trade_record(self):
+        """Convert to backtest TradeRecord for performance metrics."""
+        from agent.backtest.models import TradeRecord
+        import pandas as pd
+
+        direction_int = 1 if self.direction == "LONG" else -1
+        entry_time = pd.Timestamp(self.opened_at) if self.opened_at else pd.Timestamp.now()
+        exit_time = pd.Timestamp(self.closed_at) if self.closed_at else pd.Timestamp.now()
+        # Estimate holding bars (1h bar granularity)
+        delta = exit_time - entry_time
+        holding_bars = max(1, int(delta.total_seconds() / 3600))
+
+        return TradeRecord(
+            symbol=self.symbol,
+            direction=direction_int,
+            entry_price=self.entry_price,
+            exit_price=self.exit_price,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            size=self.quantity,
+            leverage=float(self.leverage),
+            pnl=self.pnl_usdt,
+            pnl_pct=self.pnl_pct,
+            exit_reason=self.reason,
+            holding_bars=holding_bars,
+            commission=0.0,
+        )
+
+
+class PositionTracker:
+    """Manages active positions with thread-safe state and JSON persistence.
+
+    Usage:
+        tracker = PositionTracker(account_balance=10000.0, max_exposure_pct=0.25)
+        if tracker.can_open_new("BTCUSDT")[0]:
+            tracker.open_position(signal, quantity=0.01, stop_loss=63000, take_profit=67000)
+        exposure = tracker.get_exposure()
+        tracker.close_position("BTCUSDT")
+    """
+
+    def __init__(
+        self,
+        account_balance: float = 10_000.0,
+        max_exposure_pct: float = 0.25,
+        max_positions: int = 3,
+        max_same_direction: int = 2,
+        cooldown_minutes: int = 30,
+        persist_dir: Optional[str | Path] = None,
+    ) -> None:
+        self._account_balance = account_balance
+        self._max_exposure_pct = max_exposure_pct
+        self._max_positions = max_positions
+        self._max_same_direction = max_same_direction
+        self._cooldown_minutes = cooldown_minutes
+        base_dir = Path(persist_dir) if persist_dir else _DEFAULT_PERSIST_DIR
+        self._db_path = base_dir / "trading.db"
+        self._lock = RLock()
+        self._positions: dict[str, Position] = {}
+        self._closed: list[CloseRecord] = []  # 已平仓历史
+        self._cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → timestamp
+        self._extended_cooldowns: dict[str, float] = {}  # "SYMBOL:DIRECTION" → expiry_timestamp
+        self._trailing_stops: dict[str, float] = {}
+        self._peak_prices: dict[str, float] = {}
+        self._equity_history: list[dict[str, Any]] = []  # 权益曲线快照
+        self._rolling_peak_balance: float = account_balance  # 24h rolling 回撤基准峰值
+        self._rolling_peak_externally_reset: bool = False
+        self._initial_balance: float = account_balance
+        self._synced_closed_count: int = 0
+        self._synced_equity_count: int = 0
+        self._conn: Optional[sqlite3.Connection] = None
+        # 尝试自动迁移旧 JSON
+        self._maybe_migrate(base_dir)
+        self._init_db()
+        self._load()
+
+    def _maybe_migrate(self, base_dir: Path) -> None:
+        """从旧的 positions.json 自动迁移到 trading.db."""
+        json_path = base_dir / "positions.json"
+        if not json_path.exists():
+            return
+        if self._db_path.exists():
+            return  # DB 已存在，不做迁移
+        try:
+            from extensions.trading.crypto.live.migration import migrate_from_json
+            logger.info("Auto-migrating from %s to %s ...", json_path, self._db_path)
+            migrate_from_json(str(base_dir))
+            logger.info("Auto-migration complete")
+        except Exception as exc:
+            logger.warning("Auto-migration failed (will continue with fresh DB): %s", exc)
+
+    def _init_db(self) -> None:
+        """Initialize SQLite database: create tables, set pragmas."""
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        from extensions.trading.crypto.schema import SCHEMA_SQL
+        self._conn.executescript(SCHEMA_SQL)
+        self._migrate_positions_schema()
+
+    def _migrate_positions_schema(self) -> None:
+        """Add columns for exchange bracket order IDs and entry_atr (idempotent)."""
+        cols = [
+            ("sl_order_id", "TEXT"),
+            ("tp_order_id", "TEXT"),
+            ("entry_atr", "REAL DEFAULT 0.0"),
+        ]
+        for col_name, col_type in cols:
+            try:
+                self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Position lifecycle
+    # ------------------------------------------------------------------
+
+    def open_position(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        quantity: float,
+        stop_loss: float,
+        take_profit: Optional[float] = None,
+        leverage: int = 1,
+        entry_score: int = -1,
+        entry_atr: float = 0.0,
+    ) -> Position:
+        """Record a new position. Overwrites existing position for the same symbol."""
+        with self._lock:
+            pos = Position(
+                symbol=symbol,
+                direction=direction,
+                entry_price=entry_price,
+                quantity=quantity,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                leverage=leverage,
+                entry_score=entry_score,
+                entry_atr=entry_atr,
+            )
+            self._positions[symbol] = pos
+            # Record cooldown to prevent immediate re-entry
+            key = f"{symbol}:{direction}"
+            self._cooldowns[key] = time.time()
+            self._record_equity_snapshot_unlocked()
+            self._persist()
+            logger.info("Position opened: %s %s @ %.4f qty=%.4f lev=%dx", symbol, direction, entry_price, quantity, leverage)
+            return pos
+
+    def set_bracket_order_ids(
+        self,
+        symbol: str,
+        sl_order_id: Optional[str],
+        tp_order_id: Optional[str],
+    ) -> None:
+        """Attach exchange SL/TP order IDs to an open position."""
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if pos is None:
+                return
+            pos.sl_order_id = sl_order_id
+            pos.tp_order_id = tp_order_id
+            self._persist()
+
+    def clear_bracket_order_ids(self, symbol: str) -> None:
+        """Clear exchange bracket order IDs (after cancel or fill)."""
+        self.set_bracket_order_ids(symbol, None, None)
+
+    def close_position(self, symbol: str, exit_price: Optional[float] = None, reason: str = "MANUAL") -> Optional[Position]:
+        """Close and remove a position. Records it in closed history with PnL.
+
+        Args:
+            symbol: Position symbol to close.
+            exit_price: Price at which the position was closed (for PnL calculation).
+            reason: Close reason — "TP", "SL", or "MANUAL".
+
+        Returns:
+            The closed Position or None.
+        """
+        with self._lock:
+            pos = self._positions.pop(symbol, None)
+            if pos:
+                pnl_usdt, pnl_pct = self._calculate_pnl_unlocked(pos, exit_price, pos.quantity)
+                self._append_close_record_unlocked(pos, exit_price or pos.entry_price, pos.quantity, pnl_usdt, pnl_pct, reason)
+
+                self._persist()
+                self._record_equity_snapshot_unlocked()
+                # 平仓后刷新冷却，防止刚平又开 / Refresh cooldown on close to block immediate re-entry
+                key = f"{symbol}:{pos.direction}"
+                self._cooldowns[key] = time.time()
+                logger.info(
+                    "Position closed: %s %s %s PnL=%.2fUSDT (%.2f%%)",
+                    symbol, pos.direction, reason, pnl_usdt, pnl_pct,
+                )
+            return pos
+
+    def close_after_market_fill(
+        self,
+        symbol: str,
+        filled: float,
+        exit_price: float,
+        reason: str,
+        *,
+        min_qty: float = 0.0,
+    ) -> Optional[Position]:
+        """Apply a reduce-only market fill when closing (handles partial fill + dust).
+
+        部分成交时合并为一笔平仓记录；剩余 dust 低于 min_qty 时按全仓记账。
+        Records one close when dust remains below exchange min_qty after partial fill.
+        """
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if not pos:
+                return None
+            if filled <= 0:
+                return self.close_position(symbol, exit_price=exit_price, reason=reason)
+
+            remaining = pos.quantity - filled
+            if remaining <= 0 or (min_qty > 0 and 0 < remaining < min_qty):
+                close_qty = pos.quantity
+                popped = self._positions.pop(symbol, None)
+                if not popped:
+                    return None
+                pnl_usdt, pnl_pct = self._calculate_pnl_unlocked(popped, exit_price, close_qty)
+                self._append_close_record_unlocked(
+                    popped, exit_price, close_qty, pnl_usdt, pnl_pct, reason,
+                )
+                self._persist()
+                self._record_equity_snapshot_unlocked()
+                key = f"{symbol}:{popped.direction}"
+                self._cooldowns[key] = time.time()
+                logger.info(
+                    "Position closed: %s %s %s PnL=%.2fUSDT (%.2f%%) qty=%.4f",
+                    symbol, popped.direction, reason, pnl_usdt, pnl_pct, close_qty,
+                )
+                return popped
+
+            pnl_usdt, pnl_pct = self._calculate_pnl_unlocked(pos, exit_price, filled)
+            self._append_close_record_unlocked(pos, exit_price, filled, pnl_usdt, pnl_pct, reason)
+            pos.quantity -= filled
+            self._persist()
+            logger.info(
+                "Position reduced: %s -%.4f @ %.4f, remaining qty=%.4f (%s)",
+                symbol, filled, exit_price, pos.quantity, reason,
+            )
+            return pos
+
+    def _calculate_pnl_unlocked(
+        self,
+        pos: Position,
+        exit_price: Optional[float],
+        quantity: float,
+    ) -> tuple[float, float]:
+        """Calculate realized PnL for a full or partial close. Caller holds _lock."""
+        if exit_price is None or exit_price <= 0 or pos.entry_price <= 0 or quantity <= 0:
+            return 0.0, 0.0
+        if pos.direction == "LONG":
+            pnl_usdt = (exit_price - pos.entry_price) * quantity
+            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+        else:
+            pnl_usdt = (pos.entry_price - exit_price) * quantity
+            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price * 100
+        return pnl_usdt, pnl_pct
+
+    def _append_close_record_unlocked(
+        self,
+        pos: Position,
+        exit_price: float,
+        quantity: float,
+        pnl_usdt: float,
+        pnl_pct: float,
+        reason: str,
+    ) -> None:
+        """Append a close record for realized PnL accounting. Caller holds _lock."""
+        record = CloseRecord(
+            symbol=pos.symbol,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            pnl_usdt=round(pnl_usdt, 4),
+            pnl_pct=round(pnl_pct, 2),
+            reason=reason,
+            opened_at=pos.opened_at,
+            dca_count=pos.dca_count,
+            leverage=pos.leverage,
+            entry_score=pos.entry_score,
+        )
+        self._closed.append(record)
+
+    def get_recent_closed(self, n: int = 10) -> list[CloseRecord]:
+        """Return the most recent N closed position records."""
+        with self._lock:
+            return list(self._closed[-n:])
+
+    def adjust_position(self, symbol: str, add_quantity: float, new_price: float) -> Optional[Position]:
+        """DCA: add quantity to existing position, recalc average entry price.
+
+        Returns updated position or None if symbol not found.
+        ``first_entry_cost`` and ``first_entry_quantity`` are intentionally
+        preserved — they serve as the invariant reference for de-risk thresholds.
+        """
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if not pos:
+                return None
+            total_qty = pos.quantity + add_quantity
+            pos.entry_price = (pos.entry_price * pos.quantity + new_price * add_quantity) / total_qty
+            pos.quantity = total_qty
+            pos.dca_count += 1
+            # 显式确保 de-risk 参照系不变
+            # (更安全的防御，避免未来某段代码意外修改)
+            pos.first_entry_cost = pos.first_entry_cost
+            pos.first_entry_quantity = pos.first_entry_quantity
+            self._persist()
+            logger.info(
+                "Position adjusted: %s +%.4f @ %.4f, new avg=%.4f qty=%.4f (dca#%d)",
+                symbol, add_quantity, new_price, pos.entry_price, total_qty, pos.dca_count,
+            )
+            return pos
+
+    def reduce_position(self, symbol: str, reduce_qty: float, current_price: float) -> Optional[Position]:
+        """Partially close a position (e.g. partial fill).
+
+        If reduce_qty >= total quantity, fully closes the position.
+        Otherwise reduces quantity in-place.
+        """
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if not pos:
+                return None
+            if reduce_qty >= pos.quantity:
+                return self.close_position(symbol, exit_price=current_price, reason="PARTIAL")
+            pos.quantity -= reduce_qty
+            self._persist()
+            logger.info(
+                "Position reduced: %s -%.4f @ %.4f, remaining qty=%.4f",
+                symbol, reduce_qty, current_price, pos.quantity,
+            )
+            return pos
+
+    def de_risk_partial_exit(self, symbol: str, de_risk_level: int, sell_qty: float, current_price: float) -> Optional[Position]:
+        """De-risk partial exit: sell a fraction of an active position.
+
+        Unlike ``reduce_position``, this method:
+        - Updates ``de_risk_level`` on the position (level only moves upward).
+        - Creates a CloseRecord for the realized partial PnL.
+        - Is idempotent for a given level (will not re-fire the same level).
+
+        Args:
+            symbol: Position symbol.
+            de_risk_level: Which de-risk level triggered (1-3).
+            sell_qty: Quantity to sell.
+            current_price: Current market price (for logging).
+
+        Returns:
+            Updated Position, or None if symbol not found.
+        """
+        if de_risk_level < 1 or de_risk_level > 4:
+            logger.warning("de_risk_partial_exit: invalid level %d for %s", de_risk_level, symbol)
+            return None
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if not pos:
+                return None
+            # Level 4 = doom, handled by full close
+            if de_risk_level == 4:
+                self.close_position(symbol, exit_price=current_price, reason="DOOM")
+                return None
+            # 防重复：level 只升不降
+            if de_risk_level <= pos.de_risk_level:
+                logger.debug(
+                    "de-risk level %d already fired for %s (current=%d), skipping",
+                    de_risk_level, symbol, pos.de_risk_level,
+                )
+                return pos
+            clamped_qty = min(sell_qty, pos.quantity)
+            if clamped_qty <= 0:
+                return pos
+            # 如果卖光 = 全平
+            if clamped_qty >= pos.quantity:
+                logger.info(
+                    "DE-RISK level %d: selling all remaining %.4f %s @ %.4f (DOOM)",
+                    de_risk_level, pos.quantity, symbol, current_price,
+                )
+                return self.close_position(symbol, exit_price=current_price, reason=f"DE_RISK_{de_risk_level}")
+            pnl_usdt, pnl_pct = self._calculate_pnl_unlocked(pos, current_price, clamped_qty)
+            self._append_close_record_unlocked(
+                pos, current_price, clamped_qty, pnl_usdt, pnl_pct, f"DE_RISK_{de_risk_level}",
+            )
+            pos.quantity -= clamped_qty
+            pos.de_risk_level = de_risk_level
+            self._persist()
+            logger.info(
+                "DE-RISK level %d: sold %.4f %s @ %.4f, remaining qty=%.4f",
+                de_risk_level, clamped_qty, symbol, current_price, pos.quantity,
+            )
+            return pos
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def get_active_positions(self) -> list[Position]:
+        """Return a copy of all active positions."""
+        with self._lock:
+            return list(self._positions.values())
+
+    def get_position(self, symbol: str) -> Optional[Position]:
+        """Get a specific position by symbol."""
+        with self._lock:
+            return self._positions.get(symbol)
+
+    def get_exposure(
+        self,
+        mark_prices: Optional[dict[str, float]] = None,
+        include_unrealized: bool = False,
+    ) -> float:
+        """Total mark/notional exposure as a fraction of balance or equity.
+
+        Args:
+            mark_prices: Optional symbol → current mark price map. Missing
+                symbols fall back to entry price for backward compatibility.
+            include_unrealized: If True, denominator is balance plus floating
+                PnL computed from ``mark_prices``.
+        """
+        with self._lock:
+            return self._get_exposure_unlocked(mark_prices, include_unrealized)
+
+    def _get_exposure_unlocked(
+        self,
+        mark_prices: Optional[dict[str, float]] = None,
+        include_unrealized: bool = False,
+    ) -> float:
+        total_value = 0.0
+        floating_pnl = 0.0
+        prices = mark_prices or {}
+        for pos in self._positions.values():
+            mark = float(prices.get(pos.symbol, pos.entry_price) or pos.entry_price)
+            total_value += mark * pos.quantity
+            if include_unrealized:
+                if pos.direction == "LONG":
+                    floating_pnl += (mark - pos.entry_price) * pos.quantity
+                else:
+                    floating_pnl += (pos.entry_price - mark) * pos.quantity
+        denominator = self._account_balance + floating_pnl if include_unrealized else self._account_balance
+        if denominator <= 0:
+            return 1.0
+        return total_value / denominator
+
+    # ------------------------------------------------------------------
+    # Equity curve tracking
+    # ------------------------------------------------------------------
+
+    def _record_equity_snapshot_unlocked(self) -> None:
+        """Record an equity snapshot. Caller must hold _lock."""
+        # Total equity = account balance + cumulative realized PnL
+        total_realized_pnl = sum(c.pnl_usdt for c in self._closed)
+        equity = self._account_balance + total_realized_pnl
+        self._equity_history.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "balance": self._account_balance,
+            "equity": round(equity, 4),
+            "active_positions": len(self._positions),
+            "total_realized_pnl": round(total_realized_pnl, 4),
+        })
+
+    def record_equity_snapshot(self) -> None:
+        """Thread-safe equity snapshot recording."""
+        with self._lock:
+            self._record_equity_snapshot_unlocked()
+
+    def get_equity_series(self):
+        """Return equity curve as pd.Series (index=timestamp, values=equity).
+
+        Returns None if no data.
+        """
+        with self._lock:
+            if not self._equity_history:
+                return None
+            import pandas as pd
+            timestamps = [pd.Timestamp(e["timestamp"]) for e in self._equity_history]
+            values = [e["equity"] for e in self._equity_history]
+            return pd.Series(values, index=timestamps)
+
+    def get_performance_metrics(self):
+        """Compute full performance metrics from equity curve and closed trades.
+
+        Returns dict from calc_metrics, or empty metrics if < 3 trades.
+        """
+        closed = self.get_recent_closed(50)
+        if len(closed) < 3:
+            return {
+                "trade_count": len(closed),
+                "win_rate": 0.0,
+                "profit_factor": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "total_return": 0.0,
+                "message": "数据太少，至少需要 3 笔交易",
+            }
+
+        trades = [c.to_trade_record() for c in closed]
+        equity = self.get_equity_series()
+        if equity is None or len(equity) < 5:
+            return {
+                "trade_count": len(trades),
+                "win_rate": 0.0,
+                "profit_factor": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "total_return": 0.0,
+                "message": "权益曲线数据不足",
+            }
+
+        try:
+            from agent.backtest.metrics import calc_metrics
+            return calc_metrics(
+                equity_curve=equity,
+                trades=trades,
+                initial_cash=self._initial_balance,
+                bars_per_year=365 * 24,  # 1h bars for crypto
+            )
+        except Exception as exc:
+            logger.warning("Performance metrics failed: %s", exc)
+            return {"trade_count": len(trades), "error": str(exc)}
+
+    def get_win_rate_by_score_tier(self) -> dict[str, dict[str, float]]:
+        """Win rate grouped by entry score tier.
+
+        Returns:
+            {"high": {"count": N, "wins": N, "win_rate": 0.0, "total_pnl": 0.0},
+             "medium": {...},
+             "low": {...}}
+        """
+        tiers = {
+            "high (7-10)": {"count": 0, "wins": 0, "total_pnl": 0.0},
+            "medium (5-6)": {"count": 0, "wins": 0, "total_pnl": 0.0},
+            "low (0-4)": {"count": 0, "wins": 0, "total_pnl": 0.0},
+            "N/A (旧数据)": {"count": 0, "wins": 0, "total_pnl": 0.0},
+        }
+        with self._lock:
+            for c in self._closed:
+                if c.entry_score >= 7:
+                    tier = "high (7-10)"
+                elif c.entry_score >= 5:
+                    tier = "medium (5-6)"
+                elif c.entry_score > 0:
+                    tier = "low (0-4)"
+                else:
+                    tier = "N/A (旧数据)"
+                tiers[tier]["count"] += 1
+                if c.pnl_usdt > 0:
+                    tiers[tier]["wins"] += 1
+                tiers[tier]["total_pnl"] += c.pnl_usdt
+
+        result = {}
+        for tier_name, data in tiers.items():
+            result[tier_name] = {
+                "count": data["count"],
+                "wins": data["wins"],
+                "win_rate": round(data["wins"] / data["count"], 2) if data["count"] > 0 else 0.0,
+                "total_pnl": round(data["total_pnl"], 4),
+            }
+        return result
+
+    # ------------------------------------------------------------------
+    # Gate result persistence
+    # ------------------------------------------------------------------
+
+    def record_gate_result(
+        self,
+        symbol: str,
+        direction: str,
+        score: int,
+        gate_status: str,
+        gate_checks: Optional[list[dict[str, Any]]] = None,
+        phase2_consensus: Optional[str] = None,
+        summary: str = "",
+    ) -> None:
+        """Persist a gate evaluation result for post-trade analysis.
+
+        Called after every Phase2 + Gate evaluation (PASS/WATCH_ONLY/REJECT),
+        regardless of whether a position was opened.
+
+        Args:
+            symbol: Trading symbol.
+            direction: LONG or SHORT.
+            score: Phase 1 entry score.
+            gate_status: GateStatus value (PASS, WATCH_ONLY, REJECT).
+            gate_checks: List of check dicts from ExecutionGateResult.
+            phase2_consensus: Phase 2 consensus verdict (PASS/NEUTRAL/FAIL).
+            summary: One-line summary from gate result.
+        """
+        import json
+
+        if self._conn is None:
+            return
+        try:
+            checks_json = json.dumps(gate_checks or [], ensure_ascii=False)
+            self._conn.execute(
+                """INSERT INTO gate_results
+                   (timestamp, symbol, direction, score, phase2_consensus,
+                    gate_status, gate_checks, summary)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    symbol,
+                    direction,
+                    score,
+                    phase2_consensus,
+                    gate_status,
+                    checks_json,
+                    summary,
+                ),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.warning("Failed to persist gate result for %s: %s", symbol, exc)
+
+    # ------------------------------------------------------------------
+    # Guards
+    # ------------------------------------------------------------------
+
+    def count_direction(self, direction: str) -> int:
+        """Count active positions in the given direction (LONG or SHORT)."""
+        direction = direction.upper()
+        with self._lock:
+            return sum(1 for p in self._positions.values() if p.direction == direction)
+
+    def get_rolling_drawdown_pct(self, hours: int = 24) -> float:
+        """Peak-to-current balance drawdown over the last N hours (0.0–1.0).
+
+        使用独立维护的 ``_rolling_peak_balance``，不用 equity_history 的 max，
+        避免提现/对账/换所后历史虚高峰误触发熔断。
+        Uses maintained ``_rolling_peak_balance``, not equity_history max.
+        """
+        _ = hours  # 峰值由 _rolling_peak_balance 维护，保留参数兼容旧调用
+        with self._lock:
+            peak = self._rolling_peak_balance
+            current = self._account_balance
+            if peak <= 0:
+                return 0.0
+            return max(0.0, (peak - current) / peak)
+
+    def _peak_balance_from_history(self, hours: int = 24) -> float:
+        """24h 内 equity_history 余额峰值（仅用于启动对齐诊断）。
+        Max balance in equity_history over the last N hours (startup diagnostics).
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        cutoff_s = cutoff.isoformat()
+        balances = [
+            e["balance"] for e in self._equity_history
+            if e.get("timestamp", "") >= cutoff_s
+        ]
+        return max(balances) if balances else self._account_balance
+
+    def initialize_rolling_peak(self, balance: Optional[float] = None) -> None:
+        """启动/换所后用交易所真实余额对齐 rolling 峰值。
+        Align rolling peak to live exchange balance on startup or exchange switch.
+        """
+        with self._lock:
+            bal = balance if balance is not None else self._account_balance
+            hist_peak = self._peak_balance_from_history(hours=24)
+            old_peak = self._rolling_peak_balance
+            self._rolling_peak_balance = bal
+            if hist_peak > bal * 1.02 or old_peak > bal * 1.02:
+                logger.info(
+                    "Rolling peak reset on init: %.2f → %.2f (24h history peak %.2f)",
+                    old_peak, bal, hist_peak,
+                )
+            self._persist_metadata_unlocked()
+
+    def consume_rolling_peak_reset(self) -> bool:
+        """若最近一次余额同步触发了外部峰值重置，返回 True 并清除标记。
+        True if the last balance sync reset rolling peak due to external adjustment.
+        """
+        with self._lock:
+            flag = self._rolling_peak_externally_reset
+            self._rolling_peak_externally_reset = False
+            return flag
+
+    def _update_rolling_peak(self, old_balance: float, new_balance: float) -> None:
+        """根据余额变动更新 rolling 峰值（调用方已持锁）。
+        Update rolling peak from a balance change (caller holds lock).
+        """
+        if new_balance > self._rolling_peak_balance:
+            self._rolling_peak_balance = new_balance
+            return
+        if old_balance <= 0:
+            return
+        drop_pct = (old_balance - new_balance) / old_balance
+        if drop_pct >= ROLLING_EXTERNAL_JUMP_PCT:
+            logger.info(
+                "Rolling peak reset: external balance adjustment %.2f → %.2f (Δ%.1f%%)",
+                old_balance, new_balance, drop_pct * 100,
+            )
+            self._rolling_peak_balance = new_balance
+            self._rolling_peak_externally_reset = True
+
+    def can_open_new(
+        self,
+        symbol: str,
+        additional_notional: float = 0.0,
+        direction: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """Check if a new position can be opened.
+
+        Args:
+            symbol: Trading symbol to check.
+            additional_notional: Expected notional of the new position (0 = skip).
+            direction: Intended direction (LONG/SHORT) for correlated exposure cap.
+
+        Returns:
+            (True, "") if allowed, or (False, "reason string") if rejected.
+
+        Rejects if:
+        - Symbol already has an active position
+        - Maximum number of positions reached
+        - Same-direction position count at cap
+        - Total exposure (current + new) exceeds limit
+        """
+        with self._lock:
+            if symbol in self._positions:
+                return False, f"已有 {symbol} 持仓"
+            if len(self._positions) >= self._max_positions:
+                return False, f"仓位已达上限 ({self._max_positions})"
+            if direction:
+                dir_upper = direction.upper()
+                same_dir = sum(1 for p in self._positions.values() if p.direction == dir_upper)
+                if same_dir >= self._max_same_direction:
+                    return False, (
+                        f"同向仓位已达上限 ({same_dir}/{self._max_same_direction} {dir_upper})"
+                    )
+            current_exp = self._get_exposure_unlocked()
+            if additional_notional > 0:
+                if self._account_balance > 0:
+                    post_exp = current_exp + (additional_notional / self._account_balance)
+                else:
+                    post_exp = float("inf")
+            else:
+                post_exp = current_exp
+            if post_exp >= self._max_exposure_pct - 1e-9:
+                if additional_notional > 0:
+                    return False, (
+                        f"开仓后总敞口 {post_exp:.1%} 超限 (上限 {self._max_exposure_pct:.0%}, "
+                        f"当前 {current_exp:.1%}, 新增 ${additional_notional:.2f})"
+                    )
+                else:
+                    return False, (
+                        f"总敞口 {current_exp:.1%} 超限 (上限 {self._max_exposure_pct:.0%})"
+                    )
+            return True, ""
+
+    def set_extended_cooldown(self, symbol: str, direction: str, minutes: int) -> None:
+        """Set a longer cooldown for a symbol+direction (e.g. after de-risk event).
+
+        Overrides the default cooldown duration. Used to prevent revenge-trading
+        on symbols that triggered de-risk.
+        """
+        with self._lock:
+            key = f"{symbol}:{direction}"
+            self._extended_cooldowns[key] = time.time() + minutes * 60
+            self._persist()
+
+    def is_in_cooldown(self, symbol: str, direction: str) -> bool:
+        """Check if symbol+direction pair is in cooldown period."""
+        with self._lock:
+            key = f"{symbol}:{direction}"
+            if key in self._extended_cooldowns:
+                if time.time() < self._extended_cooldowns[key]:
+                    return True
+                del self._extended_cooldowns[key]  # expired, clean up
+            if key not in self._cooldowns:
+                return False
+            elapsed = time.time() - self._cooldowns[key]
+            if elapsed < self._cooldown_minutes * 60:
+                return True
+            del self._cooldowns[key]  # expired, clean up
+            return False
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._positions)
+
+    @property
+    def account_balance(self) -> float:
+        return self._account_balance
+
+    @account_balance.setter
+    def account_balance(self, value: float) -> None:
+        with self._lock:
+            old_balance = self._account_balance
+            delta = value - old_balance
+            if abs(delta) > 0.01:  # 忽略微小舍入差异
+                if hasattr(self, "_last_balance_log"):
+                    logger.info(
+                        "Balance changed: %.2f → %.2f (Δ%+.2f USDT)",
+                        old_balance, value, delta,
+                    )
+                else:
+                    logger.info("Balance initialized: %.2f USDT", value)
+                self._last_balance_log = True
+            self._account_balance = value
+            if abs(delta) > 0.01:
+                self._update_rolling_peak(old_balance, value)
+                self._persist_metadata_unlocked()
+
+    @property
+    def max_exposure_pct(self) -> float:
+        """Maximum total exposure fraction (e.g. 0.25 = 25%)."""
+        return self._max_exposure_pct
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+
+    def get_trailing_state(self) -> dict[str, dict[str, float]]:
+        """Return current trailing stop state for external persistence.
+
+        Returns:
+            {"trailing_stops": {...}, "peak_prices": {...}}
+        """
+        with self._lock:
+            return {
+                "trailing_stops": dict(self._trailing_stops),
+                "peak_prices": dict(self._peak_prices),
+            }
+
+    def set_trailing_state(self, trailing_stops: dict[str, float], peak_prices: dict[str, float]) -> None:
+        """Restore trailing stop state from persisted data."""
+        with self._lock:
+            self._trailing_stops = trailing_stops or {}
+            self._peak_prices = peak_prices or {}
+            self._persist()
+    def _persist(self) -> None:
+        """Write in-memory state to SQLite. Caller holds _lock.
+
+        Append-only tables (closed_trades, equity_history) use incremental
+        inserts tracked by _synced_* counters. Small tables (positions,
+        cooldowns, trailing_state) use full replace.
+        """
+        if self._conn is None:
+            return
+        try:
+            # Positions: small table, full replace
+            self._conn.execute("DELETE FROM positions")
+            for pos in self._positions.values():
+                self._conn.execute(
+                    """INSERT INTO positions
+                       (symbol, direction, entry_price, quantity, stop_loss,
+                        take_profit, opened_at, dca_count, leverage, entry_score,
+                        first_entry_cost, first_entry_quantity, de_risk_level,
+                        sl_order_id, tp_order_id, entry_atr)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (pos.symbol, pos.direction, pos.entry_price, pos.quantity,
+                     pos.stop_loss, pos.take_profit, pos.opened_at, pos.dca_count,
+                     pos.leverage, pos.entry_score, pos.first_entry_cost,
+                     pos.first_entry_quantity, pos.de_risk_level,
+                     pos.sl_order_id, pos.tp_order_id, pos.entry_atr),
+                )
+
+            # Closed trades: incremental append
+            if len(self._closed) > self._synced_closed_count:
+                new_closed = self._closed[self._synced_closed_count:]
+                self._conn.executemany(
+                    """INSERT INTO closed_trades
+                       (symbol, direction, entry_price, exit_price, quantity,
+                        pnl_usdt, pnl_pct, reason, opened_at, closed_at,
+                        dca_count, leverage, entry_score)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    [(c.symbol, c.direction, c.entry_price, c.exit_price,
+                      c.quantity, c.pnl_usdt, c.pnl_pct, c.reason,
+                      c.opened_at, c.closed_at, c.dca_count, c.leverage,
+                      c.entry_score) for c in new_closed],
+                )
+                self._synced_closed_count = len(self._closed)
+
+            # Equity history: incremental append
+            if len(self._equity_history) > self._synced_equity_count:
+                new_equity = self._equity_history[self._synced_equity_count:]
+                self._conn.executemany(
+                    """INSERT INTO equity_history
+                       (timestamp, balance, equity, active_positions, total_realized_pnl)
+                       VALUES (?,?,?,?,?)""",
+                    [(e["timestamp"], e["balance"], e["equity"],
+                      e["active_positions"], e["total_realized_pnl"])
+                     for e in new_equity],
+                )
+                self._synced_equity_count = len(self._equity_history)
+
+            # Cooldowns: full replace
+            self._conn.execute("DELETE FROM cooldowns")
+            if self._cooldowns:
+                self._conn.executemany(
+                    "INSERT INTO cooldowns (key, expires_at) VALUES (?,?)",
+                    list(self._cooldowns.items()),
+                )
+
+            # Extended cooldowns: full replace
+            self._conn.execute("DELETE FROM extended_cooldowns")
+            if self._extended_cooldowns:
+                self._conn.executemany(
+                    "INSERT INTO extended_cooldowns (key, expires_at) VALUES (?,?)",
+                    list(self._extended_cooldowns.items()),
+                )
+
+            # Trailing state: full replace
+            self._conn.execute("DELETE FROM trailing_state")
+            if self._trailing_stops:
+                self._conn.executemany(
+                    """INSERT INTO trailing_state
+                       (symbol, trailing_stop, peak_price) VALUES (?,?,?)""",
+                    [(sym, self._trailing_stops[sym], self._peak_prices.get(sym, 0.0))
+                     for sym in self._trailing_stops],
+                )
+
+            # Metadata
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('account_balance', ?)",
+                (str(self._account_balance),),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('rolling_peak_balance', ?)",
+                (str(self._rolling_peak_balance),),
+            )
+
+            self._conn.commit()
+        except Exception as exc:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            logger.warning("SQLite persistence unavailable (in-memory only): %s", exc)
+
+    def _persist_metadata_unlocked(self) -> None:
+        """Persist account_balance + rolling_peak_balance only (caller holds lock)."""
+        if self._conn is None:
+            return
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('account_balance', ?)",
+                (str(self._account_balance),),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('rolling_peak_balance', ?)",
+                (str(self._rolling_peak_balance),),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.warning("Metadata persistence failed: %s", exc)
+
+    def _load(self) -> None:
+        """Restore in-memory state from SQLite database."""
+        if not self._db_path.exists() or self._conn is None:
+            return
+        try:
+            # Positions
+            cursor = self._conn.execute("SELECT * FROM positions")
+            for row in cursor.fetchall():
+                sym = str(row["symbol"])
+                if not _VALID_SYMBOL_RE.match(sym):
+                    logger.warning("Skipping invalid symbol in positions: %r", sym)
+                    continue
+                keys = row.keys()
+                self._positions[sym] = Position(
+                    symbol=row["symbol"], direction=row["direction"],
+                    entry_price=row["entry_price"], quantity=row["quantity"],
+                    stop_loss=row["stop_loss"], take_profit=row["take_profit"],
+                    opened_at=row["opened_at"], dca_count=row["dca_count"],
+                    leverage=row["leverage"], entry_score=row["entry_score"],
+                    first_entry_cost=row["first_entry_cost"],
+                    first_entry_quantity=row["first_entry_quantity"],
+                    de_risk_level=row["de_risk_level"],
+                    sl_order_id=row["sl_order_id"] if "sl_order_id" in keys else None,
+                    tp_order_id=row["tp_order_id"] if "tp_order_id" in keys else None,
+                    entry_atr=float(row["entry_atr"]) if "entry_atr" in keys else 0.0,
+                )
+
+            # Closed trades
+            cursor = self._conn.execute("SELECT * FROM closed_trades ORDER BY id ASC")
+            for row in cursor.fetchall():
+                self._closed.append(CloseRecord(
+                    symbol=row["symbol"], direction=row["direction"],
+                    entry_price=row["entry_price"], exit_price=row["exit_price"],
+                    quantity=row["quantity"], pnl_usdt=row["pnl_usdt"],
+                    pnl_pct=row["pnl_pct"], reason=row["reason"],
+                    opened_at=row["opened_at"], closed_at=row["closed_at"],
+                    dca_count=row["dca_count"], leverage=row["leverage"],
+                    entry_score=row["entry_score"],
+                ))
+            self._synced_closed_count = len(self._closed)
+
+            # Equity history
+            cursor = self._conn.execute("SELECT * FROM equity_history ORDER BY id ASC")
+            for row in cursor.fetchall():
+                self._equity_history.append({
+                    "timestamp": row["timestamp"],
+                    "balance": row["balance"],
+                    "equity": row["equity"],
+                    "active_positions": row["active_positions"],
+                    "total_realized_pnl": row["total_realized_pnl"],
+                })
+            self._synced_equity_count = len(self._equity_history)
+
+            # Cooldowns
+            cursor = self._conn.execute("SELECT * FROM cooldowns")
+            self._cooldowns = {row["key"]: row["expires_at"] for row in cursor.fetchall()}
+
+            # Extended cooldowns
+            cursor = self._conn.execute("SELECT * FROM extended_cooldowns")
+            self._extended_cooldowns = {row["key"]: row["expires_at"] for row in cursor.fetchall()}
+
+            # Trailing state
+            cursor = self._conn.execute("SELECT * FROM trailing_state")
+            for row in cursor.fetchall():
+                self._trailing_stops[row["symbol"]] = row["trailing_stop"]
+                self._peak_prices[row["symbol"]] = row["peak_price"]
+
+            # Account balance from metadata (initial_balance is NOT restored)
+            cursor = self._conn.execute(
+                "SELECT value FROM metadata WHERE key='account_balance'"
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                self._account_balance = float(row["value"])
+
+            cursor = self._conn.execute(
+                "SELECT value FROM metadata WHERE key='rolling_peak_balance'"
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                self._rolling_peak_balance = float(row["value"])
+            else:
+                self._rolling_peak_balance = self._account_balance
+
+            logger.info(
+                "Loaded %d positions, %d closed records, %d equity snapshots from %s",
+                len(self._positions), len(self._closed), len(self._equity_history), self._db_path,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load state from %s: %s", self._db_path, exc)
+
+    def clear(self) -> None:
+        """Remove all positions and clear persistence (useful for testing)."""
+        with self._lock:
+            self._positions.clear()
+            self._closed.clear()
+            self._cooldowns.clear()
+            self._extended_cooldowns.clear()
+            self._equity_history.clear()
+            self._trailing_stops.clear()
+            self._peak_prices.clear()
+            self._synced_closed_count = 0
+            self._synced_equity_count = 0
+            if self._db_path.exists():
+                self._db_path.unlink()

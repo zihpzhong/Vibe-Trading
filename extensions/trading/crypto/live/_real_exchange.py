@@ -1,0 +1,994 @@
+"""Binance exchange adapter via ccxt.
+
+Implements ExchangeBase for live market data and order execution.
+Filename starts with underscore to match the lazy import in exchange.py:135.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+import os
+import threading
+import time
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
+from typing import Any, Optional
+from urllib.parse import urlencode
+
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry as UrllibRetry
+
+from .exchange import ExchangeBase
+
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRY_BACKOFF = (1, 2, 4)
+
+_BINANCE_TOP20_FALLBACK = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    "MATICUSDT", "SHIBUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT",
+    "ETCUSDT", "XLMUSDT", "FILUSDT", "TRXUSDT", "NEARUSDT",
+]
+
+
+def _to_internal_symbol(ccxt_symbol: str) -> str:
+    """Convert ccxt symbol format to internal short format.
+
+    Spot:  BTC/USDT → BTCUSDT
+    Futures: BTC/USDT:USDT → BTCUSDT
+    """
+    base, _, quote = ccxt_symbol.partition("/")
+    if ":" in quote:
+        quote, _, _ = quote.partition(":")
+    return f"{base}{quote}"
+
+
+def _ccxt_ticker_to_internal(raw: dict) -> dict[str, Any]:
+    """Map Binance raw ticker (or ccxt unified ticker) to internal format.
+
+    Works for both raw Binance API responses and ccxt unified tickers.
+    Fields differ slightly between the two formats:
+      - Binance raw: lastPrice, quoteVolume, priceChangePercent
+      - ccxt unified: last, quoteVolume, percentage
+    """
+    # Binance raw API format (from /api/v3/ticker/24hr)
+    sym = raw.get("symbol", "")
+    result: dict[str, Any] = {"symbol": _to_internal_symbol(sym) if sym else ""}
+    vol = raw.get("quoteVolume") or raw.get("volume24h", 0)
+    result["volume24h"] = float(vol) if vol is not None else 0.0
+    result["last"] = float(raw.get("lastPrice") or raw.get("last", 0))
+    result["open24h"] = float(raw.get("openPrice") or raw.get("open", 0))
+    result["high24h"] = float(raw.get("highPrice") or raw.get("high", 0))
+    result["low24h"] = float(raw.get("lowPrice") or raw.get("low", 0))
+    result["change24h"] = float(raw.get("priceChangePercent") or raw.get("percentage", 0))
+    return result
+
+
+def _retry(op_name: str, fn, *args: Any, **kwargs: Any) -> Any:
+    """Call fn with exponential backoff retry."""
+    last_err: Optional[Exception] = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last_err = exc
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_BACKOFF[attempt]
+                logger.warning(
+                    "%s attempt %d/%d failed (%.1fs retry): %s",
+                    op_name, attempt + 1, MAX_RETRIES, delay, exc,
+                )
+                time.sleep(delay)
+    raise RuntimeError(f"{op_name} failed after {MAX_RETRIES} attempts") from last_err
+
+
+class RealExchange(ExchangeBase):
+    """Live Binance exchange via ccxt.
+
+    API keys read from env:
+      - BINANCE_API_KEY
+      - BINANCE_SECRET
+      - BINANCE_TESTNET=true  (optional, defaults to false)
+      - BINANCE_MARKET_TYPE=spot|future  (optional, defaults to future)
+
+    Without API keys, market-data methods still work (public endpoints).
+    Trading methods raise RuntimeError with a clear message.
+    """
+
+    def __init__(self) -> None:
+        import ccxt  # lazy import so MockExchange works without ccxt
+
+        testnet = os.environ.get("BINANCE_TESTNET", "").lower() == "true"
+        api_key = os.environ.get("BINANCE_API_KEY", "")
+        secret = os.environ.get("BINANCE_SECRET", "")
+        market_type = os.environ.get("BINANCE_MARKET_TYPE", "future").lower()
+        if market_type not in {"spot", "future"}:
+            raise ValueError("BINANCE_MARKET_TYPE must be 'spot' or 'future'")
+
+        self._testnet = testnet
+        self._has_auth = bool(api_key and secret)
+        self._market_type = market_type
+        self._lock = threading.RLock()
+
+        exchange_config: dict[str, Any] = {
+            "apiKey": api_key,
+            "secret": secret,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": market_type,
+                "fetchCurrencies": False,
+                "loadMarkets": False,  # prevent auto-load on first API call
+            },
+        }
+
+        self._ccxt = ccxt.binance(exchange_config)
+        self._ccxt.markets = {}
+        self._ccxt.markets_by_id = {}
+
+        # Shared HTTP session with connection pooling + retry for Binance API
+        self._session = requests.Session()
+        retry_strategy = UrllibRetry(
+            total=3,
+            connect=3,
+            read=2,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=retry_strategy,
+        )
+        self._session.mount("https://api.binance.com", adapter)
+        self._session.mount("https://fapi.binance.com", adapter)
+
+        # Pre-fetch LOT_SIZE stepSizes from exchangeInfo for quantity rounding
+        self._step_sizes: dict[str, float] = {}
+        self._tick_sizes: dict[str, float] = {}
+        # Also store min notional and min qty for reference
+        self._min_notionals: dict[str, float] = {}
+        self._min_qtys: dict[str, float] = {}
+        # Valid trading symbols (futures or spot depending on market_type)
+        self._valid_symbols: set[str] = set()
+        self._load_exchange_info()
+
+    # ------------------------------------------------------------------
+    # ExchangeBase — market data (public, no auth required)
+    # ------------------------------------------------------------------
+
+    def _get_kline_urls(self) -> tuple[str, str]:
+        """Return (base_url, endpoint) for kline fetching.
+
+        Uses fapi.binance.com for futures, with api.binance.com fallback.
+        Spot market always uses api.binance.com.
+        """
+        if self._market_type == "future":
+            return ("https://fapi.binance.com", "/fapi/v1/klines")
+        return ("https://api.binance.com", "/api/v3/klines")
+
+    def get_kline(self, symbol: str, timeframe: str = "1h", limit: int = 200) -> pd.DataFrame:
+        """Fetch OHLCV candles from Binance.
+
+        Returns DataFrame with columns: timestamp (index), open, high, low, close, volume.
+        Falls back to spot kline if futures endpoint is unreachable.
+        """
+        with self._lock:
+            base_url, endpoint = self._get_kline_urls()
+        # Map timeframe to Binance format (ccxt uses same format for spot and futures)
+        tf_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+        tf = tf_map.get(timeframe, timeframe)
+
+        def _fetch(url: str, ep: str) -> list:
+            resp = _retry(f"klines({symbol},{tf},{limit})", lambda: self._session.get(
+                f"{url}{ep}",
+                params={"symbol": symbol, "interval": tf, "limit": limit},
+                timeout=10,
+            ))
+            if resp.status_code == 404:
+                raise RuntimeError(f"{url}{ep} not reachable (404)")
+            resp.raise_for_status()
+            return resp.json()
+
+        try:
+            raw = _fetch(base_url, endpoint)
+        except Exception as exc:
+            # Futures kline failures → try spot API fallback for non-commodity pairs
+            if self._market_type == "future":
+                try:
+                    spot_ep = "/api/v3/klines"
+                    resp_check = self._session.get(
+                        f"https://api.binance.com{spot_ep}",
+                        params={"symbol": symbol, "interval": tf, "limit": 1},
+                        timeout=10,
+                    )
+                    if resp_check.status_code == 404:
+                        raise RuntimeError(f"Klines unavailable for {symbol} on spot (futures-only pair)")
+                    raw_resp = resp_check.json()
+                    if not raw_resp or (isinstance(raw_resp, list) and len(raw_resp) == 0):
+                        raise RuntimeError(f"Klines unavailable for {symbol} (empty response)")
+                    raw = raw_resp
+                except Exception:
+                    raise exc
+            else:
+                raise
+
+        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume",
+                                          "close_time", "quote_volume", "trades", "taker_buy_base",
+                                          "taker_buy_quote", "ignore"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms")
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        df.set_index("timestamp", inplace=True)
+        # Keep only the 6 standard columns
+        return df[["open", "high", "low", "close", "volume"]]
+
+    @property
+    def _data_prefix(self) -> str:
+        """Market data prefix for ticker/depth endpoints."""
+        if self._market_type == "future":
+            return f"{self._fapi_url()}/fapi/v1"
+        return "https://api.binance.com/api/v3"
+
+    @property
+    def _trade_prefix(self) -> str:
+        """Trading prefix — fapi.binance.com/fapi/v1 for futures, api for spot.
+
+        Trading (orders, leverage, positions) requires the correct backend.
+        """
+        if self._market_type == "future":
+            return "https://fapi.binance.com/fapi/v1"
+        return "https://api.binance.com/api/v3"
+
+    def _api_url(self) -> str:
+        """Return base Binance API URL for spot/universal endpoints."""
+        return "https://api.binance.com"
+
+    def _fapi_url(self) -> str:
+        """Return base Binance Futures API URL for fapi endpoints."""
+        return "https://fapi.binance.com"
+
+    def _api_url(self) -> str:
+        """Return base Binance API URL for spot/universal endpoints."""
+        return "https://api.binance.com"
+
+    def _fapi_url(self) -> str:
+        """Return base Binance Futures API URL for fapi endpoints."""
+        return "https://fapi.binance.com"
+
+    def get_ticker(self, symbol: str) -> dict[str, Any]:
+        """Fetch current ticker using direct HTTP (avoids ccxt load_markets)."""
+        with self._lock:
+            resp = _retry(f"ticker({symbol})", lambda: self._session.get(
+                f"{self._data_prefix}/ticker/24hr",
+                params={"symbol": symbol},
+                timeout=10,
+            ))
+            resp.raise_for_status()
+            raw = resp.json()
+            return _ccxt_ticker_to_internal({
+                "symbol": raw.get("symbol", symbol),
+                "last": raw.get("lastPrice", 0),
+                "open": raw.get("openPrice", 0),
+                "high": raw.get("highPrice", 0),
+                "low": raw.get("lowPrice", 0),
+                "quoteVolume": raw.get("quoteVolume", 0),
+                "percentage": raw.get("priceChangePercent", 0),
+            })
+
+    def get_tickers(self, symbols: Optional[list[str]] = None) -> list[dict[str, Any]]:
+        """Batch fetch all USDT ticker data via direct HTTP."""
+        with self._lock:
+            resp = _retry("all_tickers", lambda: self._session.get(
+                f"{self._data_prefix}/ticker/24hr",
+                timeout=10,
+            ))
+            resp.raise_for_status()
+            raw_all = resp.json()
+            tickers: list[dict[str, Any]] = []
+            for raw in raw_all:
+                sym = raw.get("symbol", "")
+                if not sym.endswith("USDT") or ":USDT" in sym:
+                    continue
+                # In futures mode, only return symbols that exist on Binance Futures
+                if self._market_type == "future" and self._valid_symbols and sym not in self._valid_symbols:
+                    logger.debug("  Filter(合约不可用): %s not on futures, skipped", sym)
+                    continue
+                if symbols and sym not in symbols:
+                    continue
+                t = _ccxt_ticker_to_internal(raw)
+                if t["volume24h"] > 0:
+                    tickers.append(t)
+            tickers.sort(key=lambda x: x["volume24h"], reverse=True)
+            return tickers
+
+    def get_funding_rate(self, symbol: str) -> float:
+        """Fetch current perpetual funding rate via direct HTTP."""
+        with self._lock:
+            resp = _retry(f"funding({symbol})", lambda: self._session.get(
+                f"{self._fapi_url()}/fapi/v1/premiumIndex",
+                params={"symbol": symbol},
+                timeout=10,
+            ))
+            if resp.status_code == 404:
+                raise RuntimeError(f"Funding rate unavailable for {symbol} (no perpetual futures contract)")
+            resp.raise_for_status()
+            raw = resp.json()
+            fr = raw.get("lastFundingRate")
+            return float(fr) if fr is not None else 0.0
+
+    def get_orderbook(self, symbol: str, depth: int = 10) -> dict[str, list]:
+        """Fetch order book via direct HTTP."""
+        with self._lock:
+            resp = _retry(f"orderbook({symbol},{depth})", lambda: self._session.get(
+                f"{self._data_prefix}/depth",
+                params={"symbol": symbol, "limit": depth},
+                timeout=10,
+            ))
+            if resp.status_code == 404:
+                return {"bids": [], "asks": []}
+            resp.raise_for_status()
+            raw = resp.json()
+            return {"bids": raw.get("bids", []), "asks": raw.get("asks", [])}
+
+    # ------------------------------------------------------------------
+    # Trading — requires API key
+    # ------------------------------------------------------------------
+
+    def _require_auth(self, op: str) -> None:
+        if not self._has_auth:
+            raise RuntimeError(
+                f"{op} requires BINANCE_API_KEY and BINANCE_SECRET env vars. "
+                f"Set BINANCE_TESTNET=true for testnet."
+            )
+
+    def _trade_request(self, endpoint: str, params: dict) -> dict:
+        """Send a signed POST request and parse the response.
+
+        Endpoint is auto-mapped to the correct base prefix:
+        /api/v3/order + spot   → https://api.binance.com/api/v3/order
+        /api/v3/order + future → https://fapi.binance.com/fapi/v1/order
+        """
+        self._require_auth("trade")
+        action = endpoint.rsplit("/", 1)[-1]  # /api/v3/order → "order"
+        url = f"{self._trade_prefix}/{action}"
+        data = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
+        data.update(params)
+        query_string = urlencode(sorted(data.items()))
+        signature = hmac.new(
+            self._ccxt.secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        query_string += f"&signature={signature}"
+        resp = self._session.post(
+            url,
+            data=query_string,
+            headers={"X-MBX-APIKEY": self._ccxt.apiKey},
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            raise RuntimeError(f"Trade auth failed: {resp.text}")
+        if not resp.ok:
+            raise RuntimeError(f"Trade failed ({resp.status_code}): {resp.text}")
+        raw = resp.json()
+        if isinstance(raw, dict) and "code" in raw and raw["code"] < 0:
+            raise RuntimeError(f"Binance error {raw['code']}: {raw.get('msg', '')}")
+        return raw
+
+    @staticmethod
+    def _binance_side(side: str) -> str:
+        """Map internal direction (LONG/SHORT/long/short/sell/buy) to Binance side (BUY/SELL).
+
+        Spot mapping: LONG → BUY, SHORT → SELL.
+        """
+        mapping = {"LONG": "BUY", "SHORT": "SELL", "BUY": "BUY", "SELL": "SELL",
+                   "long": "BUY", "short": "SELL", "buy": "BUY", "sell": "SELL"}
+        return mapping.get(side, side.upper())
+
+    def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
+        """Place a market order via direct HTTP.
+
+        Args:
+            side: Internal direction — "long"/"short"/"buy"/"sell" or "LONG"/"SHORT".
+            reduce_only: If True, adds reduceOnly=true (allows closing positions
+                         below Binance 20 USDT minimum notional).
+        """
+        qty = self._round_qty(symbol, amount)
+        if qty <= 0:
+            raise RuntimeError(
+                f"market({symbol},{side},{amount}) rounds to {qty} — quantity below minimum tradeable"
+            )
+        params: dict[str, str] = {
+            "symbol": symbol, "side": self._binance_side(side), "type": "MARKET",
+            "quantity": str(qty), "newOrderRespType": "RESULT",
+        }
+        if reduce_only and self._market_type == "future":
+            params["reduceOnly"] = "true"
+        with self._lock:
+            raw = _retry(f"market({symbol},{side},{qty})", self._trade_request, "/api/v3/order", params)
+            return {
+                "order_id": raw.get("orderId"),
+                "symbol": raw.get("symbol"),
+                "side": raw.get("side"),
+                "type": raw.get("type"),
+                "amount": amount,
+                "filled": float(raw.get("executedQty", 0)),
+                "status": raw.get("status"),
+                "avg_price": float(raw.get("avgPrice", 0) or 0),
+                "cummulative_quote": float(raw.get("cummulativeQuoteQty", 0) or 0),
+            }
+
+    def create_limit_order(self, symbol: str, side: str, amount: float, price: float) -> dict:
+        """Place a limit order via direct HTTP."""
+        qty = self._round_qty(symbol, amount)
+        with self._lock:
+            raw = _retry(f"limit({symbol},{side},{qty},{price})", self._trade_request, "/api/v3/order", {
+                "symbol": symbol, "side": self._binance_side(side), "type": "LIMIT",
+                "quantity": str(qty), "price": str(price), "timeInForce": "GTC",
+            })
+            return {
+                "order_id": raw.get("orderId"),
+                "symbol": raw.get("symbol"),
+                "side": raw.get("side"),
+                "type": raw.get("type"),
+                "amount": amount,
+                "price": price,
+                "filled": float(raw.get("executedQty", 0)),
+                "status": raw.get("status"),
+            }
+
+    _ALGO_ORDER_ENDPOINT = "/fapi/v1/algoOrder"
+
+    def _algo_signed_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict,
+        *,
+        op: str,
+    ) -> dict:
+        """向 Binance 合约 Algo Order API 发送签名请求。
+        Send a signed request to the Binance Algo Order API (futures).
+
+        Binance 已将 STOP_MARKET/TAKE_PROFIT_MARKET 从 /fapi/v1/order 迁出；
+        条件单须使用 /fapi/v1/algoOrder（POST/DELETE）。
+        Binance deprecated STOP_MARKET/TAKE_PROFIT_MARKET on /fapi/v1/order;
+        conditional orders must use /fapi/v1/algoOrder (POST/DELETE).
+        """
+        self._require_auth(op)
+        url = f"https://fapi.binance.com{endpoint}"
+        data = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
+        data.update(params)
+        query_string = urlencode(sorted(data.items()))
+        signature = hmac.new(
+            self._ccxt.secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        query_string += f"&signature={signature}"
+        headers = {"X-MBX-APIKEY": self._ccxt.apiKey}
+        if method == "DELETE":
+            resp = self._session.delete(f"{url}?{query_string}", headers=headers, timeout=10)
+        else:
+            resp = self._session.post(url, data=query_string, headers=headers, timeout=10)
+        if resp.status_code == 401:
+            raise RuntimeError(f"Algo {op} auth failed: {resp.text}")
+        if not resp.ok:
+            raise RuntimeError(f"Algo {op} failed ({resp.status_code}): {resp.text}")
+        raw = resp.json()
+        if isinstance(raw, dict) and "code" in raw and str(raw["code"]) not in ("200", "0"):
+            code = raw["code"]
+            if isinstance(code, int) and code < 0:
+                raise RuntimeError(f"Binance error {code}: {raw.get('msg', '')}")
+        return raw
+
+    def _algo_trade_request(self, endpoint: str, params: dict) -> dict:
+        """POST 至 Binance Algo Order API / POST to Binance Algo Order API."""
+        return self._algo_signed_request("POST", endpoint, params, op="trade")
+
+    def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
+        """通过 Binance Algo Order API 下止损（触发后市价）单。
+        Place a stop-loss (market on trigger) order via Binance Algo Order API.
+
+        合约：/fapi/v1/algoOrder + STOP_MARKET + reduceOnly。
+        Futures: uses /fapi/v1/algoOrder with STOP_MARKET + reduceOnly.
+        现货：/api/v3/order + STOP_LOSS。
+        Spot: uses /api/v3/order with STOP_LOSS (regular endpoint).
+        """
+        qty = self._round_qty(symbol, amount)
+        trigger = self._format_decimal(self._round_price(symbol, stop_price))
+        with self._lock:
+            if self._market_type == "future":
+                # 合约 Algo API；reduceOnly 表示只减仓 / Futures Algo API; reduceOnly closes only
+                bs = self._binance_side(side)
+                params: dict[str, str] = {
+                    "algoType": "CONDITIONAL",
+                    "symbol": symbol, "side": bs, "type": "STOP_MARKET",
+                    "quantity": self._format_decimal(qty),
+                    "triggerPrice": trigger, "reduceOnly": "true",
+                }
+                raw = _retry(
+                    f"stop_loss({symbol},{side},{qty},{stop_price})",
+                    self._algo_trade_request, self._ALGO_ORDER_ENDPOINT, params,
+                )
+                order_id = str(raw.get("algoId") or raw.get("clientAlgoId") or "")
+            else:
+                params = {
+                    "symbol": symbol, "side": self._binance_side(side),
+                    "type": "STOP_LOSS", "quantity": str(qty),
+                    "stopPrice": str(stop_price),
+                }
+                raw = _retry(f"stop_loss({symbol},{side},{qty},{stop_price})", self._trade_request, "/api/v3/order", params)
+                order_id = str(raw.get("orderId", ""))
+            return {
+                "order_id": order_id,
+                "symbol": raw.get("symbol"),
+                "side": raw.get("side"),
+                "type": raw.get("orderType") or raw.get("type"),
+                "amount": amount,
+                "stop_price": stop_price,
+                "filled": float(raw.get("executedQty", 0)),
+                "status": raw.get("algoStatus") or raw.get("status"),
+            }
+
+    def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
+        """通过 Binance Algo Order API 下止盈（触发后市价）单。
+        Place a take-profit (market on trigger) order via Binance Algo Order API.
+
+        合约：/fapi/v1/algoOrder + TAKE_PROFIT_MARKET + reduceOnly。
+        Futures: uses /fapi/v1/algoOrder with TAKE_PROFIT_MARKET + reduceOnly.
+        现货：/api/v3/order + TAKE_PROFIT。
+        Spot: uses /api/v3/order with TAKE_PROFIT (regular endpoint).
+        """
+        qty = self._round_qty(symbol, amount)
+        trigger = self._format_decimal(self._round_price(symbol, tp_price))
+        with self._lock:
+            if self._market_type == "future":
+                bs = self._binance_side(side)
+                params: dict[str, str] = {
+                    "algoType": "CONDITIONAL",
+                    "symbol": symbol, "side": bs, "type": "TAKE_PROFIT_MARKET",
+                    "quantity": self._format_decimal(qty),
+                    "triggerPrice": trigger, "reduceOnly": "true",
+                }
+                raw = _retry(
+                    f"take_profit({symbol},{side},{qty},{tp_price})",
+                    self._algo_trade_request, self._ALGO_ORDER_ENDPOINT, params,
+                )
+                order_id = str(raw.get("algoId") or raw.get("clientAlgoId") or "")
+            else:
+                params = {
+                    "symbol": symbol, "side": self._binance_side(side),
+                    "type": "TAKE_PROFIT", "quantity": str(qty),
+                    "stopPrice": str(tp_price),
+                }
+                raw = _retry(f"take_profit({symbol},{side},{qty},{tp_price})", self._trade_request, "/api/v3/order", params)
+                order_id = str(raw.get("orderId", ""))
+            return {
+                "order_id": order_id,
+                "symbol": raw.get("symbol"),
+                "side": raw.get("side"),
+                "type": raw.get("orderType") or raw.get("type"),
+                "amount": amount,
+                "tp_price": tp_price,
+                "filled": float(raw.get("executedQty", 0)),
+                "status": raw.get("algoStatus") or raw.get("status"),
+            }
+
+    def cancel_order(self, order_id: str, symbol: str) -> dict:
+        """取消挂单（普通单或 Algo 条件单）。
+        Cancel an open order (regular or algo conditional).
+        """
+        with self._lock:
+            self._require_auth("cancel_order")
+            if self._market_type == "future":
+                try:
+                    raw = self._algo_signed_request(
+                        "DELETE",
+                        self._ALGO_ORDER_ENDPOINT,
+                        {"algoId": order_id},
+                        op="cancel",
+                    )
+                    return {
+                        "order_id": str(raw.get("algoId", order_id)),
+                        "status": raw.get("msg", "CANCELED"),
+                    }
+                except RuntimeError:
+                    pass  # 回退普通撤单 / fall back to regular order cancel
+            query_string = urlencode(sorted({
+                "symbol": symbol,
+                "orderId": order_id,
+                "timestamp": int(time.time() * 1000),
+                "recvWindow": 10000,
+            }.items()))
+            signature = hmac.new(
+                self._ccxt.secret.encode("utf-8"),
+                query_string.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            resp = requests.delete(
+                f"{self._trade_prefix}/order?{query_string}&signature={signature}",
+                headers={"X-MBX-APIKEY": self._ccxt.apiKey},
+                timeout=10,
+            )
+            if resp.status_code == 401:
+                raise RuntimeError(f"Cancel order auth failed: {resp.text}")
+            resp.raise_for_status()
+            raw = resp.json()
+            return {"order_id": raw.get("orderId", order_id), "status": raw.get("status")}
+
+    def fetch_algo_order(self, algo_id: str) -> dict[str, Any]:
+        """查询 Algo 条件单状态 / Query algo conditional order status."""
+        with self._lock:
+            self._require_auth("fetch_algo_order")
+            resp = self._signed_request(
+                f"{self._fapi_url()}/fapi/v1", "/algoOrder", {"algoId": algo_id},
+            )
+            if not resp.ok:
+                raise RuntimeError(f"fetch_algo_order failed ({resp.status_code}): {resp.text}")
+            raw = resp.json()
+            return {
+                "algo_id": str(raw.get("algoId", algo_id)),
+                "status": raw.get("algoStatus"),
+                "symbol": raw.get("symbol"),
+                "order_type": raw.get("orderType"),
+            }
+
+    def fetch_open_algo_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+        """List open algo conditional orders (futures)."""
+        with self._lock:
+            self._require_auth("fetch_open_algo_orders")
+            params: dict[str, Any] = {}
+            if symbol:
+                params["symbol"] = symbol
+            resp = self._signed_request(
+                f"{self._fapi_url()}/fapi/v1",
+                "/openAlgoOrders",
+                params,
+            )
+            if not resp.ok:
+                raise RuntimeError(
+                    f"fetch_open_algo_orders failed ({resp.status_code}): {resp.text}",
+                )
+            raw = resp.json()
+            if not isinstance(raw, list):
+                return []
+            return raw
+
+    def fetch_order(self, order_id: str, symbol: str) -> dict:
+        """Query order status via direct HTTP GET."""
+        with self._lock:
+            self._require_auth("fetch_order")
+            resp = self._signed_request(self._trade_prefix, "/order", {
+                "symbol": symbol, "orderId": order_id,
+            })
+            resp.raise_for_status()
+            raw = resp.json()
+            return {
+                "order_id": raw.get("orderId", order_id),
+                "symbol": symbol,
+                "filled": float(raw.get("executedQty", 0)),
+                "status": raw.get("status"),
+                "remaining": float(raw.get("origQty", 0)) - float(raw.get("executedQty", 0)),
+            }
+
+    # ------------------------------------------------------------------
+    # Account
+    # ------------------------------------------------------------------
+
+    def _signed_request(self, base_url: str, endpoint: str, params: dict | None = None) -> requests.Response:
+        """Make a signed GET request to Binance API."""
+        req_params = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
+        if params:
+            req_params.update(params)
+        query_string = urlencode(sorted(req_params.items()))
+        signature = hmac.new(
+            self._ccxt.secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        query_string += f"&signature={signature}"
+        return requests.get(
+            f"{base_url}{endpoint}?{query_string}",
+            headers={"X-MBX-APIKEY": self._ccxt.apiKey},
+            timeout=10,
+        )
+
+    def get_account_balance(self) -> dict[str, float]:
+        """Fetch spot or futures account balances via direct HTTP."""
+        with self._lock:
+            if not self._has_auth:
+                return {}
+            if self._market_type == "future":
+                try:
+                    resp = self._signed_request(self._fapi_url(), "/fapi/v2/balance")
+                    if resp.ok:
+                        result: dict[str, float] = {}
+                        for entry in (resp.json() if isinstance(resp.json(), list) else []):
+                            asset = entry.get("asset", "")
+                            # 使用 wallet balance（总钱包余额=可用+持仓保证金）而非 availableBalance（仅可用余额）
+                            # availableBalance 在有持仓时远低于总余额，导致 exposure 计算虚高和系统死锁
+                            balance = float(entry.get("balance", 0))
+                            if balance > 0:
+                                result[asset] = balance
+                        return result
+                    logger.warning("Futures balance fetch failed (%d): %s", resp.status_code, resp.text[:200])
+                except Exception as exc:
+                    logger.warning("Futures balance fetch unavailable: %s", exc)
+                return {}
+            # Spot: use /api/v3/account
+            resp = self._signed_request(self._api_url(), "/api/v3/account")
+            if not resp.ok:
+                if resp.status_code == 401:
+                    logger.warning("get_account_balance auth failed: %s", resp.text)
+                else:
+                    logger.warning("get_account_balance error %d: %s", resp.status_code, resp.text[:200])
+                return {}
+            raw = resp.json()
+            result: dict[str, float] = {}
+            for entry in raw.get("balances", []):
+                free = float(entry.get("free", 0))
+                if free > 0:
+                    result[entry.get("asset", "")] = free
+            return result
+
+    def get_available_balance(self) -> dict[str, float]:
+        """Fetch available (free) balances — not locked by open positions.
+
+        For futures, reads ``availableBalance`` from Binance /fapi/v2/balance.
+        For spot, uses the same logic as get_account_balance() since spot has
+        no margin lock in the same sense.
+        """
+        with self._lock:
+            if not self._has_auth:
+                return {}
+            if self._market_type == "future":
+                try:
+                    resp = self._signed_request(self._fapi_url(), "/fapi/v2/balance")
+                    if resp.ok:
+                        result: dict[str, float] = {}
+                        for entry in (resp.json() if isinstance(resp.json(), list) else []):
+                            asset = entry.get("asset", "")
+                            free = float(entry.get("availableBalance", 0))
+                            if free > 0:
+                                result[asset] = free
+                        return result
+                    logger.warning("Available balance fetch failed (%d): %s", resp.status_code, resp.text[:200])
+                except Exception as exc:
+                    logger.warning("Available balance fetch unavailable: %s", exc)
+                return {}
+            # Spot: same as get_account_balance
+            return self.get_account_balance()
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        """Fetch current positions. Spot: non-zero balances. Futures: open positions."""
+        with self._lock:
+            if not self._has_auth:
+                return []
+            if self._market_type == "future":
+                resp = self._signed_request(self._fapi_url(), "/fapi/v2/positionRisk")
+                if resp.ok:
+                    positions: list[dict[str, Any]] = []
+                    for p in (resp.json() if isinstance(resp.json(), list) else []):
+                        amt = float(p.get("positionAmt", 0))
+                        if amt != 0:
+                            positions.append({
+                                "symbol": p.get("symbol", ""),
+                                "direction": "LONG" if amt > 0 else "SHORT",
+                                "entry_price": float(p.get("entryPrice", 0)),
+                                "quantity": abs(amt),
+                                "unrealized_pnl": float(p.get("unrealizedProfit", 0)),
+                            })
+                    return positions
+                logger.warning("Futures position risk fetch failed (%d): %s",
+                              resp.status_code, resp.text[:200])
+                return []
+            # Spot: non-zero balances as positions
+            balances = self.get_account_balance()
+            positions: list[dict[str, Any]] = []
+            for asset, amount in balances.items():
+                if asset == "USDT":
+                    continue
+                ticker_sym = f"{asset}USDT"
+                try:
+                    t = self.get_ticker(ticker_sym)
+                    price = t["last"]
+                except Exception:
+                    price = 0.0
+                positions.append({
+                    "symbol": ticker_sym,
+                    "asset": asset,
+                    "quantity": amount,
+                    "current_price": price,
+                    "value_usdt": amount * price,
+                })
+            return positions
+
+    # ------------------------------------------------------------------
+    # LOT_SIZE / quantity rounding
+    # ------------------------------------------------------------------
+
+    def _load_exchange_info(self) -> None:
+        """Fetch exchangeInfo and cache LOT_SIZE stepSizes for quantity precision.
+
+        For futures: uses /fapi/v1/exchangeInfo (futures-specific).
+        For spot: uses /api/v3/exchangeInfo.
+        Falls back silently — without stepSizes, quantity rounding is skipped.
+        """
+        try:
+            if self._market_type == "future":
+                url = f"{self._fapi_url()}/fapi/v1/exchangeInfo"
+            else:
+                url = f"{self._api_url()}/api/v3/exchangeInfo"
+            resp = self._session.get(url, timeout=10)
+            if not resp.ok:
+                logger.warning("exchangeInfo fetch failed (%d), skipping LOT_SIZE cache", resp.status_code)
+                return
+            info = resp.json()
+            for s in info.get("symbols", []):
+                sym = s.get("symbol", "")
+                if not sym.endswith("USDT"):
+                    continue
+                self._valid_symbols.add(sym)
+                for f in s.get("filters", []):
+                    if f.get("filterType") == "LOT_SIZE":
+                        step = float(f.get("stepSize", 1))
+                        self._step_sizes[sym] = step
+                        self._min_qtys[sym] = float(f.get("minQty", 0))
+                    elif f.get("filterType") == "PRICE_FILTER":
+                        self._tick_sizes[sym] = float(f.get("tickSize", 0.01))
+        except Exception as exc:
+            logger.warning("Failed to load exchangeInfo for LOT_SIZE: %s", exc)
+
+    def _round_qty(self, symbol: str, qty: float) -> float:
+        """Round quantity to the symbol's LOT_SIZE stepSize.
+
+        Uses cached stepSize from exchangeInfo.
+        Falls back to rounding to 6 decimal places if stepSize unknown.
+        When rounded result is 0, falls back to the step size (minimum tradable unit)
+        to avoid order rejection.
+        """
+        step = self._step_sizes.get(symbol)
+        if step is None or step <= 0:
+            return round(qty, 6)
+        min_qty = self._min_qtys.get(symbol, step)
+        # Use Decimal for precise step rounding (avoids float 24.400000000000002 bugs)
+        step_d = Decimal(str(step))
+        qty_d = Decimal(str(qty))
+        rounded = (qty_d / step_d).to_integral_value(rounding=ROUND_FLOOR) * step_d
+        result = float(rounded)
+        if result == 0.0 and qty > 0:
+            fallback = max(step, min_qty)
+            logger.warning(
+                "_round_qty(%s, %.6f) rounded to 0 (step=%.6f), falling back to %.6f",
+                symbol, qty, step, fallback,
+            )
+            return fallback
+        return result
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        """按 PRICE_FILTER tickSize 舍入价格 / Round price to PRICE_FILTER tickSize."""
+        tick = self._tick_sizes.get(symbol)
+        if tick is None or tick <= 0:
+            return round(price, 8)
+        tick_d = Decimal(str(tick))
+        price_d = Decimal(str(price))
+        rounded = (price_d / tick_d).to_integral_value(rounding=ROUND_HALF_UP) * tick_d
+        return float(rounded)
+
+    @staticmethod
+    def _format_decimal(value: float) -> str:
+        """格式化为 Binance API 所需精度（无多余小数位）。
+        Format float for Binance API without excess precision.
+        """
+        return format(Decimal(str(value)).normalize(), "f")
+
+    def _fapi_post(self, path: str, params: dict) -> dict:
+        """Send a signed POST to fapi.binance.com with full path.
+
+        Unlike _trade_request which strips the endpoint to a single segment,
+        this preserves the full path (e.g. /fapi/v1/positionSide/dual).
+        """
+        self._require_auth("fapi_post")
+        url = f"{self._fapi_url()}{path}"
+        data = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
+        data.update(params)
+        query_string = urlencode(sorted(data.items()))
+        signature = hmac.new(
+            self._ccxt.secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        query_string += f"&signature={signature}"
+        resp = self._session.post(
+            url,
+            data=query_string,
+            headers={"X-MBX-APIKEY": self._ccxt.apiKey},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        body = resp.text[:200]
+        raise RuntimeError(f"FAPI POST {path} failed ({resp.status_code}): {body}")
+
+    def set_margin_mode(self, symbol: str, mode: str = "ISOLATED") -> None:
+        """Set margin type for a symbol: ISOLATED (逐仓) or CROSSED (全仓).
+
+        Only works when there are no open positions for the symbol.
+        Binance error code -4058 = position exists, which is ignored.
+        """
+        if self._market_type != "future":
+            return
+        try:
+            self._fapi_post("/fapi/v1/marginType", {"symbol": symbol, "marginType": mode.upper()})
+            logger.info("Margin mode set to %s for %s", mode.upper(), symbol)
+        except RuntimeError as exc:
+            if "-4058" in str(exc) or "-4046" in str(exc):
+                logger.info("Margin mode already %s for %s (or position exists)", mode.upper(), symbol)
+            else:
+                logger.warning("Failed to set margin mode for %s: %s", symbol, exc)
+
+    def set_position_mode(self, dual: bool = False) -> None:
+        """Set position mode: dual=False = 单向持仓, dual=True = 双向持仓.
+
+        Global setting — requires no open positions or orders.
+        Error code -4059 = mode already set, ignored.
+        """
+        if self._market_type != "future":
+            return
+        try:
+            val = "true" if dual else "false"
+            self._fapi_post("/fapi/v1/positionSide/dual", {"dualSidePosition": val})
+            logger.info("Position mode set to %s", "双向" if dual else "单向")
+        except RuntimeError as exc:
+            if "-4059" in str(exc) or "-4046" in str(exc):
+                logger.info("Position mode already set to %s", "双向" if dual else "单向")
+            else:
+                logger.warning("Failed to set position mode: %s", exc)
+
+    def set_leverage(self, symbol: str, leverage: int = 5) -> None:
+        """Set futures leverage for a symbol via POST /fapi/v1/leverage."""
+        if self._market_type != "future":
+            return
+        try:
+            self._trade_request("/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+            logger.info("Leverage set to %dx for %s", leverage, symbol)
+        except RuntimeError as exc:
+            # Code -4046 means already set to this value — not an error
+            if "-4046" not in str(exc):
+                logger.warning("Failed to set leverage for %s: %s", symbol, exc)
+
+    def get_min_qty(self, symbol: str) -> float:
+        """Minimum tradeable quantity for a symbol (from LOT_SIZE minQty)."""
+        return self._min_qtys.get(symbol, 0.0)
+
+    def is_valid_symbol(self, symbol: str) -> bool:
+        """Check if a symbol is tradeable on the current exchange.
+
+        For futures mode, checks against cached exchangeInfo.
+        For spot mode, always returns True (all USDT pairs from ticker are valid).
+        """
+        if self._market_type != "future" or not self._valid_symbols:
+            return True
+        return symbol in self._valid_symbols
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def has_auth(self) -> bool:
+        return self._has_auth
+
+    @property
+    def is_testnet(self) -> bool:
+        return self._testnet

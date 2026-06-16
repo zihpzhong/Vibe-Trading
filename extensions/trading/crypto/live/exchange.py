@@ -1,0 +1,321 @@
+"""Cryptocurrency exchange data abstraction layer.
+
+Provides a unified interface for fetching market data.
+Supports real (OKX/CCXT) and mock modes for testing.
+"""
+
+from __future__ import annotations
+
+import os
+import random
+from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+from typing import Any, Optional
+
+import pandas as pd
+
+
+class ExchangeBase(ABC):
+    """Abstract exchange data interface."""
+
+    @abstractmethod
+    def get_kline(self, symbol: str, timeframe: str = "1h", limit: int = 50) -> pd.DataFrame:
+        """Fetch kline/candlestick data.
+
+        Returns:
+            DataFrame with columns: timestamp, open, high, low, close, volume
+        """
+        ...
+
+    @abstractmethod
+    def get_ticker(self, symbol: str) -> dict[str, Any]:
+        """Fetch current ticker.
+
+        Returns:
+            dict with keys: symbol, last, open24h, volume24h, high24h, low24h
+        """
+        ...
+
+    @abstractmethod
+    def get_funding_rate(self, symbol: str) -> float:
+        """Fetch current perpetual funding rate.
+
+        Returns:
+            Funding rate as decimal (e.g. 0.0001 = 0.01%)
+        """
+        ...
+
+    @abstractmethod
+    def get_orderbook(self, symbol: str, depth: int = 10) -> dict[str, list]:
+        """Fetch order book depth.
+
+        Returns:
+            dict with keys: bids (list of [price, size]), asks (list of [price, size])
+        """
+        ...
+
+    @abstractmethod
+    def get_tickers(self, symbols: Optional[list[str]] = None) -> list[dict[str, Any]]:
+        """Batch fetch tickers, filtered to USDT spot pairs.
+
+        Returns:
+            list of ticker dicts with keys: symbol, last, open24h, volume24h, high24h, low24h
+        """
+        ...
+
+    @abstractmethod
+    def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
+        """Create a market order.
+
+        Args:
+            reduce_only: If True, order will only reduce position (Binance futures).
+                          Allows closing positions below minimum notional (20 USDT).
+
+        Returns:
+            dict with keys: order_id, symbol, side, type, amount, filled, status
+        """
+        ...
+
+    def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
+        """Create a stop-loss order (STOP_MARKET).
+
+        Returns:
+            dict with keys: order_id, symbol, side, type, amount, stop_price, filled, status
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support stop-loss orders")
+
+    def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
+        """Create a take-profit order (TAKE_PROFIT_MARKET on futures).
+
+        Returns:
+            dict with keys: order_id, symbol, side, type, amount, tp_price, filled, status
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support take-profit orders")
+
+    def cancel_order(self, order_id: str, symbol: str) -> dict:
+        """Cancel an open order by ID."""
+        raise NotImplementedError(f"{type(self).__name__} does not support cancel_order")
+
+    def fetch_order(self, order_id: str, symbol: str) -> dict:
+        """Query order status."""
+        raise NotImplementedError(f"{type(self).__name__} does not support fetch_order")
+
+    def get_min_qty(self, symbol: str) -> float:
+        """Return minimum tradeable quantity for symbol (0.0 = unknown)."""
+        return 0.0
+
+    def is_valid_symbol(self, symbol: str) -> bool:
+        """Check if symbol exists on this exchange market.
+
+        RealExchange overrides this to check futures exchangeInfo.
+        MockExchange returns True for all symbols (handles all mock data).
+        """
+        return True
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        """Fetch open positions (futures positionRisk). Spot: non-zero balances."""
+        return []
+
+    def get_account_balance(self) -> dict[str, float]:
+        """Fetch wallet balances. Mock: return a default USDT balance."""
+        return {"USDT": 10_000.0}
+
+    def get_available_balance(self) -> dict[str, float]:
+        """Fetch available (free) balances. Mock: delegates to get_account_balance."""
+        return self.get_account_balance()
+
+    def get_balance_snapshot(self) -> dict[str, dict[str, float]]:
+        """Fetch both total and available balances in one API call (mock: single call).
+
+        Override in subclasses that can fetch both in one round-trip.
+        Returns ``{"total": ..., "free": ...}``.
+        """
+        return {"total": self.get_account_balance(), "free": self.get_available_balance()}
+
+
+class MockExchange(ExchangeBase):
+    """Mock exchange that returns simulated data.
+
+    Used for testing and development without real network calls.
+    Produces deterministic-ish data based on a seed price.
+    """
+
+    BASE_PRICES = {
+        "BTCUSDT": 65_000.0,
+        "ETHUSDT": 3_200.0,
+        "SOLUSDT": 145.0,
+        "DOGEUSDT": 0.155,
+        "BNBUSDT": 580.0,
+    }
+
+    def __init__(self, seed_price: Optional[float] = None) -> None:
+        self._seed_price = seed_price
+        self._base_time = datetime.now()
+        self._open_algo_orders: list[dict[str, Any]] = []
+        self._algo_seq = 0
+
+    def get_kline(self, symbol: str = "BTCUSDT", timeframe: str = "1h", limit: int = 50) -> pd.DataFrame:
+        base_price = self._seed_price or self.BASE_PRICES.get(symbol, 100.0)
+        rows: list[dict] = []
+        for i in range(limit):
+            ts = self._base_time - timedelta(hours=limit - i)
+            volatility = base_price * 0.02
+            open_p = base_price + random.gauss(0, volatility)
+            close_p = open_p + random.gauss(0, volatility * 0.5)
+            high_p = max(open_p, close_p) + abs(random.gauss(0, volatility * 0.3))
+            low_p = min(open_p, close_p) - abs(random.gauss(0, volatility * 0.3))
+            volume = random.uniform(1_000, 10_000) * 100_000
+            rows.append({
+                "timestamp": int(ts.timestamp()),
+                "open": open_p,
+                "high": high_p,
+                "low": low_p,
+                "close": close_p,
+                "volume": volume,
+            })
+        df = pd.DataFrame(rows)
+        df.set_index("timestamp", inplace=True)
+        return df
+
+    def get_ticker(self, symbol: str = "BTCUSDT") -> dict[str, Any]:
+        base_price = self._seed_price or self.BASE_PRICES.get(symbol, 100.0)
+        change_pct = random.uniform(-5.0, 5.0)
+        last = base_price * (1 + change_pct / 100)
+        return {
+            "symbol": symbol,
+            "last": last,
+            "open24h": base_price,
+            "volume24h": random.uniform(500, 5_000) * 1_000_000,
+            "high24h": base_price * 1.03,
+            "low24h": base_price * 0.97,
+            "change24h": change_pct,
+        }
+
+    def get_funding_rate(self, symbol: str = "BTCUSDT") -> float:
+        return random.uniform(-0.001, 0.002)
+
+    def get_orderbook(self, symbol: str = "BTCUSDT", depth: int = 10) -> dict[str, list]:
+        base_price = self._seed_price or self.BASE_PRICES.get(symbol, 100.0)
+        bids = [[base_price * (1 - 0.001 * i), random.uniform(0.5, 5.0)] for i in range(1, depth + 1)]
+        asks = [[base_price * (1 + 0.001 * i), random.uniform(0.5, 5.0)] for i in range(1, depth + 1)]
+        return {"bids": bids, "asks": asks}
+
+    _MOCK_TOP20_SYMBOLS = [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+        "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+        "MATICUSDT", "SHIBUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT",
+        "ETCUSDT", "XLMUSDT", "FILUSDT", "TRXUSDT", "NEARUSDT",
+    ]
+
+    def get_tickers(self, symbols: Optional[list[str]] = None) -> list[dict[str, Any]]:
+        target = symbols or self._MOCK_TOP20_SYMBOLS
+        result: list[dict[str, Any]] = []
+        for sym in target:
+            t = self.get_ticker(sym)
+            result.append(t)
+        result.sort(key=lambda x: x.get("volume24h", 0) or 0, reverse=True)
+        return result
+
+    # ------------------------------------------------------------------
+    # Mock trading methods (for TPSLMonitor / Scheduler testing)
+    # ------------------------------------------------------------------
+
+    def create_market_order(self, symbol: str, side: str, amount: float, reduce_only: bool = False) -> dict:
+        return {
+            "order_id": f"mock_market_{random.randint(1000, 9999)}",
+            "symbol": symbol, "side": side, "type": "market",
+            "amount": amount, "filled": amount, "status": "closed",
+        }
+
+    def create_stop_loss_order(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
+        self._algo_seq += 1
+        order_id = f"mock_sl_{self._algo_seq}"
+        self._open_algo_orders.append({
+            "algoId": order_id,
+            "symbol": symbol,
+            "orderType": "STOP_MARKET",
+            "algoStatus": "NEW",
+        })
+        return {
+            "order_id": order_id,
+            "symbol": symbol, "side": side, "type": "STOP_MARKET",
+            "amount": amount, "stop_price": stop_price,
+            "filled": 0, "status": "NEW",
+        }
+
+    def create_take_profit_order(self, symbol: str, side: str, amount: float, tp_price: float) -> dict:
+        self._algo_seq += 1
+        order_id = f"mock_tp_{self._algo_seq}"
+        self._open_algo_orders.append({
+            "algoId": order_id,
+            "symbol": symbol,
+            "orderType": "TAKE_PROFIT_MARKET",
+            "algoStatus": "NEW",
+        })
+        return {
+            "order_id": order_id,
+            "symbol": symbol, "side": side, "type": "TAKE_PROFIT_MARKET",
+            "amount": amount, "tp_price": tp_price,
+            "filled": 0, "status": "NEW",
+        }
+
+    def cancel_order(self, order_id: str, symbol: str) -> dict:
+        self._open_algo_orders = [
+            o for o in self._open_algo_orders if str(o.get("algoId")) != str(order_id)
+        ]
+        return {"order_id": order_id, "status": "CANCELED"}
+
+    def fetch_open_algo_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+        if symbol:
+            return [o for o in self._open_algo_orders if o.get("symbol") == symbol]
+        return list(self._open_algo_orders)
+
+    def fetch_algo_order(self, algo_id: str) -> dict[str, Any]:
+        for item in self._open_algo_orders:
+            if str(item.get("algoId")) == str(algo_id):
+                return {"status": item.get("algoStatus", "NEW")}
+        return {"status": "CANCELED"}
+
+    def fetch_order(self, order_id: str, symbol: str) -> dict:
+        return {"order_id": order_id, "status": "FILLED", "filled": 0}
+
+
+def create_exchange(
+    mock: bool = True,
+    seed_price: Optional[float] = None,
+    exchange_name: Optional[str] = None,
+) -> ExchangeBase:
+    """Factory: create an exchange instance.
+
+    Args:
+        mock: If True, return MockExchange. Otherwise return a real exchange.
+        seed_price: Optional base price for mock data.
+        exchange_name: Exchange name ("binance" or "bitget"). Ignored when
+            mock=True. Falls back to CRYPTO_EXCHANGE env var, then "binance".
+
+    Returns:
+        ExchangeBase instance.
+    """
+    if mock:
+        return MockExchange(seed_price=seed_price)
+
+    exchange_name = (exchange_name or os.environ.get("CRYPTO_EXCHANGE", "binance")).lower()
+
+    if exchange_name == "bitget":
+        try:
+            from ._bitget_exchange import BitgetExchange  # type: ignore[import-untyped,unused-ignore]
+            return BitgetExchange()
+        except ImportError as exc:
+            raise ImportError(
+                "BitgetExchange requires ccxt. Install with: pip install ccxt, or use mock=True"
+            ) from exc
+    elif exchange_name == "binance":
+        try:
+            from ._real_exchange import RealExchange  # type: ignore[import-untyped,unused-ignore]
+            return RealExchange()
+        except ImportError as exc:
+            raise ImportError(
+                "RealExchange requires ccxt. Install with: pip install ccxt, or use mock=True"
+            ) from exc
+    else:
+        raise ValueError(f"Unknown exchange: {exchange_name}")

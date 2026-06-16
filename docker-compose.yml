@@ -1,16 +1,53 @@
 services:
   vibe-trading:
-    build: .
+    build:
+      context: .
+      args:
+        - HTTP_PROXY=
+        - HTTPS_PROXY=
+        - NO_PROXY=*
     ports:
       - "127.0.0.1:8899:8899"
     env_file:
       - agent/.env
+      - agent/.env.agt
     environment:
       - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1
+      # AGT live-runner tick 间隔（ms）；180000 = 3 分钟 / 3-min autonomous tick
+      - LIVE_RUNNER_MARKET_WATCH_MS=180000
+      # 108 等生产环境直连 Bitget，勿继承 agent/.env 的本地代理 / prod: no proxy
+      - CCXT_PROXY=
+      - CCXT_PROXY_PORT=
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
     volumes:
       - vibe-runs:/app/agent/runs
       - vibe-sessions:/app/agent/sessions
+      - ~/.vibe-trading:/home/vibe/.vibe-trading
+    command: ["python", "-m", "uvicorn", "extensions.live.serve_with_bridge:app", "--host", "0.0.0.0", "--port", "8899"]
     restart: unless-stopped
+
+  live-trading:
+    build: .
+    user: root
+    env_file:
+      - agent/.env
+      - agent/.env.aut
+    environment:
+      - HOME=/home/vibe
+      # 禁止 AUT 加载 AGT 专用 .env.local / Skip AGT-only .env.local in AUT container
+      - VIBE_AUT_SKIP_ENV_LOCAL=1
+      # 108 等生产环境直连 Bitget，勿继承 agent/.env 的本地代理 / prod: no proxy
+      - CCXT_PROXY=
+      - CCXT_PROXY_PORT=
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+    volumes:
+      - live-trading-data:/home/vibe/.vibe-trading
+    command: ["python", "extensions/ext_cli/run_live_trading.py", "--live", "--confirm-live", "I_UNDERSTAND", "--exchange", "bitget", "--balance", "200", "--interval", "5", "--position-size", "0.12"]
+    restart: unless-stopped
+    healthcheck:
+      disable: true
 
   frontend:
     image: node:20
@@ -31,3 +68,4 @@ services:
 volumes:
   vibe-runs:
   vibe-sessions:
+  live-trading-data:

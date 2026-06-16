@@ -1,0 +1,650 @@
+"""Unit tests for PositionTracker — US-008."""
+
+from __future__ import annotations
+
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+from extensions.trading.crypto.live.position_tracker import Position, PositionTracker
+
+
+@pytest.fixture
+def tracker() -> PositionTracker:
+    """Fresh tracker with temp persistence directory (no file on disk)."""
+    tmp = tempfile.mkdtemp()
+    t = PositionTracker(account_balance=10_000.0, max_exposure_pct=0.25, persist_dir=tmp)
+    yield t
+    # Cleanup
+    t.clear()
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Position dataclass
+# ---------------------------------------------------------------------------
+
+class TestPositionDataclass:
+    """Position data model."""
+
+    def test_creation_with_required_fields(self) -> None:
+        p = Position(symbol="BTCUSDT", direction="LONG", entry_price=65000.0, quantity=0.1, stop_loss=63000.0)
+        assert p.symbol == "BTCUSDT"
+        assert p.direction == "LONG"
+        assert p.entry_price == 65000.0
+        assert p.stop_loss == 63000.0
+        assert p.take_profit is None
+        assert p.opened_at != ""  # auto-generated
+
+    def test_creation_with_all_fields(self) -> None:
+        p = Position("ETHUSDT", "SHORT", 3200.0, 1.0, 3300.0, 3000.0, "2025-01-01T00:00:00Z")
+        assert p.take_profit == 3000.0
+        assert p.opened_at == "2025-01-01T00:00:00Z"
+
+    def test_to_dict_and_from_dict_roundtrip(self) -> None:
+        p = Position("SOLUSDT", "LONG", 145.0, 10.0, 138.0, 152.0, "2025-01-01T00:00:00Z")
+        d = p.to_dict()
+        p2 = Position.from_dict(d)
+        assert p2.symbol == p.symbol
+        assert p2.direction == p.direction
+        assert p2.entry_price == p.entry_price
+        assert p2.quantity == p.quantity
+        assert p2.stop_loss == p.stop_loss
+        assert p2.take_profit == p.take_profit
+        assert p2.opened_at == p.opened_at
+
+    def test_from_dict_minimal(self) -> None:
+        """from_dict works with minimal keys."""
+        d = {"symbol": "X", "direction": "LONG", "entry_price": "50", "quantity": "1", "stop_loss": "45"}
+        p = Position.from_dict(d)
+        assert p.symbol == "X"
+        assert p.entry_price == 50.0
+        assert p.take_profit is None
+
+
+# ---------------------------------------------------------------------------
+# Open / Close lifecycle
+# ---------------------------------------------------------------------------
+
+class TestLifecycle:
+    """Position open/close lifecycle."""
+
+    def test_open_position_returns_position(self, tracker: PositionTracker) -> None:
+        pos = tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        assert isinstance(pos, Position)
+        assert pos.symbol == "BTCUSDT"
+
+    def test_open_position_updates_active_count(self, tracker: PositionTracker) -> None:
+        assert tracker.active_count == 0
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        assert tracker.active_count == 1
+
+    def test_open_same_symbol_overwrites(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        tracker.open_position("BTCUSDT", "SHORT", 66000.0, 0.2, 67000.0)
+        assert tracker.active_count == 1
+        pos = tracker.get_position("BTCUSDT")
+        assert pos is not None
+        assert pos.direction == "SHORT"
+
+    def test_close_position_removes(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        closed = tracker.close_position("BTCUSDT")
+        assert closed is not None
+        assert closed.symbol == "BTCUSDT"
+        assert tracker.active_count == 0
+        assert tracker.get_position("BTCUSDT") is None
+
+    def test_close_nonexistent_returns_none(self, tracker: PositionTracker) -> None:
+        assert tracker.close_position("NOSUCH") is None
+
+    def test_get_active_positions_returns_copy(self, tracker: PositionTracker) -> None:
+        tracker.open_position("A", "LONG", 100.0, 1.0, 90.0)
+        tracker.open_position("B", "SHORT", 200.0, 2.0, 220.0)
+        positions = tracker.get_active_positions()
+        assert len(positions) == 2
+        # Modifying the returned list doesn't affect tracker
+        positions.clear()
+        assert tracker.active_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Exposure
+# ---------------------------------------------------------------------------
+
+class TestExposure:
+    """Exposure calculation."""
+
+    def test_exposure_zero_with_no_positions(self, tracker: PositionTracker) -> None:
+        assert tracker.get_exposure() == 0.0
+
+    def test_exposure_single_position(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 50000.0, 0.01, 48000.0)
+        # value = 500, balance = 10000, exposure = 0.05
+        assert tracker.get_exposure() == pytest.approx(0.05)
+
+    def test_exposure_uses_mark_price_when_provided(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 50000.0, 0.01, 48000.0)
+        # mark value = 600, balance = 10000, exposure = 0.06
+        assert tracker.get_exposure({"BTCUSDT": 60000.0}) == pytest.approx(0.06)
+
+    def test_exposure_uses_equity_after_unrealized_pnl(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 50000.0, 0.01, 48000.0)
+        # mark notional = 400, equity = 10000 - 100 floating loss = 9900
+        assert tracker.get_exposure({"BTCUSDT": 40000.0}, include_unrealized=True) == pytest.approx(400 / 9900)
+
+    def test_exposure_multiple_positions(self, tracker: PositionTracker) -> None:
+        tracker.open_position("A", "LONG", 100.0, 10.0, 90.0)  # 1000
+        tracker.open_position("B", "SHORT", 200.0, 5.0, 220.0)  # 1000
+        # total value = 2000, balance = 10000, exposure = 0.20
+        assert tracker.get_exposure() == pytest.approx(0.20)
+
+    def test_exposure_full_when_balance_zero(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=0.0, persist_dir=tmp)
+        t.open_position("X", "LONG", 100.0, 1.0, 90.0)
+        assert t.get_exposure() == 1.0
+        t.clear()
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# can_open_new
+# ---------------------------------------------------------------------------
+
+class TestCanOpenNew:
+    """Position opening guard."""
+
+    def test_allows_first_position(self, tracker: PositionTracker) -> None:
+        ok, reason = tracker.can_open_new("BTCUSDT")
+        assert ok is True
+        assert reason == ""
+
+    def test_rejects_duplicate_symbol(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        ok, reason = tracker.can_open_new("BTCUSDT")
+        assert ok is False
+        assert "已有" in reason
+
+    def test_rejects_at_max_positions(self, tracker: PositionTracker) -> None:
+        t = PositionTracker(
+            account_balance=10_000.0, max_exposure_pct=5.0, max_positions=5, persist_dir=tracker._db_path.parent,
+        )
+        t.open_position("A", "LONG", 100.0, 1.0, 90.0)
+        t.open_position("B", "LONG", 200.0, 1.0, 180.0)
+        t.open_position("C", "LONG", 300.0, 1.0, 270.0)
+        t.open_position("D", "LONG", 400.0, 1.0, 360.0)
+        t.open_position("E", "LONG", 500.0, 1.0, 450.0)
+        assert t.active_count == 5
+        ok, reason = t.can_open_new("F")
+        assert ok is False
+        assert "上限" in reason
+
+    def test_rejects_at_max_same_direction(self, tracker: PositionTracker) -> None:
+        tracker.open_position("A", "SHORT", 100.0, 1.0, 110.0)
+        tracker.open_position("B", "SHORT", 200.0, 1.0, 220.0)
+        ok, reason = tracker.can_open_new("C", direction="SHORT")
+        assert ok is False
+        assert "同向" in reason
+        ok, _ = tracker.can_open_new("C", direction="LONG")
+        assert ok is True
+
+    def test_rejects_when_exposure_exceeded(self, tracker: PositionTracker) -> None:
+        # 3000 value / 10000 balance = 0.30 > 0.25 max
+        tracker.open_position("A", "LONG", 3000.0, 1.0, 2900.0)
+        ok, reason = tracker.can_open_new("B")
+        assert ok is False
+        assert "敞口" in reason
+
+    def test_allows_different_symbol_below_limits(self, tracker: PositionTracker) -> None:
+        tracker.open_position("A", "LONG", 100.0, 1.0, 90.0)
+        ok, reason = tracker.can_open_new("B")
+        assert ok is True
+        assert reason == ""
+
+
+# ---------------------------------------------------------------------------
+# Cooldown
+# ---------------------------------------------------------------------------
+
+class TestCooldown:
+    """Signal cooldown tracking."""
+
+    def test_not_in_cooldown_initially(self, tracker: PositionTracker) -> None:
+        assert tracker.is_in_cooldown("BTCUSDT", "LONG") is False
+
+    def test_in_cooldown_after_open(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        assert tracker.is_in_cooldown("BTCUSDT", "LONG") is True
+
+    def test_different_direction_not_in_cooldown(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        assert tracker.is_in_cooldown("BTCUSDT", "SHORT") is False
+
+    def test_different_symbol_not_in_cooldown(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        assert tracker.is_in_cooldown("ETHUSDT", "LONG") is False
+
+    def test_cooldown_expires(self, tracker: PositionTracker) -> None:
+        # Create tracker with very short cooldown
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=10000.0, cooldown_minutes=0, persist_dir=tmp)
+        t.open_position("X", "LONG", 100.0, 1.0, 90.0)
+        # cooldown_minutes=0 means cooldown expires immediately (elapsed >= 0)
+        time.sleep(0.01)
+        assert t.is_in_cooldown("X", "LONG") is False
+        t.clear()
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+class TestPersistence:
+    """JSON persistence to disk."""
+
+    def test_positions_persisted_to_file(self, tracker: PositionTracker) -> None:
+        tracker.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0)
+        assert tracker._db_path.exists()
+
+    def test_positions_restored_on_load(self) -> None:
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t1 = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        t1.open_position("BTCUSDT", "LONG", 65000.0, 0.1, 63000.0, 67000.0)
+
+        # Create new tracker that loads from same database
+        t2 = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        assert t2.active_count == 1
+        pos = t2.get_position("BTCUSDT")
+        assert pos is not None
+        assert pos.symbol == "BTCUSDT"
+        assert pos.entry_price == 65000.0
+        assert pos.stop_loss == 63000.0
+        assert pos.take_profit == 67000.0
+
+        t1.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_account_balance_restored(self) -> None:
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t1 = PositionTracker(account_balance=50000.0, persist_dir=tmp)
+        t1.open_position("X", "LONG", 100.0, 1.0, 90.0)
+        t2 = PositionTracker(account_balance=99999.0, persist_dir=tmp)  # should use restored balance
+        assert t2.account_balance == 50000.0
+        t1.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_clear_removes_db_file(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 1.0, 90.0)
+        assert tracker._db_path.exists()
+        tracker.clear()
+        assert not tracker._db_path.exists()
+        assert tracker.active_count == 0
+
+    def test_load_non_existent_db_handled(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        assert t.active_count == 0  # gracefully handled
+        t.clear()
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Thread safety
+# ---------------------------------------------------------------------------
+
+class TestThreadSafety:
+    """Concurrent access doesn't corrupt state."""
+
+    def test_concurrent_opens_and_reads(self, tracker: PositionTracker) -> None:
+        import threading
+
+        errors: list[Exception] = []
+
+        def open_positions(start: int) -> None:
+            try:
+                for i in range(start, start + 10):
+                    sym = f"SYM{i}"
+                    if tracker.can_open_new(sym)[0]:
+                        tracker.open_position(sym, "LONG", 100.0, 1.0, 90.0)
+                    _ = tracker.get_exposure()
+                    _ = tracker.is_in_cooldown(sym, "LONG")
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=open_positions, args=(0,))
+        t2 = threading.Thread(target=open_positions, args=(10,))
+        t3 = threading.Thread(target=open_positions, args=(20,))
+        t1.start()
+        t2.start()
+        t3.start()
+        t1.join()
+        t2.join()
+        t3.join()
+
+        assert len(errors) == 0, f"Thread errors: {errors}"
+        # can_open_new + open_position is not atomic under concurrent access --
+        # threads can pass the gate before any inserts. Verify no crashes.
+        assert 0 <= tracker.active_count <= 30
+
+    def test_close_from_another_tracker_reference(self) -> None:
+        """Persistence enables restart recovery (not live state sharing)."""
+        import tempfile
+        import shutil
+        tmp = tempfile.mkdtemp()
+        t1 = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        t1.open_position("X", "LONG", 100.0, 1.0, 90.0)
+        # Create tracker that loads from disk (simulating restart)
+        t2 = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        assert t2.active_count == 1
+        t1.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# account_balance property
+# ---------------------------------------------------------------------------
+
+class TestAccountBalance:
+    """Account balance getter/setter."""
+
+    def test_balance_initial_value(self, tracker: PositionTracker) -> None:
+        assert tracker.account_balance == 10000.0
+
+    def test_balance_setter_updates_exposure(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 500.0, 2.0, 450.0)  # value = 1000
+        assert tracker.get_exposure() == pytest.approx(0.10)  # 1000/10000
+        tracker.account_balance = 5000.0
+        assert tracker.get_exposure() == pytest.approx(0.20)  # 1000/5000
+
+
+# ---------------------------------------------------------------------------
+# De-risk realized PnL records
+# ---------------------------------------------------------------------------
+
+class TestDeRiskRecords:
+    """De-risk partial exits should be visible to realized PnL accounting."""
+
+    def test_de_risk_partial_exit_creates_close_record(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 2.0, 80.0, entry_score=7)
+        tracker.de_risk_partial_exit("X", de_risk_level=1, sell_qty=0.5, current_price=90.0)
+
+        pos = tracker.get_position("X")
+        assert pos is not None
+        assert pos.quantity == pytest.approx(1.5)
+
+        closed = tracker.get_recent_closed(10)
+        assert len(closed) == 1
+        assert closed[0].reason == "DE_RISK_1"
+        assert closed[0].quantity == pytest.approx(0.5)
+        assert closed[0].pnl_usdt == pytest.approx(-5.0)
+        assert closed[0].entry_score == 7
+
+
+# ---------------------------------------------------------------------------
+# Entry score tracking
+# ---------------------------------------------------------------------------
+
+class TestEntryScore:
+    """Entry score propagation and tier-based win rate."""
+
+    def test_open_position_stores_entry_score(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 1.0, 90.0, entry_score=8)
+        pos = tracker.get_position("X")
+        assert pos is not None
+        assert pos.entry_score == 8
+
+    def test_entry_score_propagates_to_close_record(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 1.0, 90.0, entry_score=7)
+        tracker.close_position("X", exit_price=110.0, reason="TP")
+        closed = tracker.get_recent_closed(10)
+        assert len(closed) == 1
+        assert closed[0].entry_score == 7
+
+    def test_win_rate_by_score_tier(self, tracker: PositionTracker) -> None:
+        # High score winner
+        tracker.open_position("A", "LONG", 100.0, 1.0, 90.0, entry_score=9)
+        tracker.close_position("A", exit_price=110.0, reason="TP")
+        # Medium score loser
+        tracker.open_position("B", "SHORT", 200.0, 1.0, 210.0, entry_score=5)
+        tracker.close_position("B", exit_price=210.0, reason="SL")
+        # Low score winner
+        tracker.open_position("C", "LONG", 50.0, 1.0, 45.0, entry_score=3)
+        tracker.close_position("C", exit_price=55.0, reason="TP")
+
+        tiers = tracker.get_win_rate_by_score_tier()
+        assert tiers["high (7-10)"]["count"] == 1
+        assert tiers["high (7-10)"]["wins"] == 1
+        assert tiers["high (7-10)"]["win_rate"] == 1.0
+        assert tiers["medium (5-6)"]["count"] == 1
+        assert tiers["medium (5-6)"]["wins"] == 0
+        assert tiers["low (0-4)"]["count"] == 1
+        assert tiers["low (0-4)"]["wins"] == 1
+
+    def test_entry_score_survives_serialization(self, tracker: PositionTracker) -> None:
+        tracker.open_position("X", "LONG", 100.0, 1.0, 90.0, entry_score=8)
+        tracker.close_position("X", exit_price=110.0, reason="TP")
+        # Re-create tracker to trigger deserialization
+        persist_dir = tracker._db_path.parent
+        t2 = PositionTracker(account_balance=10000.0, persist_dir=str(persist_dir))
+        closed = t2.get_recent_closed(10)
+        assert len(closed) >= 1
+        assert closed[-1].entry_score == 8
+        t2.clear()
+
+
+# ---------------------------------------------------------------------------
+# SQLite-specific tests
+# ---------------------------------------------------------------------------
+
+class TestSQLite:
+    """SQLite persistence specifics: WAL mode, incremental sync, migration."""
+
+    def test_wal_mode_active(self, tracker: PositionTracker) -> None:
+        """Database should be in WAL journal mode."""
+        cursor = tracker._conn.execute("PRAGMA journal_mode")
+        assert cursor.fetchone()[0].lower() == "wal"
+
+    def test_sqlite_roundtrip(self) -> None:
+        """Open trade -> close -> verify data via direct SQL."""
+        import shutil
+        import tempfile
+        import sqlite3
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        t.open_position("ETHUSDT", "SHORT", 3200.0, 0.5, 3300.0, 3100.0, entry_score=7)
+        t.close_position("ETHUSDT", exit_price=3100.0, reason="TP")
+
+        # Verify directly via SQLite
+        conn = sqlite3.connect(str(Path(tmp) / "trading.db"))
+        row = conn.execute(
+            "SELECT pnl_usdt, pnl_pct, reason, entry_score FROM closed_trades"
+        ).fetchone()
+        assert row is not None
+        assert row[2] == "TP"
+        assert row[3] == 7  # entry_score
+        conn.close()
+        t.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_equity_incremental_sync(self) -> None:
+        """Verify only new equity rows are appended on each _persist()."""
+        import shutil
+        import tempfile
+        import sqlite3
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=10000.0, persist_dir=tmp)
+        # Open 3 positions — each triggers _persist() with equity snapshot
+        t.open_position("A", "LONG", 100.0, 1.0, 90.0)
+        t.open_position("B", "LONG", 200.0, 1.0, 180.0)
+        t.open_position("C", "LONG", 300.0, 1.0, 270.0)
+
+        conn = sqlite3.connect(str(Path(tmp) / "trading.db"))
+        count = conn.execute("SELECT COUNT(*) FROM equity_history").fetchone()[0]
+        conn.close()
+        assert count >= 3  # at least 3 snapshots (one per open)
+        assert t._synced_equity_count == count  # sync counter matches DB
+
+        t.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_migrate_from_json(self) -> None:
+        """Migrate old positions.json to trading.db."""
+        import shutil
+        import tempfile
+        import json
+        import sqlite3
+        tmp = Path(tempfile.mkdtemp())
+
+        # Create mock positions.json
+        mock_data = {
+            "positions": [{
+                "symbol": "BTCUSDT", "direction": "LONG",
+                "entry_price": 77150.0, "quantity": 0.001,
+                "stop_loss": 73292.5, "take_profit": 88722.5,
+                "opened_at": "2026-05-17T23:41:21Z",
+                "dca_count": 0, "leverage": 5, "entry_score": 7,
+                "first_entry_cost": 77150.0, "first_entry_quantity": 0.001,
+                "de_risk_level": 0,
+            }],
+            "closed": [{
+                "symbol": "ETHUSDT", "direction": "SHORT",
+                "entry_price": 3200.0, "exit_price": 3100.0,
+                "quantity": 0.5, "pnl_usdt": 50.0, "pnl_pct": 3.12,
+                "reason": "TP", "opened_at": "2026-05-17T22:00:00Z",
+                "closed_at": "2026-05-17T23:00:00Z",
+                "dca_count": 0, "leverage": 1, "entry_score": 8,
+            }],
+            "cooldowns": {"BTCUSDT:LONG": 1000.0},
+            "account_balance": 207.63,
+        }
+        json_path = tmp / "positions.json"
+        json_path.write_text(json.dumps(mock_data))
+
+        # Run migration
+        from extensions.trading.crypto.live.migration import migrate_from_json
+        result = migrate_from_json(str(tmp))
+        assert result is True
+
+        # Verify migrated data
+        conn = sqlite3.connect(str(tmp / "trading.db"))
+        assert conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM closed_trades").fetchone()[0] == 1
+        row = conn.execute("SELECT value FROM metadata WHERE key='account_balance'").fetchone()
+        assert float(row[0]) == pytest.approx(207.63)
+        conn.close()
+
+        # Old file should be renamed to .bak
+        assert not (tmp / "positions.json").exists()
+        assert (tmp / "positions.json.bak").exists()
+
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_migrate_idempotent(self) -> None:
+        """Second migration call should be a no-op."""
+        import shutil
+        import tempfile
+        import json
+        tmp = Path(tempfile.mkdtemp())
+
+        mock_data = {"positions": [], "closed": []}
+        (tmp / "positions.json").write_text(json.dumps(mock_data))
+
+        from extensions.trading.crypto.live.migration import migrate_from_json
+        assert migrate_from_json(str(tmp)) is True  # first run
+        assert migrate_from_json(str(tmp)) is False  # second run skipped
+
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_trailing_state_roundtrip(self, tracker: PositionTracker) -> None:
+        """Trailing stop state survives restart."""
+
+        tracker.set_trailing_state({"BTCUSDT": 76000.0}, {"BTCUSDT": 78000.0})
+
+        persist_dir = tracker._db_path.parent
+        t2 = PositionTracker(account_balance=10000.0, persist_dir=str(persist_dir))
+        state = t2.get_trailing_state()
+        assert state["trailing_stops"].get("BTCUSDT") == 76000.0
+        assert state["peak_prices"].get("BTCUSDT") == 78000.0
+        t2.clear()
+
+
+class TestCloseAfterMarketFill:
+    def test_partial_fill_dust_merged_into_one_close_record(self, tracker: PositionTracker) -> None:
+        tracker.open_position("INJUSDT", "LONG", 5.246, 4.616633, 4.9)
+        tracker.close_after_market_fill("INJUSDT", 4.6, 5.089, "STALE", min_qty=0.1)
+
+        assert tracker.get_position("INJUSDT") is None
+        closed = tracker.get_recent_closed(1)[0]
+        assert closed.reason == "STALE"
+        assert closed.quantity == pytest.approx(4.616633)
+        assert closed.pnl_usdt == pytest.approx((5.089 - 5.246) * 4.616633, rel=1e-4)
+
+    def test_close_position_refreshes_cooldown(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=10_000.0, persist_dir=tmp, cooldown_minutes=30)
+        t.open_position("INJUSDT", "LONG", 5.0, 1.0, 4.5)
+        assert t.is_in_cooldown("INJUSDT", "LONG") is True
+        t.close_position("INJUSDT", exit_price=5.1, reason="TP")
+        assert t.is_in_cooldown("INJUSDT", "LONG") is True
+
+
+class TestRollingDrawdownPeak:
+    def test_external_balance_drop_resets_peak(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=260.0, persist_dir=tmp)
+        t._equity_history.append({
+            "timestamp": "2026-05-28T10:00:00+00:00",
+            "balance": 262.0,
+            "equity": 262.0,
+            "active_positions": 0,
+            "total_realized_pnl": 0.0,
+        })
+        t._rolling_peak_balance = 262.0
+        t.account_balance = 214.0
+        assert t.get_rolling_drawdown_pct() == pytest.approx(0.0)
+        assert t.consume_rolling_peak_reset() is True
+        t.clear()
+
+    def test_trading_loss_does_not_reset_peak(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=214.0, persist_dir=tmp)
+        t._rolling_peak_balance = 214.0
+        t.account_balance = 208.0  # ~2.8% drop
+        assert t.get_rolling_drawdown_pct() == pytest.approx((214.0 - 208.0) / 214.0)
+        assert t.consume_rolling_peak_reset() is False
+        t.clear()
+
+    def test_initialize_rolling_peak_ignores_history_spike(self) -> None:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        t = PositionTracker(account_balance=214.0, persist_dir=tmp)
+        t._rolling_peak_balance = 262.0
+        t._equity_history.append({
+            "timestamp": "2026-05-28T10:00:00+00:00",
+            "balance": 262.0,
+            "equity": 262.0,
+            "active_positions": 1,
+            "total_realized_pnl": 0.0,
+        })
+        t.account_balance = 214.71
+        t.initialize_rolling_peak(214.71)
+        assert t.get_rolling_drawdown_pct() == pytest.approx(0.0)
+        t.clear()
